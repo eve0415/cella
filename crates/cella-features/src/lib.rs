@@ -140,6 +140,9 @@ struct FeatureEntry {
     /// registry. Drives lockfile generation, including transitive `dependsOn`
     /// features (which are appended to the install set during expansion).
     oci: Option<OciLockInfo>,
+    /// The full OCI image manifest, present only for OCI-fetched features.
+    /// Retained for `read-configuration --include-features-configuration`.
+    oci_manifest: Option<oci_distribution::manifest::OciImageManifest>,
 }
 
 /// Build the unique install identity for a feature instance.
@@ -452,7 +455,7 @@ fn parse_and_normalize(
 /// Result of fetching a single feature — OCI fetches carry digest metadata,
 /// other fetchers return only the artifact path.
 enum FetchResult {
-    Oci(oci::OciFetchResult),
+    Oci(Box<oci::OciFetchResult>),
     Other(PathBuf),
 }
 
@@ -473,6 +476,16 @@ impl FetchResult {
                 repository: r.repository.clone(),
                 digest: r.digest.clone(),
             }),
+            Self::Other(_) => None,
+        }
+    }
+
+    /// The full OCI image manifest, if this fetch came from an OCI registry —
+    /// retained for `read-configuration --include-features-configuration`
+    /// (`featureSets[].sourceInformation.manifest`).
+    fn oci_manifest(&self) -> Option<oci_distribution::manifest::OciImageManifest> {
+        match self {
+            Self::Oci(r) => Some(r.manifest.clone()),
             Self::Other(_) => None,
         }
     }
@@ -539,7 +552,7 @@ async fn fetch_one_with_digest(
             let result = oci_fetcher
                 .fetch_oci_with_digest(norm_ref, cache, locked_digest)
                 .await?;
-            Ok(FetchResult::Oci(result))
+            Ok(FetchResult::Oci(Box::new(result)))
         }
         NormalizedRef::HttpTarget { .. } => {
             let path = http_fetcher.fetch(norm_ref, platform, cache).await?;
@@ -679,6 +692,7 @@ fn parse_metadata_and_validate(
             user_options,
             original_ref: key.clone(),
             oci: fetch_result.oci_lock_info(),
+            oci_manifest: fetch_result.oci_manifest(),
         });
     }
 
@@ -883,6 +897,18 @@ fn assemble_resolved(
             user_options: entry.user_options.clone(),
             artifact_dir: entry.artifact_dir.clone(),
             has_install_script: has_install,
+            // An OCI feature carries both its resolved digest (from the lock
+            // info) and the manifest blob; bundle them, or `None` for non-OCI.
+            oci: match (&entry.oci, &entry.oci_manifest) {
+                (Some(lock), Some(manifest)) => Some(ResolvedOciManifest {
+                    registry: lock.registry.clone(),
+                    repository: lock.repository.clone(),
+                    version: lock.version.clone(),
+                    digest: lock.digest.clone(),
+                    manifest: manifest.clone(),
+                }),
+                _ => None,
+            },
         });
 
         debug!(
@@ -1075,6 +1101,7 @@ async fn expand_depends_on(
             user_options,
             original_ref: dep_ref,
             oci: fetch_result.oci_lock_info(),
+            oci_manifest: fetch_result.oci_manifest(),
         });
     }
 
@@ -1243,6 +1270,7 @@ mod tests {
             user_options: HashMap::new(),
             artifact_dir: PathBuf::from("/tmp/features/node"),
             has_install_script: true,
+            oci: None,
         }];
 
         let label = generate_metadata_label(&features, &json!({}), None, MetadataOmit::default());
@@ -1340,6 +1368,7 @@ mod tests {
             user_options: HashMap::new(),
             artifact_dir: PathBuf::from("/tmp/features/python"),
             has_install_script: true,
+            oci: None,
         }];
         let user_config = json!({
             "image": "ubuntu",
@@ -2376,6 +2405,7 @@ mod tests {
                 repository: repo.to_string(),
                 digest: digest.to_string(),
             }),
+            oci_manifest: None,
         }
     }
 
@@ -2464,6 +2494,7 @@ mod tests {
             user_options: HashMap::new(),
             original_ref: "./local".to_string(),
             oci: None,
+            oci_manifest: None,
         };
         let lf = build_lockfile_from_entries(&[entry]);
         assert!(lf.features.is_empty());

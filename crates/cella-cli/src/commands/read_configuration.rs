@@ -114,6 +114,19 @@ impl ReadConfigurationArgs {
             &host_mount_folder,
         );
 
+        // `featuresConfiguration` is emitted when explicitly requested, or when
+        // `mergedConfiguration` is requested without a container target — the
+        // official `needsFeaturesConfig = includeFeaturesConfig || (includeMergedConfig
+        // && !container)`. It always derives from the config's features (never a
+        // container label), so resolve once and share with the merged path.
+        let needs_features_config = self.include_features_configuration
+            || (self.include_merged_configuration && !has_container_target);
+        let resolved_features = if needs_features_config {
+            resolve_config_features(&resolved.config, &resolved.config_path).await?
+        } else {
+            None
+        };
+
         if self.include_merged_configuration {
             output["mergedConfiguration"] =
                 if let Some((label, has_id_labels)) = container_metadata_label {
@@ -122,8 +135,15 @@ impl ReadConfigurationArgs {
                     // `getImageMetadataFromContainer` path.
                     build_merged_from_label(&resolved.config, &label, has_id_labels)
                 } else {
-                    resolve_merged_config(&resolved.config, &resolved.config_path).await?
+                    build_merged_output(&resolved.config, resolved_features.as_ref())
                 };
+        }
+
+        if needs_features_config
+            && let Some(rf) = resolved_features.as_ref()
+            && let Some(fc) = super::features_configuration::build(rf)?
+        {
+            output["featuresConfiguration"] = serde_json::to_value(fc)?;
         }
 
         // Official `read-configuration` prints compact (single-line) JSON.
@@ -232,9 +252,22 @@ pub async fn resolve_merged_config(
     config: &serde_json::Value,
     config_path: &Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let rf = resolve_config_features(config, config_path).await?;
+    Ok(build_merged_output(config, rf.as_ref()))
+}
+
+/// Resolve the config's features for `mergedConfiguration`/`featuresConfiguration`,
+/// or `None` when the config declares no features.
+///
+/// Always derives from the config (never a container label), so it can be shared
+/// between both outputs in a single `read-configuration` invocation.
+pub async fn resolve_config_features(
+    config: &serde_json::Value,
+    config_path: &Path,
+) -> Result<Option<ResolvedFeatures>, Box<dyn std::error::Error + Send + Sync>> {
     let features = super::features::resolve::extract_features(config);
     if features.is_empty() {
-        return Ok(build_merged_output(config, None));
+        return Ok(None);
     }
 
     let platform =
@@ -259,7 +292,7 @@ pub async fn resolve_merged_config(
     )
     .await?;
 
-    Ok(build_merged_output(config, Some(&rf)))
+    Ok(Some(rf))
 }
 
 /// Build `mergedConfiguration` from a container's baked `devcontainer.metadata`
@@ -323,6 +356,7 @@ fn build_merged_from_label(
                 user_options: HashMap::new(),
                 artifact_dir: PathBuf::new(),
                 has_install_script: false,
+                oci: None,
             })
         })
         .collect();
@@ -807,6 +841,7 @@ mod tests {
                     user_options: HashMap::new(),
                     artifact_dir: PathBuf::from("/tmp"),
                     has_install_script: false,
+                    oci: None,
                 },
                 ResolvedFeature {
                     id: "feat-b".to_string(),
@@ -819,6 +854,7 @@ mod tests {
                     user_options: HashMap::new(),
                     artifact_dir: PathBuf::from("/tmp"),
                     has_install_script: false,
+                    oci: None,
                 },
             ],
             dockerfile: String::new(),
@@ -1124,6 +1160,7 @@ mod tests {
                 user_options: HashMap::new(),
                 artifact_dir: PathBuf::from("/tmp"),
                 has_install_script: false,
+                oci: None,
             }],
             dockerfile: String::new(),
             build_context: PathBuf::from("/tmp"),

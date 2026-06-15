@@ -443,6 +443,7 @@ RUN echo install-as-node
             user_options: std::collections::HashMap::new(),
             artifact_dir: std::path::PathBuf::from("/tmp/marker"),
             has_install_script: true,
+            oci: None,
         };
         let feature_dockerfile =
             generate_dockerfile("base", &resolved_user, "node", "node", &[feature], true);

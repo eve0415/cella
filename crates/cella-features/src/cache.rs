@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
+use oci_distribution::manifest::OciImageManifest;
 use sha2::{Digest, Sha256};
 
 /// On-disk feature cache rooted at a platform-appropriate location.
@@ -60,6 +61,92 @@ impl FeatureCache {
             .join(hash_ref_component(registry))
             .join(hash_ref_component(repository))
             .join(hash_ref_component(digest))
+    }
+
+    /// Write the OCI manifest for a feature to the cache.
+    ///
+    /// Stored as a `manifest-<hash>.json` sidecar alongside the artifact
+    /// directory, keyed by the same registry/repository/digest triple, and
+    /// written atomically (staged temp file + `rename`) so a concurrent reader
+    /// never observes a partial file. Failures are logged and swallowed — a
+    /// missing or unreadable sidecar is treated as a cache miss by
+    /// [`get_oci_manifest`] and triggers a one-time re-pull.
+    pub fn put_oci_manifest(
+        &self,
+        registry: &str,
+        repository: &str,
+        digest: &str,
+        manifest: &OciImageManifest,
+    ) {
+        let path = self.oci_manifest_path(registry, repository, digest);
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(
+                "failed to create manifest cache dir {}: {e}",
+                parent.display()
+            );
+            return;
+        }
+        let json = match serde_json::to_string(manifest) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to serialise OCI manifest for {registry}/{repository}@{digest}: {e}"
+                );
+                return;
+            }
+        };
+        // Stage to a per-process temp file then atomically rename, so a
+        // concurrent reader never observes a partially-written manifest.
+        let staging = path.with_extension(format!("partial-{}", process::id()));
+        if let Err(e) = std::fs::write(&staging, &json) {
+            tracing::warn!("failed to write manifest cache {}: {e}", staging.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(&staging, &path) {
+            tracing::warn!("failed to commit manifest cache {}: {e}", path.display());
+            let _ = std::fs::remove_file(&staging);
+        }
+    }
+
+    /// Read a cached OCI manifest by registry/repository/digest.
+    ///
+    /// Returns `None` when the file is absent or cannot be parsed — the caller
+    /// should treat this as a cache miss and re-pull the manifest.
+    #[must_use]
+    pub fn get_oci_manifest(
+        &self,
+        registry: &str,
+        repository: &str,
+        digest: &str,
+    ) -> Option<OciImageManifest> {
+        let path = self.oci_manifest_path(registry, repository, digest);
+        let json = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&json) {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                tracing::warn!("failed to parse manifest cache {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Compute the cache path for a stored OCI manifest.
+    ///
+    /// Lives alongside the artifact directory as a sibling file:
+    /// `<oci_parent>/manifest-<digest_hash>.json`.
+    fn oci_manifest_path(&self, registry: &str, repository: &str, digest: &str) -> PathBuf {
+        // Reuse the same three-hash key scheme as oci_path.  The manifest file
+        // lives inside the same parent directory as the artifact, so the
+        // registry and repository hashes form the directory while the digest
+        // hash is used as a filename component — avoiding a 5-segment path.
+        let parent = self
+            .root
+            .join("oci")
+            .join(hash_ref_component(registry))
+            .join(hash_ref_component(repository));
+        parent.join(format!("manifest-{}.json", hash_ref_component(digest)))
     }
 
     /// Check whether a URL-fetched feature tarball is already cached.
@@ -458,5 +545,111 @@ mod tests {
         assert!(path.ends_with("builds/abc123"));
         // Should be a sibling of the features root, not nested inside it.
         assert!(!path.starts_with(dir.path().join("features")));
+    }
+
+    // -----------------------------------------------------------------------
+    // OCI manifest cache: put_oci_manifest / get_oci_manifest
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal `OciImageManifest` for testing.
+    fn make_test_manifest() -> OciImageManifest {
+        use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
+        OciImageManifest {
+            schema_version: 2,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            config: OciDescriptor {
+                media_type: "application/vnd.devcontainers".to_string(),
+                digest: "sha256:cfgdigest000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                size: 42,
+                ..OciDescriptor::default()
+            },
+            layers: vec![OciDescriptor {
+                media_type: "application/vnd.devcontainers.layer.v1+tar+gz".to_string(),
+                digest: "sha256:layerdigest0000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                size: 1024,
+                ..OciDescriptor::default()
+            }],
+            ..OciImageManifest::default()
+        }
+    }
+
+    #[test]
+    fn manifest_cache_miss_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let result = cache.get_oci_manifest("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        assert!(result.is_none(), "expected None on cache miss");
+    }
+
+    #[test]
+    fn manifest_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+
+        let manifest = make_test_manifest();
+        cache.put_oci_manifest(
+            "ghcr.io",
+            "devcontainers/features/node",
+            "sha256:abc",
+            &manifest,
+        );
+
+        let retrieved = cache
+            .get_oci_manifest("ghcr.io", "devcontainers/features/node", "sha256:abc")
+            .expect("manifest should be cached");
+
+        // Verify the key fields round-tripped correctly.
+        assert_eq!(retrieved.config.digest, manifest.config.digest);
+        assert_eq!(retrieved.config.size, manifest.config.size);
+        assert_eq!(retrieved.layers.len(), manifest.layers.len());
+        assert_eq!(retrieved.layers[0].digest, manifest.layers[0].digest);
+        assert_eq!(retrieved.layers[0].size, manifest.layers[0].size);
+    }
+
+    #[test]
+    fn manifest_cache_key_is_digest_scoped() {
+        // Two different digests must produce different cache entries.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+
+        let manifest = make_test_manifest();
+        cache.put_oci_manifest(
+            "ghcr.io",
+            "devcontainers/features/node",
+            "sha256:aaa",
+            &manifest,
+        );
+
+        // Different digest — should miss.
+        assert!(
+            cache
+                .get_oci_manifest("ghcr.io", "devcontainers/features/node", "sha256:bbb")
+                .is_none(),
+            "different digest must be a cache miss"
+        );
+        // Same digest — should hit.
+        assert!(
+            cache
+                .get_oci_manifest("ghcr.io", "devcontainers/features/node", "sha256:aaa")
+                .is_some(),
+            "same digest must be a cache hit"
+        );
+    }
+
+    #[test]
+    fn manifest_path_is_sibling_of_artifact_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+
+        let artifact = cache.oci_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        let manifest =
+            cache.oci_manifest_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+
+        // Both must share the same parent directory.
+        assert_eq!(artifact.parent(), manifest.parent());
+        // Manifest path must end in a .json file.
+        assert_eq!(manifest.extension().and_then(|e| e.to_str()), Some("json"));
     }
 }

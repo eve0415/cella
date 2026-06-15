@@ -80,6 +80,13 @@ pub struct OciFetchResult {
     pub registry: String,
     /// The OCI repository path.
     pub repository: String,
+    /// The full OCI image manifest returned by the registry.
+    ///
+    /// Always populated — on a cache hit the manifest is read from the
+    /// `manifest-<hash>.json` sidecar written during the original fetch; on a
+    /// miss it is stored there immediately after pulling.  If the sidecar is
+    /// absent (pre-existing cache entry), the manifest is re-pulled once.
+    pub manifest: oci_distribution::manifest::OciImageManifest,
 }
 
 /// Find the first extractable layer in a manifest, or return an error listing available types.
@@ -278,12 +285,35 @@ impl OciFetcher {
         cache: &FeatureCache,
     ) -> Result<OciFetchResult, FeatureError> {
         if let Some(cached) = cache.get_oci(registry, repository, digest) {
+            // Read the sidecar manifest; if absent (cache entry predates manifest
+            // caching), re-pull it once by the pinned digest and store it so the
+            // result always carries a manifest without re-downloading the layer.
+            let manifest =
+                if let Some(manifest) = cache.get_oci_manifest(registry, repository, digest) {
+                    manifest
+                } else {
+                    // Sidecar absent (cache entry predates manifest caching): re-pull
+                    // once by the pinned digest and store it so the result always
+                    // carries a manifest without re-downloading the layer.
+                    let oci_ref = Reference::with_digest(
+                        registry.to_owned(),
+                        repository.to_owned(),
+                        digest.to_owned(),
+                    );
+                    let auth = build_registry_auth(registry);
+                    let (manifest, _) = self
+                        .pull_manifest(&oci_ref, &auth, registry, repository, tag)
+                        .await?;
+                    cache.put_oci_manifest(registry, repository, digest, &manifest);
+                    manifest
+                };
             return Ok(OciFetchResult {
                 artifact_dir: cached,
                 digest: digest.to_owned(),
                 version: tag.to_owned(),
                 registry: registry.to_owned(),
                 repository: repository.to_owned(),
+                manifest,
             });
         }
 
@@ -320,12 +350,14 @@ impl OciFetcher {
             tag,
             &resolved_digest,
         )?;
+        cache.put_oci_manifest(registry, repository, &resolved_digest, &manifest);
         Ok(OciFetchResult {
             artifact_dir,
             digest: resolved_digest,
             version: tag.to_owned(),
             registry: registry.to_owned(),
             repository: repository.to_owned(),
+            manifest,
         })
     }
 
@@ -350,6 +382,7 @@ impl OciFetcher {
         let (manifest, digest) = self
             .pull_manifest(&oci_ref, &auth, registry, repository, tag)
             .await?;
+        cache.put_oci_manifest(registry, repository, &digest, &manifest);
 
         if let Some(cached) = cache.get_oci(registry, repository, &digest) {
             debug!("cache hit by digest {digest} for {registry}/{repository}:{tag}");
@@ -359,6 +392,7 @@ impl OciFetcher {
                 version: tag.to_owned(),
                 registry: registry.to_owned(),
                 repository: repository.to_owned(),
+                manifest,
             });
         }
 
@@ -379,6 +413,7 @@ impl OciFetcher {
             version: tag.to_owned(),
             registry: registry.to_owned(),
             repository: repository.to_owned(),
+            manifest,
         })
     }
 }
@@ -557,5 +592,50 @@ mod tests {
         // Second fetch should hit cache.
         let path2 = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
         assert_eq!(path, path2, "second fetch should return cached path");
+    }
+
+    #[cella_testing::runtime_test(network)]
+    async fn oci_fetch_retains_manifest_across_cache_miss_and_hit() {
+        let fetcher = OciFetcher::new();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path());
+
+        let reference = NormalizedRef::OciTarget {
+            registry: "ghcr.io".to_owned(),
+            repository: "devcontainers/features/node".to_owned(),
+            tag: "1".to_owned(),
+        };
+
+        // Cache-miss path (fetch_by_tag): pulls the manifest, writes the sidecar,
+        // and populates the result field.
+        let fresh = fetcher
+            .fetch_oci_with_digest(&reference, &cache, None)
+            .await
+            .unwrap();
+        assert!(
+            !fresh.manifest.config.digest.is_empty(),
+            "retained manifest must carry the config descriptor digest"
+        );
+        assert!(
+            !fresh.manifest.layers.is_empty(),
+            "retained manifest must carry at least one layer descriptor"
+        );
+
+        // Cache-hit path (fetch_by_locked_digest): reads the manifest from the
+        // sidecar without re-downloading the layer; the field stays populated and
+        // identical to the original pull.
+        let cached = fetcher
+            .fetch_oci_with_digest(&reference, &cache, Some(&fresh.digest))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.manifest.config.digest, fresh.manifest.config.digest,
+            "cache-hit manifest must match the originally fetched manifest"
+        );
+        assert_eq!(
+            cached.manifest.layers.len(),
+            fresh.manifest.layers.len(),
+            "cache-hit manifest must carry the same layer set"
+        );
     }
 }
