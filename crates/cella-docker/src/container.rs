@@ -169,11 +169,11 @@ impl DockerClient {
             ..Default::default()
         };
         let containers = self.inner().list_containers(Some(options)).await?;
-        if let Some(summary) = containers.into_iter().next() {
-            let id = summary.id.as_deref().unwrap_or_default();
-            Ok(Some(self.inspect_container(id).await?))
-        } else {
-            Ok(None)
+        match containers.into_iter().next().and_then(|s| s.id) {
+            // A summary without an id can't be inspected — treat it as "no match"
+            // rather than inspecting "" and turning it into a hard API error.
+            Some(id) if !id.is_empty() => Ok(Some(self.inspect_container(&id).await?)),
+            _ => Ok(None),
         }
     }
 
