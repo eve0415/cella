@@ -105,6 +105,7 @@ pub(crate) fn container_info_from_summary(
         config_hash,
         ports,
         created_at,
+        started_at: None,
         container_user: None,
         image: summary.image,
         mounts: Vec::new(),
@@ -153,6 +154,9 @@ impl DockerClient {
     }
 
     /// Return the first container matching a single `key=value` label filter.
+    ///
+    /// Follows up with an inspect so that fields only available via inspect
+    /// (e.g. `started_at`, `container_user`, `mounts`) are populated.
     async fn find_one_by_label(
         &self,
         label: &str,
@@ -165,10 +169,12 @@ impl DockerClient {
             ..Default::default()
         };
         let containers = self.inner().list_containers(Some(options)).await?;
-        Ok(containers
-            .into_iter()
-            .next()
-            .map(container_info_from_summary))
+        if let Some(summary) = containers.into_iter().next() {
+            let id = summary.id.as_deref().unwrap_or_default();
+            Ok(Some(self.inspect_container(id).await?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Create a container from mapped config options.
@@ -354,6 +360,7 @@ impl DockerClient {
             config_hash,
             ports,
             created_at: inspect.created,
+            started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             container_user,
             image,
             mounts,
@@ -832,6 +839,7 @@ mod tests {
             config_hash: None,
             ports: Vec::new(),
             created_at: None,
+            started_at: None,
             container_user: None,
             image: None,
             mounts: Vec::new(),

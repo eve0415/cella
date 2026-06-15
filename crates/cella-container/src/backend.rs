@@ -1361,6 +1361,9 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
         config_hash,
         ports,
         created_at,
+        // Apple Container 1.0.0 does not expose started_at — postStartCommand
+        // always runs (safe fallback via Option::None semantics).
+        started_at: None,
         container_user: None,
         image: config.image.as_ref().and_then(|i| i.reference.clone()),
         mounts,

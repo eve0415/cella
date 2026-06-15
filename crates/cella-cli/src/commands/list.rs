@@ -345,6 +345,7 @@ mod tests {
             config_hash: None,
             container_user: None,
             created_at: None,
+            started_at: None,
             image: None,
             mounts: vec![],
             exit_code: None,

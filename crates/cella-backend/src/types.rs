@@ -112,6 +112,12 @@ pub struct ContainerInfo {
     pub config_hash: Option<String>,
     pub ports: Vec<PortBinding>,
     pub created_at: Option<String>,
+    /// The time the container was last started (RFC3339).
+    ///
+    /// Populated from `docker inspect` state; `None` for list/summary paths and
+    /// Apple Container backend (which does not expose this field). When `None`,
+    /// `postStartCommand` always runs (safe fallback).
+    pub started_at: Option<String>,
     /// The USER from the container's config (only populated via inspect, not list).
     pub container_user: Option<String>,
     /// The image used to create the container.

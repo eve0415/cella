@@ -423,6 +423,8 @@ impl EnsureUpContext<'_> {
         run_lifecycle_entries(&lc_ctx, "onCreateCommand", &entries, &self.progress).await?;
         let new_state = LifecycleState {
             oncreate_done: true,
+            // `up` doesn't record started_at — run-user-commands is the sole writer.
+            started_at: None,
         };
         write_lifecycle_state(self.client, container_id, remote_user, &new_state).await;
         Ok(())
@@ -456,6 +458,7 @@ impl EnsureUpContext<'_> {
 
         let state = LifecycleState {
             oncreate_done: true,
+            started_at: None,
         };
         write_lifecycle_state(self.client, &container.id, remote_user, &state).await;
         write_content_hash(
@@ -1630,6 +1633,7 @@ impl EnsureUpContext<'_> {
         if !gate.enabled {
             let state = LifecycleState {
                 oncreate_done: false,
+                started_at: None,
             };
             write_lifecycle_state(self.client, container_id, remote_user, &state).await;
             return Ok(());
@@ -1669,6 +1673,7 @@ impl EnsureUpContext<'_> {
         let oncreate_foreground = gate.foreground_boundary() > 0;
         let state = LifecycleState {
             oncreate_done: oncreate_foreground,
+            started_at: None,
         };
         write_lifecycle_state(self.client, container_id, remote_user, &state).await;
 

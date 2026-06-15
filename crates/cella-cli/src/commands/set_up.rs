@@ -221,6 +221,7 @@ impl SetUpArgs {
                     target_path: &self.dotfiles.target_path,
                 },
                 workspace_root: workspace_root.as_deref(),
+                container_started_at: container.started_at.as_deref(),
             };
             let result = orchestrator::run_user_commands(&lc_ctx, &input, &sender).await;
             drop(sender);
@@ -492,6 +493,7 @@ mod tests {
             config_hash: None,
             ports: Vec::new(),
             created_at: None,
+            started_at: None,
             container_user: None,
             image: None,
             mounts: Vec::new(),

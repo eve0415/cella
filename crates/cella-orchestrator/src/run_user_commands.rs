@@ -36,9 +36,10 @@
 //! `rerun = !!prebuild`), AND it writes each marker back after its phase
 //! succeeds (just like `up`), so repeated invocations don't re-run a phase that
 //! already completed. A FAILED previous background lifecycle re-runs every gated
-//! phase (recovery). `postStartCommand`/`postAttachCommand` still run
-//! unconditionally — `startedAt`-based postStart gating is a follow-up (needs new
-//! ContainerInfo/LifecycleState plumbing).
+//! phase (recovery). `postStartCommand` is skipped when the container has not
+//! restarted since `up` last ran it (its current `started_at` matches the
+//! recorded one), and the new `started_at` is written back after it runs —
+//! mirroring the official `startedAt` marker. `postAttachCommand` always runs.
 
 use cella_backend::ContainerBackend;
 use cella_backend::lifecycle::{
@@ -174,6 +175,26 @@ pub struct RunUserCommandsInput<'a> {
     /// `content_changed` defaults to `true` so updateContent/postCreate run
     /// unconditionally — the safe fallback that matches today's behavior.
     pub workspace_root: Option<&'a std::path::Path>,
+    /// The container's current `started_at` timestamp (RFC3339, from Docker
+    /// inspect). Used to decide whether `postStartCommand` can be skipped.
+    ///
+    /// `None` means the value was not available (list-path resolution, Apple
+    /// backend, etc.) — `postStartCommand` always runs in that case (safe).
+    pub container_started_at: Option<&'a str>,
+}
+
+/// Decide whether `postStartCommand` should run.
+///
+/// Skip only when the recorded `started_at` (what `up` wrote after the last
+/// successful postStart) matches the container's current `started_at` — i.e.
+/// the container has NOT restarted since postStart last ran.
+///
+/// `None` on either side → run (safe: no recorded value means we haven't run
+/// yet, or the current value is unavailable from the backend).
+#[must_use]
+pub fn should_run_post_start(recorded: Option<&str>, current: Option<&str>) -> bool {
+    // Skip only on a confirmed match of two `Some` values.
+    !(recorded.is_some() && recorded == current)
 }
 
 /// Run the gated lifecycle phases in the foreground against an existing
@@ -215,11 +236,17 @@ pub async fn run_user_commands(
     // If the previous background lifecycle FAILED, re-run every gated phase —
     // run-user-commands is cella's recovery path, and the content-hash skip is
     // only sound when the prior run completed.
-    let skips = if lifecycle_failed(lc_ctx).await {
+    let recovery = lifecycle_failed(lc_ctx).await;
+    let skips = if recovery {
         PhaseSkips::run_all()
     } else {
         phase_skips(oncreate_done, is_content_changed, g.stop.prebuild)
     };
+    // postStart is gated separately (restart detection, not create-time state):
+    // skip it only when the container hasn't restarted since `up` last ran it.
+    // Recovery forces it like every other phase.
+    let run_post_start = recovery
+        || should_run_post_start(lc_state.started_at.as_deref(), input.container_started_at);
 
     // (b) onCreate, then gate. Mark it done on success so a later run/up skips
     // it — written only after the phase ran, mirroring `up`.
@@ -266,8 +293,16 @@ pub async fn run_user_commands(
         return Ok(STATUS_STOP_FOR_PERSONALIZATION);
     }
 
-    // (h) postStart, then gate.
-    run_phase(lc_ctx, input, "postStartCommand", progress).await?;
+    // (h) postStart, then gate. Skip when the container hasn't restarted since
+    // `up` last ran it; on success record the current started_at so a later
+    // run/up skips it — written only after the phase ran, mirroring `up`.
+    if run_post_start {
+        run_phase(lc_ctx, input, "postStartCommand", progress).await?;
+        if let Some(current) = input.container_started_at {
+            lc_state.started_at = Some(current.to_owned());
+            write_lifecycle_state(lc_ctx.client, lc_ctx.container_id, remote_user, &lc_state).await;
+        }
+    }
     if stops_after(g, WaitForPhase::PostStart) {
         return Ok(STATUS_SKIP_NON_BLOCKING);
     }
@@ -571,6 +606,28 @@ mod tests {
         assert!(s.run_post_create, "recovery re-runs postCreate");
     }
 
+    #[test]
+    fn should_run_post_start_cases() {
+        // Skip ONLY on a confirmed match of two Some values (no restart).
+        assert!(
+            !should_run_post_start(Some("T"), Some("T")),
+            "no restart → skip"
+        );
+        assert!(
+            should_run_post_start(Some("T1"), Some("T2")),
+            "restart → run"
+        );
+        assert!(
+            should_run_post_start(None, Some("T")),
+            "never recorded → run"
+        );
+        assert!(
+            should_run_post_start(Some("T"), None),
+            "current unavailable → run"
+        );
+        assert!(should_run_post_start(None, None), "both absent → run");
+    }
+
     // ── mock-backend integration tests ───────────────────────────────────────
     //
     // These exercise run_user_commands against a mock ContainerBackend that
@@ -601,6 +658,10 @@ mod tests {
         /// (the common case: nothing failed). Set to `{"status":"failed"}` to
         /// exercise the recovery path.
         lifecycle_status: String,
+        /// The `started_at` recorded in `lifecycle_state.json`. `None` = not yet
+        /// recorded (postStart always runs). Set to a timestamp to exercise the
+        /// restart-skip path.
+        recorded_started_at: Option<String>,
         recorded: Arc<Mutex<Vec<String>>>,
     }
 
@@ -614,6 +675,7 @@ mod tests {
                 oncreate_done,
                 stored_hash: stored_hash.into(),
                 lifecycle_status: String::new(),
+                recorded_started_at: None,
                 recorded: Arc::clone(&recorded),
             };
             (backend, recorded)
@@ -711,7 +773,10 @@ mod tests {
                 .is_some_and(|a| a == "/tmp/.cella/lifecycle_state.json")
             {
                 let flag = if self.oncreate_done { "true" } else { "false" };
-                format!(r#"{{"oncreate_done":{flag}}}"#)
+                self.recorded_started_at.as_ref().map_or_else(
+                    || format!(r#"{{"oncreate_done":{flag}}}"#),
+                    |ts| format!(r#"{{"oncreate_done":{flag},"started_at":"{ts}"}}"#),
+                )
             } else if opts
                 .cmd
                 .get(1)
@@ -922,6 +987,9 @@ mod tests {
                 target_path: "/root/dotfiles",
             },
             workspace_root,
+            // No recorded started_at in these mocks → postStart runs (the
+            // restart-skip cases use bespoke inputs below).
+            container_started_at: None,
         }
     }
 
@@ -1146,6 +1214,56 @@ mod tests {
         assert!(
             cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
             "recovery re-runs postCreate; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poststart_skipped_when_container_not_restarted() {
+        // recorded started_at == current → no restart → postStart skipped.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+        let (mut backend, recorded) = LifecycleMockBackend::new(true, expected_hash);
+        backend.recorded_started_at = Some("2026-06-15T12:00:00Z".to_owned());
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let mut input = input_with_phases(&config, Some(tmp.path()));
+        input.container_started_at = Some("2026-06-15T12:00:00Z");
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_POSTSTART")),
+            "postStart skipped when container has not restarted; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poststart_runs_and_persists_when_restarted() {
+        // recorded started_at != current → restart → postStart runs and records
+        // the new started_at (mirror of up).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+        let (mut backend, recorded) = LifecycleMockBackend::new(true, expected_hash);
+        backend.recorded_started_at = Some("2026-06-15T12:00:00Z".to_owned());
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let mut input = input_with_phases(&config, Some(tmp.path()));
+        input.container_started_at = Some("2026-06-15T18:00:00Z");
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_POSTSTART")),
+            "postStart runs after a restart; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("> /tmp/.cella/lifecycle_state.json")),
+            "started_at persisted after postStart runs; got {cmds:?}"
         );
     }
 }
