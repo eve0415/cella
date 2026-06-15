@@ -82,6 +82,11 @@ pub struct TemplatesGenerateDocsArgs {
     /// GitHub repository name used to build the README footer URL.
     #[arg(long = "github-repo", default_value = "")]
     pub github_repo: String,
+
+    /// Log verbosity level. Defaults to `info`, matching the official
+    /// `devcontainer templates generate-docs --log-level`.
+    #[arg(long = "log-level", value_enum, default_value = "info")]
+    pub log_level: LogLevel,
 }
 
 /// Arguments for `cella templates metadata`.
@@ -148,8 +153,8 @@ impl TemplatesArgs {
             TemplatesCommand::Apply(args) => Some(args.log_level),
             TemplatesCommand::Metadata(args) => Some(args.log_level),
             TemplatesCommand::Publish(args) => Some(args.log_level),
-            TemplatesCommand::GenerateDocs(_)
-            | TemplatesCommand::New { .. }
+            TemplatesCommand::GenerateDocs(args) => Some(args.log_level),
+            TemplatesCommand::New { .. }
             | TemplatesCommand::List
             | TemplatesCommand::Edit { .. } => None,
         }
@@ -698,6 +703,54 @@ mod tests {
         assert!(matches!(
             templates_args.apply_log_level(),
             Some(LogLevel::Debug)
+        ));
+    }
+
+    fn parse_generate_docs(argv: &[&str]) -> Result<TemplatesGenerateDocsArgs, clap::Error> {
+        let mut full = vec!["templates", "generate-docs"];
+        full.extend_from_slice(argv);
+        let parsed = <MetadataHarness as clap::Parser>::try_parse_from(full)?;
+        match parsed.command {
+            TemplatesCommand::GenerateDocs(args) => Ok(args),
+            _ => unreachable!("parsed the generate-docs subcommand"),
+        }
+    }
+
+    #[test]
+    fn generate_docs_accepts_log_level_flag() {
+        // Regression: generate-docs lacked `--log-level` entirely; the official
+        // templatesGenerateDocsOptions registers it (info|debug|trace).
+        for level in ["info", "debug", "trace"] {
+            let args = parse_generate_docs(&["--log-level", level])
+                .unwrap_or_else(|e| panic!("--log-level {level} should parse: {e}"));
+            assert!(matches!(
+                args.log_level,
+                LogLevel::Info | LogLevel::Debug | LogLevel::Trace
+            ));
+        }
+    }
+
+    #[test]
+    fn generate_docs_log_level_defaults_to_info() {
+        let args = parse_generate_docs(&[]).unwrap();
+        assert!(matches!(args.log_level, LogLevel::Info));
+    }
+
+    #[test]
+    fn generate_docs_log_level_wired_through_apply_log_level() {
+        let parsed = <MetadataHarness as clap::Parser>::try_parse_from([
+            "templates",
+            "generate-docs",
+            "--log-level",
+            "trace",
+        ])
+        .unwrap();
+        let templates_args = TemplatesArgs {
+            command: parsed.command,
+        };
+        assert!(matches!(
+            templates_args.apply_log_level(),
+            Some(LogLevel::Trace)
         ));
     }
 
