@@ -69,8 +69,23 @@ pub struct ExecArgs {
     #[arg(long, value_enum, default_value = "text")]
     output: super::OutputFormat,
 
+    /// Container data folder for in-container user data (compatibility no-op).
+    #[arg(long = "container-data-folder")]
+    container_data_folder: Option<PathBuf>,
+
+    /// Container system data folder (compatibility no-op).
+    #[arg(long = "container-system-data-folder")]
+    container_system_data_folder: Option<PathBuf>,
+
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
+
+    /// Shared devcontainer-CLI compat flags (`--docker-path`, `--user-data-folder`,
+    /// `--mount-*`, `--log-level`/`--log-format`, `--terminal-*`,
+    /// `--skip-feature-auto-mapping`). All no-ops except log-level/log-format
+    /// (seeded into tracing by `main.rs`).
+    #[command(flatten)]
+    pub(crate) compat: super::WorkspaceCompatArgs,
 
     /// The command to execute.
     #[arg(trailing_var_arg = true, required = true)]
@@ -595,6 +610,153 @@ mod tests {
             panic!("expected exec subcommand");
         };
         assert_eq!(args.id_label, ["a=1", "b=2"]);
+    }
+
+    // ── devcontainer-CLI flag parity ───────────────────────────────
+    //
+    // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
+    // `execOptions` (lines 1250-1271). Every official long flag MUST be declared
+    // so no official `devcontainer exec` invocation errors with "unknown
+    // argument". This test exists because exec drifted from the spec for lack of
+    // one — adding a flag to the official means adding it here.
+    const OFFICIAL_EXEC_FLAGS: &[&str] = &[
+        "user-data-folder",
+        "docker-path",
+        "docker-compose-path",
+        "container-data-folder",
+        "container-system-data-folder",
+        "workspace-folder",
+        "mount-workspace-git-root",
+        "mount-git-worktree-common-dir",
+        "container-id",
+        "id-label",
+        "config",
+        "override-config",
+        "log-level",
+        "log-format",
+        "terminal-columns",
+        "terminal-rows",
+        "default-user-env-probe",
+        "remote-env",
+        "skip-feature-auto-mapping",
+    ];
+
+    #[test]
+    fn exec_flag_parity() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+        let cli = crate::Cli::command();
+        let cmd = cli
+            .find_subcommand("exec")
+            .expect("`exec` subcommand must exist");
+        let longs: HashSet<&str> = cmd
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+            .collect();
+        let missing: Vec<&&str> = OFFICIAL_EXEC_FLAGS
+            .iter()
+            .filter(|f| !longs.contains(**f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`exec` is missing official flags: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn exec_accepts_all_new_compat_flags() {
+        use clap::Parser;
+        // A maximal official-style invocation must parse Ok. Mirrors the kind of
+        // command that previously errored with "unexpected argument".
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "exec",
+            "--log-format",
+            "json",
+            "--log-level",
+            "debug",
+            "--user-data-folder",
+            "/x",
+            "--docker-path",
+            "/usr/bin/docker",
+            "--docker-compose-path",
+            "/usr/bin/docker-compose",
+            "--container-data-folder",
+            "/cdata",
+            "--container-system-data-folder",
+            "/csys",
+            "--mount-git-worktree-common-dir",
+            "--terminal-columns",
+            "80",
+            "--terminal-rows",
+            "40",
+            "--skip-feature-auto-mapping",
+            "--",
+            "true",
+        ])
+        .expect("all official exec compat flags must parse");
+        let crate::commands::Command::Exec(args) = &cli.command else {
+            panic!("expected exec subcommand");
+        };
+        // log-level/log-format are wired (read by main.rs); confirm they land.
+        assert!(matches!(
+            args.compat.log_level,
+            Some(super::super::LogLevel::Debug)
+        ));
+        assert!(matches!(
+            args.compat.log_format,
+            super::super::LogFormat::Json
+        ));
+    }
+
+    #[test]
+    fn exec_mount_workspace_git_root_boolean_forms() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| -> bool {
+            let cli = crate::Cli::try_parse_from(argv).expect("must parse");
+            let crate::commands::Command::Exec(args) = cli.command else {
+                panic!("expected exec subcommand");
+            };
+            args.compat.mount_workspace_git_root
+        };
+        // Absent → default true.
+        assert!(parse(&["cella", "exec", "--", "true"]));
+        // Explicit value false (official `--mount-workspace-git-root false`).
+        assert!(!parse(&[
+            "cella",
+            "exec",
+            "--mount-workspace-git-root",
+            "false",
+            "--",
+            "true",
+        ]));
+        // Explicit value true.
+        assert!(parse(&[
+            "cella",
+            "exec",
+            "--mount-workspace-git-root",
+            "true",
+            "--",
+            "true",
+        ]));
+        // Bare flag (official yargs boolean accepts the no-value form) → true.
+        assert!(parse(&[
+            "cella",
+            "exec",
+            "--mount-workspace-git-root",
+            "--",
+            "true",
+        ]));
+    }
+
+    #[test]
+    fn exec_terminal_columns_requires_rows() {
+        use clap::Parser;
+        // Official pairs terminal-columns/terminal-rows via `implies`; clap's
+        // `requires` enforces the same — one without the other is rejected.
+        let r =
+            crate::Cli::try_parse_from(["cella", "exec", "--terminal-columns", "80", "--", "true"]);
+        assert!(r.is_err(), "--terminal-columns alone must be rejected");
     }
 
     #[test]

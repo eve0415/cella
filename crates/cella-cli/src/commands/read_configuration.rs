@@ -47,6 +47,16 @@ pub struct ReadConfigurationArgs {
     /// Additional features as JSON string.
     #[arg(long = "additional-features")]
     additional_features: Option<String>,
+
+    /// Shared devcontainer-CLI compat flags (`--docker-path`,
+    /// `--user-data-folder`, `--mount-*`, `--log-level`/`--log-format`,
+    /// `--terminal-*`, `--skip-feature-auto-mapping`). Mostly no-ops; the
+    /// exceptions are log-level/log-format (seeded into tracing by `main.rs`)
+    /// and `--mount-workspace-git-root`, which is honored here — when `false`
+    /// the reported `workspaceMount` binds the workspace folder itself rather
+    /// than its git root (defaults to `true`, matching the official).
+    #[command(flatten)]
+    pub(crate) compat: super::WorkspaceCompatArgs,
 }
 
 impl ReadConfigurationArgs {
@@ -106,7 +116,8 @@ impl ReadConfigurationArgs {
         // bind-mounts the git-root folder (mountWorkspaceGitRoot defaults to
         // true). read-configuration exposes no flag to override this, so the
         // default is reported. Compose configs ignore this (no bind mount).
-        let host_mount_folder = cella_git::find_git_root_folder(&cwd, true);
+        let host_mount_folder =
+            cella_git::find_git_root_folder(&cwd, self.compat.mount_workspace_git_root);
         let mut output = build_base_output(
             &resolved.config,
             &resolved.config_path,
@@ -743,6 +754,123 @@ mod tests {
         );
     }
 
+    // ── devcontainer-CLI flag parity ───────────────────────────────
+    //
+    // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
+    // `readConfigurationOptions` (lines 993-1012). Every official long flag MUST
+    // be declared so no official `devcontainer read-configuration` invocation
+    // errors with "unknown argument". This test exists because the command
+    // drifted from the spec for lack of one.
+    const OFFICIAL_READ_CONFIGURATION_FLAGS: &[&str] = &[
+        "user-data-folder",
+        "docker-path",
+        "docker-compose-path",
+        "workspace-folder",
+        "mount-workspace-git-root",
+        "mount-git-worktree-common-dir",
+        "container-id",
+        "id-label",
+        "config",
+        "override-config",
+        "log-level",
+        "log-format",
+        "terminal-columns",
+        "terminal-rows",
+        "include-features-configuration",
+        "include-merged-configuration",
+        "additional-features",
+        "skip-feature-auto-mapping",
+    ];
+
+    #[test]
+    fn read_configuration_flag_parity() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+        let cli = crate::Cli::command();
+        let cmd = cli
+            .find_subcommand("read-configuration")
+            .expect("`read-configuration` subcommand must exist");
+        let longs: HashSet<&str> = cmd
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+            .collect();
+        let missing: Vec<&&str> = OFFICIAL_READ_CONFIGURATION_FLAGS
+            .iter()
+            .filter(|f| !longs.contains(**f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`read-configuration` is missing official flags: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn read_configuration_accepts_all_new_compat_flags() {
+        use clap::Parser;
+        // A maximal official-style invocation must parse Ok.
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "read-configuration",
+            "--log-format",
+            "json",
+            "--log-level",
+            "debug",
+            "--user-data-folder",
+            "/x",
+            "--docker-path",
+            "/usr/bin/docker",
+            "--docker-compose-path",
+            "/usr/bin/docker-compose",
+            "--mount-workspace-git-root",
+            "false",
+            "--mount-git-worktree-common-dir",
+            "--terminal-columns",
+            "80",
+            "--terminal-rows",
+            "40",
+            "--skip-feature-auto-mapping",
+        ])
+        .expect("all official read-configuration compat flags must parse");
+        let crate::commands::Command::ReadConfiguration(args) = &cli.command else {
+            panic!("expected read-configuration subcommand");
+        };
+        assert!(matches!(
+            args.compat.log_level,
+            Some(super::super::LogLevel::Debug)
+        ));
+        assert!(matches!(
+            args.compat.log_format,
+            super::super::LogFormat::Json
+        ));
+        assert!(!args.compat.mount_workspace_git_root);
+    }
+
+    #[test]
+    fn workspace_mount_reflects_mount_workspace_git_root() {
+        // `execute` now feeds `find_git_root_folder(cwd, mount_workspace_git_root)`
+        // into the reported `workspaceMount`. A git-root mount and a
+        // workspace-folder mount must therefore yield different sources — so
+        // `--mount-workspace-git-root false` is honored, not ignored.
+        let config = serde_json::json!({ "image": "ubuntu" });
+        let cfg = PathBuf::from("/repo/sub/.devcontainer/devcontainer.json");
+        let workspace = PathBuf::from("/repo/sub");
+        let git_root_mount = build_base_output(&config, &cfg, &workspace, &PathBuf::from("/repo"));
+        let workspace_mount = build_base_output(&config, &cfg, &workspace, &workspace);
+        assert_ne!(
+            git_root_mount["workspace"]["workspaceMount"],
+            workspace_mount["workspace"]["workspaceMount"],
+            "mount source must differ between git-root and workspace-folder mounts"
+        );
+    }
+
+    #[test]
+    fn read_configuration_terminal_columns_requires_rows() {
+        use clap::Parser;
+        let r =
+            crate::Cli::try_parse_from(["cella", "read-configuration", "--terminal-columns", "80"]);
+        assert!(r.is_err(), "--terminal-columns alone must be rejected");
+    }
+
     // -------------------------------------------------------------------------
     // build_merged_output — lifecycle plural arrays
     // -------------------------------------------------------------------------
@@ -1268,6 +1396,7 @@ mod tests {
             override_config: None,
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: None,
         };
         args.execute().await.unwrap();
@@ -1289,6 +1418,7 @@ mod tests {
             override_config: Some(override_path),
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: None,
         };
         args.execute().await.unwrap();
@@ -1307,6 +1437,7 @@ mod tests {
             override_config: None,
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: Some(
                 r#"{"ghcr.io/devcontainers/features/git:1": {}}"#.to_string(),
             ),
@@ -1327,6 +1458,7 @@ mod tests {
             override_config: None,
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: Some("not valid json".to_string()),
         };
         let err = args.execute().await.unwrap_err();
@@ -1346,6 +1478,7 @@ mod tests {
             override_config: None,
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: Some(r#"["not", "an", "object"]"#.to_string()),
         };
         let err = args.execute().await.unwrap_err();
@@ -1366,6 +1499,7 @@ mod tests {
             override_config: None,
             id_label: Vec::new(),
             container_id: None,
+            compat: crate::commands::WorkspaceCompatArgs::default(),
             additional_features: None,
         };
         // Capture stdout to verify the shape.

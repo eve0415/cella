@@ -133,6 +133,99 @@ pub fn derive_lockfile_policy(
     }
 }
 
+/// Compatibility/diagnostic flags shared by the workspace-resolving commands
+/// `exec` and `read-configuration`, sized to the **common** subset of their
+/// official option surfaces (devcontainers/cli `execOptions`, lines 1250-1271,
+/// and `readConfigurationOptions`, lines 993-1012).
+///
+/// Every field here is a no-op in cella, accepted purely for drop-in parity:
+/// cella manages its own data dirs, talks to the engine API directly (not the
+/// `docker`/`docker compose` CLI), fixes the workspace mount layout at create
+/// time, and resolves no features on these paths. `--log-level`/`--log-format`
+/// are the exception — they ARE wired, seeded into the global tracing subscriber
+/// by `main.rs` via [`Command::log_level`]/[`Command::log_format`] before
+/// dispatch (the same path `up`/`run-user-commands` use).
+///
+/// This is deliberately NOT [`run_user_commands::CompatArgs`]: that struct
+/// carries `--secrets-file` (which it *wires*) and `--container-session-data-
+/// folder`, neither of which the official `exec`/`read-configuration` accept —
+/// flattening it would over-expose and silently ignore `--secrets-file`. The
+/// container data-folder flags that ARE exec-only (`--container-data-folder`,
+/// `--container-system-data-folder`) live on `ExecArgs` directly, since
+/// `read-configuration` does not accept them.
+#[derive(Args)]
+pub struct WorkspaceCompatArgs {
+    /// `docker` CLI binary path (compatibility no-op).
+    #[arg(long = "docker-path")]
+    pub(crate) docker_path: Option<String>,
+
+    /// `docker compose` CLI binary path (compatibility no-op).
+    #[arg(long = "docker-compose-path")]
+    pub(crate) docker_compose_path: Option<String>,
+
+    /// Host directory persisted across sessions (compatibility no-op).
+    #[arg(long = "user-data-folder")]
+    pub(crate) user_data_folder: Option<std::path::PathBuf>,
+
+    /// Mount the workspace using its Git root (compatibility no-op, default
+    /// `true`). Accepts the official yargs boolean forms: bare
+    /// (`--mount-workspace-git-root`), explicit (`--mount-workspace-git-root
+    /// false`), and absent (defaults to `true`).
+    #[arg(
+        long = "mount-workspace-git-root",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+    )]
+    pub(crate) mount_workspace_git_root: bool,
+
+    /// Mount the Git worktree common dir (compatibility no-op).
+    #[arg(long = "mount-git-worktree-common-dir")]
+    pub(crate) mount_git_worktree_common_dir: bool,
+
+    /// Log verbosity (seeded into the global tracing filter by `main.rs`).
+    #[arg(long = "log-level", value_enum)]
+    pub(crate) log_level: Option<LogLevel>,
+
+    /// Log output format (seeded into the global tracing subscriber by `main.rs`).
+    #[arg(long = "log-format", value_enum, default_value = "text")]
+    pub(crate) log_format: LogFormat,
+
+    /// Number of columns to render subprocess output for (compatibility no-op).
+    #[arg(long = "terminal-columns", requires = "terminal_rows")]
+    pub(crate) terminal_columns: Option<u16>,
+
+    /// Number of rows to render subprocess output for (compatibility no-op).
+    #[arg(long = "terminal-rows", requires = "terminal_columns")]
+    pub(crate) terminal_rows: Option<u16>,
+
+    /// Temporary option for testing; cella resolves no features on these paths
+    /// (compatibility no-op, hidden — matches the official `hidden: true`).
+    #[arg(long = "skip-feature-auto-mapping", hide = true)]
+    pub(crate) skip_feature_auto_mapping: bool,
+}
+
+impl Default for WorkspaceCompatArgs {
+    /// Matches the clap-parsed defaults so struct-literal test construction (via
+    /// `..Default::default()`) mirrors a bare invocation. `mount_workspace_git_root`
+    /// defaults to `true` (the official default), which `#[derive(Default)]` would
+    /// get wrong (`false`).
+    fn default() -> Self {
+        Self {
+            docker_path: None,
+            docker_compose_path: None,
+            user_data_folder: None,
+            mount_workspace_git_root: true,
+            mount_git_worktree_common_dir: false,
+            log_level: None,
+            log_format: LogFormat::Text,
+            terminal_columns: None,
+            terminal_rows: None,
+            skip_feature_auto_mapping: false,
+        }
+    }
+}
+
 /// Common flags for commands that support verbose output.
 #[derive(Args, Clone)]
 pub struct VerboseArgs {
@@ -409,17 +502,19 @@ impl Command {
 
     /// The `--log-level` value, if the subcommand carries one.
     ///
-    /// `up` (and `code`, which embeds the `up` arg surface), `build`,
-    /// `run-user-commands`, `set-up`, `templates`, `features`, and `upgrade`
-    /// expose `--log-level`; every other variant returns
-    /// `None`. main.rs reads this once, before subcommand dispatch, to seed the
-    /// global tracing filter — the level can't be applied inside `execute()`
-    /// because the subscriber is already installed by then.
+    /// `up` (and `code`, which embeds the `up` arg surface), `build`, `exec`,
+    /// `read-configuration`, `run-user-commands`, `set-up`, `templates`,
+    /// `features`, and `upgrade` expose `--log-level`; every other variant
+    /// returns `None`. main.rs reads this once, before subcommand dispatch, to
+    /// seed the global tracing filter — the level can't be applied inside
+    /// `execute()` because the subscriber is already installed by then.
     pub const fn log_level(&self) -> Option<LogLevel> {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
             Self::Build(args) => args.log_level(),
+            Self::Exec(args) => args.compat.log_level,
+            Self::ReadConfiguration(args) => args.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
             Self::SetUp(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
@@ -431,8 +526,8 @@ impl Command {
 
     /// The `--log-format` value (defaults to `Text`).
     ///
-    /// `up`/`code`, `build`, `run-user-commands`, and `set-up` expose
-    /// `--log-format`; every other variant returns
+    /// `up`/`code`, `build`, `exec`, `read-configuration`, `run-user-commands`,
+    /// and `set-up` expose `--log-format`; every other variant returns
     /// `Text`. Read once in main.rs to select the tracing formatter and to
     /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
     /// machine-readable JSON log lines on stderr).
@@ -441,6 +536,8 @@ impl Command {
             Self::Up(args) => args.compat.log_format,
             Self::Code(args) => args.up.compat.log_format,
             Self::Build(args) => args.log_format(),
+            Self::Exec(args) => args.compat.log_format,
+            Self::ReadConfiguration(args) => args.compat.log_format,
             Self::RunUserCommands(args) => args.compat.log_format,
             Self::SetUp(args) => args.compat.log_format,
             _ => LogFormat::Text,
