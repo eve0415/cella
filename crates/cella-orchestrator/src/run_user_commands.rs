@@ -227,11 +227,17 @@ pub async fn run_user_commands(
     // read-modify-write that preserves any fields a later PR adds.
     let mut lc_state = read_lifecycle_state(lc_ctx.client, lc_ctx.container_id, remote_user).await;
     let oncreate_done = lc_state.oncreate_done;
-    // No workspace_root (e.g. bare --container-id) → default to changed (run)
-    // — safe fallback that matches today's unconditional behavior.
-    let is_content_changed = match input.workspace_root {
-        Some(ws) => content_changed(lc_ctx, ws).await,
-        None => true,
+    // Under prebuild, content_changed only feeds run_post_create, which is
+    // unreachable (the flow returns STATUS_PREBUILD before postCreate), and
+    // run_update_content is forced anyway — so skip the workspace scan. No
+    // workspace_root (bare --container-id) → default to changed (safe).
+    let is_content_changed = if g.stop.prebuild {
+        false
+    } else {
+        match input.workspace_root {
+            Some(ws) => content_changed(lc_ctx, ws).await,
+            None => true,
+        }
     };
     // If the previous background lifecycle FAILED, re-run every gated phase —
     // run-user-commands is cella's recovery path, and the content-hash skip is
