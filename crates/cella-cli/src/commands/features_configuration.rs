@@ -12,9 +12,19 @@
 //!   not the official's per-invocation temp folder.
 //! - `features[].value` is derived from the parsed options map, so the rare
 //!   string/boolean shorthand (`"feature": "latest"`) emits `{}` (the object
-//!   form is exact).
+//!   form is exact), and object keys are sorted (`serde_json` has no
+//!   `preserve_order`) rather than in devcontainer.json order.
 //! - the embedded `manifest` is re-serialised from the typed manifest, so its
 //!   JSON key order may differ from the registry's original bytes.
+//!
+//! Follow-ups, gated on `cella-features` modelling the field (it currently does
+//! not parse them, so they are dropped before reaching here, not invented):
+//! - `features[].documentationURL` / `licenseURL`, and string-option
+//!   `proposals` — unmodelled in `FeatureMetadata` / `FeatureOption`.
+//! - non-OCI `sourceInformation.tarballUri` (direct-tarball) /
+//!   `resolvedFilePath` (file-path) — not carried on `ResolvedFeature`.
+//! - explicitly-empty collections (`"capAdd": []`) are emitted as absent,
+//!   because the parser cannot distinguish them from an omitted key.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -146,6 +156,9 @@ struct FeatureOut {
 struct FeatureOptionOut {
     #[serde(rename = "type")]
     option_type: &'static str,
+    // Omit when absent (parsed `default` is `Null`): matches the official's
+    // optional `default?` being dropped from JSON when undefined.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     default: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -155,9 +168,9 @@ struct FeatureOptionOut {
 
 /// Build the `featuresConfiguration` value, or `None` when no features are
 /// declared (the official omits the key entirely in that case).
-pub fn build(rf: &ResolvedFeatures) -> Option<FeaturesConfiguration> {
+pub fn build(rf: &ResolvedFeatures) -> Result<Option<FeaturesConfiguration>, serde_json::Error> {
     if rf.features.is_empty() {
-        return None;
+        return Ok(None);
     }
     let dst_folder = rf.build_context.to_string_lossy().into_owned();
     let feature_sets = rf
@@ -165,27 +178,34 @@ pub fn build(rf: &ResolvedFeatures) -> Option<FeaturesConfiguration> {
         .iter()
         .enumerate()
         .map(|(idx, f)| feature_set(f, idx, &dst_folder))
-        .collect();
-    Some(FeaturesConfiguration {
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(FeaturesConfiguration {
         feature_sets,
         dst_folder,
+    }))
+}
+
+fn feature_set(
+    f: &ResolvedFeature,
+    idx: usize,
+    dst_folder: &str,
+) -> Result<FeatureSetOut, serde_json::Error> {
+    Ok(FeatureSetOut {
+        source_information: source_information(f)?,
+        features: vec![feature_out(f, idx, dst_folder)],
     })
 }
 
-fn feature_set(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureSetOut {
-    FeatureSetOut {
-        source_information: source_information(f),
-        features: vec![feature_out(f, idx, dst_folder)],
-    }
-}
-
-fn source_information(f: &ResolvedFeature) -> SourceInformationOut {
+fn source_information(f: &ResolvedFeature) -> Result<SourceInformationOut, serde_json::Error> {
     let user_feature_id = f.original_ref.clone();
     let user_feature_id_without_version = feature_id_without_version(&f.original_ref);
 
-    match &f.oci {
+    Ok(match &f.oci {
         Some(oci) => SourceInformationOut::Oci(Box::new(OciSourceInformationOut {
-            manifest: serde_json::to_value(&oci.manifest).unwrap_or(serde_json::Value::Null),
+            // Propagate rather than emit `manifest: null` on the (practically
+            // impossible) serialization error — a null manifest is a silent
+            // contract violation, so callers should see the failure.
+            manifest: serde_json::to_value(&oci.manifest)?,
             manifest_digest: oci.digest.clone(),
             feature_ref: parse_feature_ref(&f.original_ref),
             user_feature_id,
@@ -201,7 +221,7 @@ fn source_information(f: &ResolvedFeature) -> SourceInformationOut {
             user_feature_id,
             user_feature_id_without_version,
         }),
-    }
+    })
 }
 
 fn feature_out(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureOut {
@@ -422,12 +442,14 @@ mod tests {
 
     #[test]
     fn omits_when_no_features() {
-        assert!(build(&resolved(vec![])).is_none());
+        assert!(build(&resolved(vec![])).unwrap().is_none());
     }
 
     #[test]
     fn oci_feature_full_shape() {
-        let fc = build(&resolved(vec![oci_feature()])).expect("features present");
+        let fc = build(&resolved(vec![oci_feature()]))
+            .unwrap()
+            .expect("features present");
         let v = serde_json::to_value(&fc).unwrap();
 
         assert_eq!(v["dstFolder"], "/tmp/cella-features");
@@ -489,7 +511,9 @@ mod tests {
         f.id = "local".to_string();
         f.original_ref = "./my-feature".to_string();
         f.oci = None;
-        let fc = build(&resolved(vec![f])).expect("features present");
+        let fc = build(&resolved(vec![f]))
+            .unwrap()
+            .expect("features present");
         let v = serde_json::to_value(&fc).unwrap();
         let si = &v["featureSets"][0]["sourceInformation"];
         assert_eq!(si["type"], "file-path");

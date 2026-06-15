@@ -140,9 +140,8 @@ impl ReadConfigurationArgs {
         }
 
         if needs_features_config
-            && let Some(fc) = resolved_features
-                .as_ref()
-                .and_then(super::features_configuration::build)
+            && let Some(rf) = resolved_features.as_ref()
+            && let Some(fc) = super::features_configuration::build(rf)?
         {
             output["featuresConfiguration"] = serde_json::to_value(fc)?;
         }
