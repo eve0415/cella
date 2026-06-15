@@ -58,17 +58,29 @@ impl InstallArgs {
 
         let client = self.backend.resolve_client().await?;
 
-        let target = ContainerTarget {
-            container_id: self.container_id,
-            container_name: self.container_name,
-            id_labels: self.id_label,
-            workspace_folder: self.workspace_folder,
-        };
+        let has_id_target = self.container_id.is_some()
+            || self.container_name.is_some()
+            || !self.id_label.is_empty();
 
-        let has_explicit = picker::has_explicit_target(&target);
-        let container = match target.resolve(client.as_ref(), true).await {
-            Ok(c) => c,
-            Err(_) if !has_explicit => {
+        let container = if has_id_target {
+            // Explicit id target wins: --container-id, --container-name, or --id-label.
+            let target = ContainerTarget {
+                container_id: self.container_id,
+                container_name: self.container_name,
+                id_labels: self.id_label,
+                workspace_folder: self.workspace_folder,
+            };
+            target.resolve(client.as_ref(), true).await?
+        } else {
+            // No id target: resolve workspace + default config, then use spec-identity
+            // lookup with legacy fallback. On miss: show the interactive picker.
+            let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
+            let maybe_container =
+                super::exec::resolve_by_spec_identity_or_fallback(client.as_ref(), &ws, None, None)
+                    .await?;
+            if let Some(c) = maybe_container {
+                c
+            } else {
                 let containers = client.as_ref().list_cella_containers(true).await?;
                 let cwd_container = client
                     .as_ref()
@@ -83,7 +95,6 @@ impl InstallArgs {
                     None,
                 )?
             }
-            Err(e) => return Err(e.into()),
         };
         let container =
             super::resolve_service_container(client.as_ref(), container, self.service.as_deref())

@@ -79,8 +79,54 @@ pub struct ExecArgs {
 
 impl ExecArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let select_by_config = self.config_selects_container();
         let client = self.backend.resolve_client().await?;
+
+        // Determine container resolution path before consuming self's fields.
+        let has_id = self.has_id_target();
+
+        let container = if has_id {
+            // Explicit id target wins: --container-id, --container-name, or --id-label.
+            // Resolve directly; no picker (explicit means explicit). Mirrors the
+            // official findContainerAndIdLabels precedence where providedIdLabels win.
+            let target = ContainerTarget {
+                container_id: self.container_id,
+                container_name: self.container_name,
+                id_labels: self.id_label,
+                workspace_folder: self.workspace_folder,
+            };
+            target.resolve(client.as_ref(), true).await?
+        } else {
+            // No id target: resolve workspace + config, then use spec-identity lookup
+            // with legacy fallback (mirrors the official workspace tier). --config /
+            // --override-config are honoured; absent both, the default
+            // devcontainer.json is discovered automatically. On miss: show the
+            // interactive picker for bare invocations (no explicit selector given).
+            let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
+            let maybe_container = resolve_by_spec_identity_or_fallback(
+                client.as_ref(),
+                &ws,
+                self.config.as_deref(),
+                self.override_config.as_deref(),
+            )
+            .await?;
+            if let Some(c) = maybe_container {
+                c
+            } else {
+                let containers = client.as_ref().list_cella_containers(true).await?;
+                let cwd_container = client
+                    .as_ref()
+                    .find_container(&std::env::current_dir()?)
+                    .await
+                    .ok()
+                    .flatten();
+                picker::resolve_container_interactive(
+                    &containers,
+                    cwd_container.as_ref().map(|c| c.name.as_str()),
+                    "Select a container:",
+                    None,
+                )?
+            }
+        };
 
         let user_opt = self.user;
         let workdir_opt = self.workdir;
@@ -91,58 +137,6 @@ impl ExecArgs {
         let output = self.output;
         let default_user_env_probe = self.default_user_env_probe;
 
-        let container = if select_by_config {
-            // Explicit config selection (no higher-precedence id target). Resolve
-            // the path exactly as `up` does (config_with_override: `--config` wins;
-            // with only `--override-config` the recorded path is the discovered
-            // devcontainer.json, since the override supplies content, not the path),
-            // then target the container by its spec identity labels
-            // [local_folder + config_file] — the same (workspace, config) pair `up`
-            // stamps and reuses by. Resolve the workspace folder with the same helper
-            // `up` uses so `devcontainer.local_folder` matches byte-for-byte. Mirrors
-            // the official `findContainerAndIdLabels` workspace tier; id targets
-            // (handled below) take precedence. Explicit target → no picker.
-            let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let resolved = cella_config::devcontainer::resolve::config_with_override(
-                &ws,
-                self.config.as_deref(),
-                self.override_config.as_deref(),
-            )?;
-            find_container_by_spec_identity(
-                client.as_ref(),
-                &resolved.workspace_root,
-                &resolved.config_path,
-            )
-            .await?
-        } else {
-            let target = ContainerTarget {
-                container_id: self.container_id,
-                container_name: self.container_name,
-                id_labels: self.id_label,
-                workspace_folder: self.workspace_folder,
-            };
-
-            let has_explicit = picker::has_explicit_target(&target);
-            match target.resolve(client.as_ref(), true).await {
-                Ok(c) => c,
-                Err(_) if !has_explicit => {
-                    let containers = client.as_ref().list_cella_containers(true).await?;
-                    let cwd_container = client
-                        .as_ref()
-                        .find_container(&std::env::current_dir()?)
-                        .await
-                        .ok()
-                        .flatten();
-                    picker::resolve_container_interactive(
-                        &containers,
-                        cwd_container.as_ref().map(|c| c.name.as_str()),
-                        "Select a container:",
-                        None,
-                    )?
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
         let container =
             super::resolve_service_container(client.as_ref(), container, service.as_deref())
                 .await?;
@@ -175,17 +169,11 @@ impl ExecArgs {
         .await
     }
 
-    /// Whether `--config`/`--override-config` should drive container resolution.
-    ///
-    /// True only when a config path is given AND no higher-precedence explicit
-    /// target (`--container-id`/`--container-name`/`--id-label`) is set. Mirrors
-    /// the official `findContainerAndIdLabels` precedence, where the config file
-    /// only feeds the workspace-tier label search and id targets win.
-    const fn config_selects_container(&self) -> bool {
-        (self.config.is_some() || self.override_config.is_some())
-            && self.container_id.is_none()
-            && self.container_name.is_none()
-            && self.id_label.is_empty()
+    /// Whether an explicit id target was given: any of `--container-id`,
+    /// `--container-name`, or `--id-label`. These win over workspace/config
+    /// resolution per the official `findContainerAndIdLabels` precedence.
+    const fn has_id_target(&self) -> bool {
+        self.container_id.is_some() || self.container_name.is_some() || !self.id_label.is_empty()
     }
 }
 
@@ -201,46 +189,132 @@ impl ExecArgs {
 pub(super) fn spec_identity_labels(workspace_root: &Path, config_path: &Path) -> [String; 2] {
     [
         format!(
-            "devcontainer.local_folder={}",
+            "{}={}",
+            cella_backend::LOCAL_FOLDER_LABEL,
             cella_backend::lexical_absolute(workspace_root).to_string_lossy()
         ),
         format!(
-            "devcontainer.config_file={}",
+            "{}={}",
+            cella_backend::CONFIG_FILE_LABEL,
             cella_backend::lexical_absolute(config_path).to_string_lossy()
         ),
     ]
 }
 
-/// Resolve the running container stamped with the given `(workspace, config)`
-/// spec identity (`--config` / `--override-config`), matching both the
-/// `devcontainer.local_folder` and `devcontainer.config_file` labels `up`
-/// records — the same pair cella keys container reuse on. An explicit target,
-/// so there is no interactive fallback.
-async fn find_container_by_spec_identity(
+/// Resolve the running container matching the given `(workspace, config)` pair
+/// using the official spec-identity lookup with legacy fallback, mirroring
+/// `findContainerAndIdLabels` from the official devcontainer CLI
+/// (src/spec-node/utils.ts, lines 682-726).
+///
+/// # Resolution order
+///
+/// 1. `[local_folder + config_file]` exact match — containers stamped by a
+///    recent `cella up` will be found here.
+/// 2. `[local_folder]` only — legacy fallback for containers created before the
+///    spec-identity scheme. A container that **has** a `devcontainer.config_file`
+///    label but didn't match step 1 belongs to a *different* config; it is
+///    silently discarded (official behaviour). Only containers without that label
+///    (old-format, pre-spec-identity) are accepted here.
+///
+/// cella already uses lexical-absolute paths consistently, so the official's
+/// normalised-path variant (step 1b in the spec) is not needed — one exact
+/// lookup per label-set is sufficient.
+///
+/// Returns `Ok(Some(container))` if found and Running, `Ok(None)` if not found
+/// (caller may fall back to interactive picker), or `Err` if found but not
+/// Running (explicit error; don't silently drop a stopped container).
+pub(super) async fn find_container_spec_identity_with_fallback(
     client: &dyn cella_backend::ContainerBackend,
     workspace_root: &Path,
     config_path: &Path,
+) -> Result<Option<cella_backend::ContainerInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    let new_labels = spec_identity_labels(workspace_root, config_path);
+
+    // Step 1: exact [local_folder + config_file] match.
+    if let Some(container) = client.find_container_by_labels(&new_labels).await? {
+        return check_running(container, config_path).map(Some);
+    }
+
+    // Step 2: legacy fallback — [local_folder] only.
+    // Discard the result if it carries a config_file label: it belongs to a
+    // different config. Only old containers (created before the config_file label
+    // was introduced) are accepted.
+    let old_labels = [new_labels[0].clone()];
+    if let Some(container) = client.find_container_by_labels(&old_labels).await? {
+        if container
+            .labels
+            .contains_key(cella_backend::CONFIG_FILE_LABEL)
+        {
+            return Ok(None); // belongs to a different config; treat as not found
+        }
+        return check_running(container, config_path).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn check_running(
+    info: cella_backend::ContainerInfo,
+    config_path: &Path,
 ) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let labels = spec_identity_labels(workspace_root, config_path);
-    let info = client
-        .find_container_by_labels(&labels)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "no dev container found for config '{}' in workspace '{}' — run `cella up` for it first",
-                config_path.display(),
-                workspace_root.display()
-            )
-        })?;
-    if info.state != cella_backend::ContainerState::Running {
-        return Err(format!(
+    if info.state == cella_backend::ContainerState::Running {
+        Ok(info)
+    } else {
+        Err(format!(
             "container '{}' for config '{}' exists but is not running; run `cella up` to start it",
             info.name,
             config_path.display()
         )
-        .into());
+        .into())
     }
-    Ok(info)
+}
+
+/// Resolve the default (or explicit) devcontainer config for the workspace, then
+/// look up the running container via spec-identity with legacy fallback.
+///
+/// When `config_path_override` or `override_config_file` is supplied, the
+/// resolution is explicit and errors on miss. When neither is given the default
+/// devcontainer.json is discovered; if there is none, the function degrades to a
+/// workspace-folder-only lookup (`find_container`) — matching the pre-spec-identity
+/// behaviour and avoiding hard errors where cella previously succeeded.
+///
+/// Note: the workspace-folder-only degradation path does NOT apply the
+/// `config_file` discard check. The discard rule's purpose is to reject a
+/// container that belongs to a *different* config; with no config resolved there
+/// is nothing to disambiguate against, and applying the discard would break
+/// containers that cella currently finds successfully.
+///
+/// `pub(super)` so `shell` and `install` can share this logic without duplicating
+/// the spec-identity + legacy-fallback algorithm.
+pub(super) async fn resolve_by_spec_identity_or_fallback(
+    client: &dyn cella_backend::ContainerBackend,
+    workspace_root: &Path,
+    config_path_override: Option<&Path>,
+    override_config_file: Option<&Path>,
+) -> Result<Option<cella_backend::ContainerInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(resolved) = cella_config::devcontainer::resolve::config_with_override(
+        workspace_root,
+        config_path_override,
+        override_config_file,
+    ) {
+        find_container_spec_identity_with_fallback(
+            client,
+            &resolved.workspace_root,
+            &resolved.config_path,
+        )
+        .await
+    } else {
+        // No devcontainer.json found; degrade to workspace-folder-only lookup.
+        // This preserves the behaviour callers had before spec-identity was added.
+        let maybe = client.find_container(workspace_root).await?;
+        Ok(maybe.and_then(|c| {
+            if c.state == cella_backend::ContainerState::Running {
+                Some(c)
+            } else {
+                None
+            }
+        }))
+    }
 }
 
 async fn resolve_exec_context(
@@ -548,13 +622,20 @@ mod tests {
     }
 
     #[test]
-    fn config_alone_selects_by_config() {
-        let args = exec_args(["cella", "exec", "--config", "/a/dc.json", "--", "true"].as_ref());
-        assert!(args.config_selects_container());
+    fn no_flags_has_no_id_target() {
+        let args = exec_args(["cella", "exec", "--", "true"].as_ref());
+        assert!(!args.has_id_target());
     }
 
     #[test]
-    fn override_config_alone_selects_by_config() {
+    fn config_alone_has_no_id_target() {
+        // --config drives workspace-tier resolution but is not an id target.
+        let args = exec_args(["cella", "exec", "--config", "/a/dc.json", "--", "true"].as_ref());
+        assert!(!args.has_id_target());
+    }
+
+    #[test]
+    fn override_config_alone_has_no_id_target() {
         let args = exec_args(
             [
                 "cella",
@@ -566,73 +647,32 @@ mod tests {
             ]
             .as_ref(),
         );
-        assert!(args.config_selects_container());
+        assert!(!args.has_id_target());
     }
 
     #[test]
-    fn container_id_takes_precedence_over_config() {
-        let args = exec_args(
-            [
-                "cella",
-                "exec",
-                "--config",
-                "/a/dc.json",
-                "--container-id",
-                "abc",
-                "--",
-                "true",
-            ]
-            .as_ref(),
-        );
+    fn container_id_is_id_target() {
+        let args = exec_args(["cella", "exec", "--container-id", "abc", "--", "true"].as_ref());
         assert!(
-            !args.config_selects_container(),
-            "--container-id must win over --config (official precedence)"
+            args.has_id_target(),
+            "--container-id must be detected as id target (official precedence)"
         );
     }
 
     #[test]
-    fn id_label_takes_precedence_over_config() {
-        let args = exec_args(
-            [
-                "cella",
-                "exec",
-                "--config",
-                "/a/dc.json",
-                "--id-label",
-                "k=v",
-                "--",
-                "true",
-            ]
-            .as_ref(),
-        );
+    fn id_label_is_id_target() {
+        let args = exec_args(["cella", "exec", "--id-label", "k=v", "--", "true"].as_ref());
         assert!(
-            !args.config_selects_container(),
-            "--id-label must win over --config (official precedence)"
+            args.has_id_target(),
+            "--id-label must be detected as id target (official precedence)"
         );
     }
 
     #[test]
-    fn container_name_takes_precedence_over_config() {
-        let args = exec_args(
-            [
-                "cella",
-                "exec",
-                "--config",
-                "/a/dc.json",
-                "--container-name",
-                "my-ctr",
-                "--",
-                "true",
-            ]
-            .as_ref(),
-        );
-        assert!(!args.config_selects_container());
-    }
-
-    #[test]
-    fn no_config_does_not_select_by_config() {
-        let args = exec_args(["cella", "exec", "--", "true"].as_ref());
-        assert!(!args.config_selects_container());
+    fn container_name_is_id_target() {
+        let args =
+            exec_args(["cella", "exec", "--container-name", "my-ctr", "--", "true"].as_ref());
+        assert!(args.has_id_target());
     }
 
     #[test]
@@ -684,5 +724,398 @@ mod tests {
             "CLI --remote-env must beat infra fwd_env"
         );
         assert!(!merged.contains(&"HTTPS_PROXY=http://infra-proxy:8080".to_string()));
+    }
+
+    // --- spec-identity resolution tests ---
+
+    use cella_backend::error::BackendError;
+    use cella_backend::traits::labels_match_all;
+    use cella_backend::{
+        BackendCapabilities, BackendKind, BoxFuture, BuildOptions, ContainerInfo, ContainerState,
+        ExecOptions, ExecResult, FileToUpload, ImageDetails, InteractiveExecOptions, Platform,
+    };
+
+    /// Minimal mock backend that returns containers from a fixed list.
+    ///
+    /// `find_container_by_labels` filters the list using `labels_match_all`.
+    /// `find_container` always returns `None` (not needed for spec-identity tests).
+    struct MockBackend {
+        containers: Vec<ContainerInfo>,
+    }
+
+    fn running_container(name: &str, labels: HashMap<String, String>) -> ContainerInfo {
+        ContainerInfo {
+            id: name.to_string(),
+            name: name.to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: BackendKind::Docker,
+        }
+    }
+
+    impl cella_backend::ContainerBackend for MockBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Docker
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                compose: false,
+                managed_agent: false,
+            }
+        }
+
+        fn find_container<'a>(
+            &'a self,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn find_container_by_labels<'a>(
+            &'a self,
+            labels: &'a [String],
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            let result = self
+                .containers
+                .iter()
+                .find(|c| labels_match_all(&c.labels, labels))
+                .cloned();
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn create_container<'a>(
+            &'a self,
+            _: &'a cella_backend::CreateContainerOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn start_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn stop_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn remove_container<'a>(
+            &'a self,
+            _: &'a str,
+            _: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_container<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ContainerInfo, BackendError>> {
+            unimplemented!()
+        }
+
+        fn list_cella_containers(
+            &self,
+            _: bool,
+        ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn find_compose_service<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn find_container_by_label<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn container_logs<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_command<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+            _: Box<dyn std::io::Write + Send + 'a>,
+            _: Box<dyn std::io::Write + Send + 'a>,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_interactive<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a InteractiveExecOptions,
+        ) -> BoxFuture<'a, Result<i64, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_detached<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn pull_image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn build_image<'a>(
+            &'a self,
+            _: &'a BuildOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn image_exists<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool, BackendError>> {
+            unimplemented!()
+        }
+
+        fn tag_image<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_details<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
+            unimplemented!()
+        }
+
+        fn upload_files<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [FileToUpload],
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn host_gateway(&self) -> &'static str {
+            "host.docker.internal"
+        }
+
+        fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
+            unimplemented!()
+        }
+
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_user<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_container_network<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn get_container_ip<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn write_agent_addr<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            unimplemented!()
+        }
+
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+    }
+
+    fn ws() -> &'static Path {
+        Path::new("/ws")
+    }
+
+    fn cfg() -> &'static Path {
+        Path::new("/ws/.devcontainer/devcontainer.json")
+    }
+
+    fn spec_labels() -> HashMap<String, String> {
+        let [lf, cf] = spec_identity_labels(ws(), cfg());
+        let (lf_k, lf_v) = lf.split_once('=').unwrap();
+        let (cf_k, cf_v) = cf.split_once('=').unwrap();
+        HashMap::from([
+            (lf_k.to_string(), lf_v.to_string()),
+            (cf_k.to_string(), cf_v.to_string()),
+        ])
+    }
+
+    fn local_folder_label_only() -> HashMap<String, String> {
+        let [lf, _] = spec_identity_labels(ws(), cfg());
+        let (k, v) = lf.split_once('=').unwrap();
+        HashMap::from([(k.to_string(), v.to_string())])
+    }
+
+    fn spec_labels_different_config() -> HashMap<String, String> {
+        // Same local_folder as ws() but a different config_file.
+        let [lf, _] = spec_identity_labels(ws(), cfg());
+        let (lf_k, lf_v) = lf.split_once('=').unwrap();
+        HashMap::from([
+            (lf_k.to_string(), lf_v.to_string()),
+            (
+                cella_backend::CONFIG_FILE_LABEL.to_string(),
+                "/ws/.devcontainer/other.json".to_string(),
+            ),
+        ])
+    }
+
+    /// Container with `[local_folder + config_file]` → selected via exact match.
+    #[tokio::test]
+    async fn spec_identity_hit_selects_container() {
+        let backend = MockBackend {
+            containers: vec![running_container("target", spec_labels())],
+        };
+        let result = find_container_spec_identity_with_fallback(&backend, ws(), cfg())
+            .await
+            .expect("no backend error");
+        assert!(result.is_some(), "should find the spec-identity container");
+        assert_eq!(result.unwrap().name, "target");
+    }
+
+    /// Only a legacy container (`local_folder` only, no `config_file` label) → accepted.
+    #[tokio::test]
+    async fn legacy_fallback_hit_accepted() {
+        let backend = MockBackend {
+            containers: vec![running_container("legacy", local_folder_label_only())],
+        };
+        let result = find_container_spec_identity_with_fallback(&backend, ws(), cfg())
+            .await
+            .expect("no backend error");
+        assert!(
+            result.is_some(),
+            "legacy container should be found via fallback"
+        );
+        assert_eq!(result.unwrap().name, "legacy");
+    }
+
+    /// A container with the right `local_folder` but a DIFFERENT `config_file` label
+    /// is discarded in the legacy fallback — it belongs to another config.
+    #[tokio::test]
+    async fn legacy_fallback_discard_different_config_file() {
+        let backend = MockBackend {
+            containers: vec![running_container(
+                "wrong-config",
+                spec_labels_different_config(),
+            )],
+        };
+        let result = find_container_spec_identity_with_fallback(&backend, ws(), cfg())
+            .await
+            .expect("no backend error");
+        assert!(
+            result.is_none(),
+            "container with a different config_file label must be discarded in fallback"
+        );
+    }
+
+    /// Two containers, same `local_folder`, different `config_file` → only the one
+    /// matching our `config_file` is selected (exact match wins).
+    #[tokio::test]
+    async fn multi_config_selects_matching_config() {
+        let backend = MockBackend {
+            containers: vec![
+                running_container("other-config", spec_labels_different_config()),
+                running_container("our-config", spec_labels()),
+            ],
+        };
+        let result = find_container_spec_identity_with_fallback(&backend, ws(), cfg())
+            .await
+            .expect("no backend error");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().name,
+            "our-config",
+            "exact [local_folder + config_file] match must win over sibling configs"
+        );
+    }
+
+    /// An id target (`--container-id`) causes `has_id_target()` to return true,
+    /// so the spec-identity path is bypassed entirely — id targets always win.
+    #[test]
+    fn id_target_bypasses_spec_identity() {
+        let args = exec_args(["cella", "exec", "--container-id", "abc123", "--", "true"].as_ref());
+        assert!(
+            args.has_id_target(),
+            "--container-id must be recognised as id target so spec-identity is skipped"
+        );
     }
 }

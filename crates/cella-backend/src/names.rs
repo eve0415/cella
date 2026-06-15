@@ -146,6 +146,14 @@ pub fn lexical_absolute(path: &Path) -> PathBuf {
 /// Label key for the container backend kind.
 pub const BACKEND_LABEL: &str = "dev.cella.backend";
 
+/// Spec-standard label key for the container workspace folder path.
+/// Used by VS Code and other tooling to discover devcontainers.
+pub const LOCAL_FOLDER_LABEL: &str = "devcontainer.local_folder";
+
+/// Spec-standard label key for the devcontainer config file path.
+/// Used by VS Code and other tooling to identify the config a container belongs to.
+pub const CONFIG_FILE_LABEL: &str = "devcontainer.config_file";
+
 /// Standard labels for cella containers.
 ///
 /// Emits both cella-specific (`dev.cella.*`) and spec-standard
