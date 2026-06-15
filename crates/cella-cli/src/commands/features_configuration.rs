@@ -194,7 +194,8 @@ fn feature_set(f: &ResolvedFeature, idx: usize) -> Result<FeatureSetOut, serde_j
 
 fn source_information(f: &ResolvedFeature) -> Result<SourceInformationOut, serde_json::Error> {
     let user_feature_id = f.original_ref.clone();
-    let user_feature_id_without_version = feature_id_without_version(&f.original_ref);
+    let user_feature_id_without_version =
+        cella_features::feature_id_without_version(&f.original_ref).to_owned();
 
     Ok(match &f.oci {
         Some(oci) => SourceInformationOut::Oci(Box::new(OciSourceInformationOut {
@@ -349,17 +350,6 @@ fn parse_feature_ref(input: &str) -> FeatureRefOut {
         tag,
         digest,
     }
-}
-
-/// Strip a trailing `:tag` or `@digest` from a feature id, mirroring the
-/// official `getFeatureIdWithoutVersion` regex `/[:@][^/]*$/` (the delimiter is
-/// the first `:`/`@` after the last `/`).
-fn feature_id_without_version(feature_id: &str) -> String {
-    let last_slash = feature_id.rfind('/').map_or(0, |i| i + 1);
-    feature_id[last_slash..].find(['@', ':']).map_or_else(
-        || feature_id.to_string(),
-        |rel| feature_id[..last_slash + rel].to_string(),
-    )
 }
 
 /// Classify a non-OCI reference: an `http(s)://` URL is a direct tarball,
@@ -628,21 +618,5 @@ mod tests {
         let r = parse_feature_ref("ghcr.io/devcontainers/features/git");
         assert_eq!(r.version, "latest");
         assert_eq!(r.tag.as_deref(), Some("latest"));
-    }
-
-    #[test]
-    fn feature_id_without_version_cases() {
-        assert_eq!(
-            feature_id_without_version("ghcr.io/devcontainers/features/node:1"),
-            "ghcr.io/devcontainers/features/node"
-        );
-        assert_eq!(
-            feature_id_without_version("ghcr.io/owner/repo/tool@sha256:abc"),
-            "ghcr.io/owner/repo/tool"
-        );
-        assert_eq!(
-            feature_id_without_version("ghcr.io/devcontainers/features/git"),
-            "ghcr.io/devcontainers/features/git"
-        );
     }
 }

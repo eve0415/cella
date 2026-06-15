@@ -95,6 +95,24 @@ fn split_tag(s: &str) -> (&str, &str) {
     }
 }
 
+/// Strip a trailing `:tag` or `@digest` from a feature id.
+///
+/// Matches the official `getFeatureIdWithoutVersion` (`/[:@][^/]*$/`): the
+/// delimiter must appear after the last `/`, so registry ports
+/// (`host:5000/repo`) survive.
+///
+/// Distinct from [`split_tag`], which splits only on `:` (for OCI tag parsing)
+/// and returns the tag; this drops both `:tag` and `@digest` and keeps only the
+/// id. Shared by the CLI commands that compare ids ignoring their version
+/// (`upgrade`, `outdated`, `read-configuration`'s features output).
+#[must_use]
+pub fn feature_id_without_version(id: &str) -> &str {
+    let start = id.rfind('/').map_or(0, |i| i + 1);
+    id[start..]
+        .find([':', '@'])
+        .map_or(id, |rel| &id[..start + rel])
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -420,6 +438,34 @@ mod tests {
             split_tag("ghcr.io/owner/repo:1.2.3"),
             ("ghcr.io/owner/repo", "1.2.3")
         );
+    }
+
+    #[test]
+    fn feature_id_without_version_cases() {
+        let f = feature_id_without_version;
+        // Tagged OCI refs drop the tag.
+        assert_eq!(
+            f("ghcr.io/devcontainers/features/node:1"),
+            "ghcr.io/devcontainers/features/node"
+        );
+        assert_eq!(f("ghcr.io/x/node:2"), "ghcr.io/x/node");
+        assert_eq!(f("node:1"), "node");
+        // Untagged refs are unchanged.
+        assert_eq!(
+            f("ghcr.io/devcontainers/features/git"),
+            "ghcr.io/devcontainers/features/git"
+        );
+        assert_eq!(f("ghcr.io/x/y"), "ghcr.io/x/y");
+        // `@digest` delimiter is stripped too (official `/[:@][^/]*$/`).
+        assert_eq!(
+            f("ghcr.io/owner/repo/tool@sha256:abc"),
+            "ghcr.io/owner/repo/tool"
+        );
+        assert_eq!(f("node@sha256:abc"), "node");
+        // Registry port colon is before the last `/`, so it survives.
+        assert_eq!(f("localhost:5000/x/y"), "localhost:5000/x/y");
+        assert_eq!(f("host:5000/x/node"), "host:5000/x/node");
+        assert_eq!(f("host:5000/x/node:2"), "host:5000/x/node");
     }
 
     // -----------------------------------------------------------------------

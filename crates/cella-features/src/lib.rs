@@ -36,7 +36,7 @@ pub use merge::{
 pub use metadata::parse_feature_metadata;
 pub use oci::{FeatureFetcher, OciFetcher};
 pub use ordering::compute_install_order;
-pub use reference::{FeatureRef, NormalizedRef};
+pub use reference::{FeatureRef, NormalizedRef, feature_id_without_version};
 pub use types::*;
 
 use std::collections::{HashMap, HashSet};

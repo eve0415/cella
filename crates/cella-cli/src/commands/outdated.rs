@@ -429,22 +429,6 @@ fn major_string(version: &str) -> Option<String> {
     Version::parse(version).ok().map(|v| v.major.to_string())
 }
 
-/// Strip the trailing `:tag` / `@digest` from a feature id for the text-table
-/// "Feature" column, mirroring the official `getFeatureIdWithoutVersion` (regex
-/// `/[:@][^/]*$/`).
-///
-/// The regex anchors to the end and matches the *earliest* `:` or `@` in the
-/// trailing run that contains no `/`. So in the last path segment (after the
-/// final `/`, or the whole string if none) we cut at the **first** `:`/`@`.
-/// This makes `…/y@sha256:abc` cut at the `@` (not the digest's `:`), and a
-/// registry port colon (which sits before a `/`) is never cut.
-fn feature_id_without_version(feature_id: &str) -> &str {
-    let segment_start = feature_id.rfind('/').map_or(0, |i| i + 1);
-    feature_id[segment_start..]
-        .find([':', '@'])
-        .map_or(feature_id, |rel| &feature_id[..segment_start + rel])
-}
-
 /// Render the 4-column text table (`Feature`, `Current`, `Wanted`, `Latest`) to
 /// stdout, mirroring the official `text-table` output. Absent fields render as
 /// `-`.
@@ -471,7 +455,7 @@ fn text_rows(report: &OutdatedReport) -> Vec<[String; 4]> {
     ]);
     for (key, info) in &report.entries {
         rows.push([
-            feature_id_without_version(key).to_owned(),
+            cella_features::feature_id_without_version(key).to_owned(),
             info.current.clone().unwrap_or_else(dash),
             info.wanted.clone().unwrap_or_else(dash),
             info.latest.clone().unwrap_or_else(dash),
@@ -813,40 +797,6 @@ mod tests {
         assert_eq!(
             info.current, None,
             "tag-only lockfile version must be ignored"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // feature_id_without_version
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn feature_id_strips_tag() {
-        assert_eq!(
-            feature_id_without_version("ghcr.io/devcontainers/features/node:1"),
-            "ghcr.io/devcontainers/features/node"
-        );
-    }
-
-    #[test]
-    fn feature_id_strips_digest() {
-        assert_eq!(
-            feature_id_without_version("ghcr.io/x/y@sha256:abc"),
-            "ghcr.io/x/y"
-        );
-    }
-
-    #[test]
-    fn feature_id_no_version_unchanged() {
-        assert_eq!(feature_id_without_version("ghcr.io/x/y"), "ghcr.io/x/y");
-    }
-
-    #[test]
-    fn feature_id_port_colon_not_stripped() {
-        // The colon is before a slash (a registry port) → not a version cut.
-        assert_eq!(
-            feature_id_without_version("localhost:5000/x/y"),
-            "localhost:5000/x/y"
         );
     }
 

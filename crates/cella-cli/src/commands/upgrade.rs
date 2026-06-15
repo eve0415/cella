@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use cella_features::{
-    BaseImageContext, FeatureCache, LockfilePolicy,
+    BaseImageContext, FeatureCache, LockfilePolicy, feature_id_without_version,
     lockfile::{lockfile_path, write_lockfile},
     oci::detect_platform,
 };
@@ -38,16 +38,15 @@ pub struct UpgradeArgs {
     #[arg(long = "docker-compose-path", default_value = "docker-compose")]
     pub docker_compose_path: String,
 
-    /// Target a single Feature for upgrade (the official CLI's dependabot path,
-    /// alongside `--target-version`). Hidden parity flag, accepted-and-ignored:
-    /// cella currently refreshes the whole lockfile, so targeted single-Feature
-    /// upgrade is a follow-up. Accepted independently of `--target-version`.
+    /// Pin a single Feature's version in devcontainer.json, then refresh the
+    /// lockfile (the official CLI's dependabot path). Must be used together with
+    /// `--target-version`. Hidden, matching the official flag.
     #[arg(short = 'f', long = "feature", hide = true)]
     pub feature: Option<String>,
 
-    /// The target version (`x`, `x.y`, or `x.y.z`) for `--feature`. Hidden
-    /// parity flag, accepted-and-ignored (see `--feature`); accepted
-    /// independently.
+    /// The version (`x`, `x.y`, or `x.y.z`) to pin `--feature` to in
+    /// devcontainer.json. Must be used together with `--feature`. Hidden,
+    /// matching the official flag.
     #[arg(short = 'v', long = "target-version", hide = true)]
     pub target_version: Option<String>,
 
@@ -63,9 +62,29 @@ impl UpgradeArgs {
     ///
     /// Returns an error if config discovery, parsing, or feature resolution fails.
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Paired-use + version-format validation runs first, before config
+        // discovery — matching the official yargs `.check()` (parse-time). So
+        // `upgrade --feature X` (no `--target-version`) in a folder without a
+        // devcontainer.json reports the paired-use error, not "no config found".
+        validate_feature_target(self.feature.as_deref(), self.target_version.as_deref())?;
+
         let config_path =
             resolve_config_path(self.workspace_folder.as_ref(), self.config.as_ref())?;
-        let config_json = read_config_json(&config_path)?;
+        let mut config_json = read_config_json(&config_path)?;
+
+        // Dependabot path: pin the requested Feature version in devcontainer.json
+        // before resolving features / writing the lockfile. Mirrors the official
+        // `featuresUpgrade` — the config write happens even under `--dry-run`
+        // (only the lockfile write is gated), so a single call can pin and then
+        // emit the regenerated lockfile to stdout.
+        if let (Some(feature), Some(target_version)) =
+            (self.feature.as_deref(), self.target_version.as_deref())
+        {
+            apply_feature_pin(&config_path, &config_json, feature, target_version)?;
+            // Re-read so the lockfile regeneration below sees the pinned version.
+            config_json = read_config_json(&config_path)?;
+        }
+
         let platform = detect_platform(std::env::consts::OS, std::env::consts::ARCH);
         let cache = FeatureCache::new();
         let base_image = config_json
@@ -149,6 +168,129 @@ fn read_config_json(
     Ok(value)
 }
 
+/// Validate the paired `--feature`/`--target-version` constraints.
+///
+/// Mirrors the official `featuresUpgradeOptions().check()`: both flags must be
+/// supplied together, and `--target-version` must be `x`, `x.y`, or `x.y.z`
+/// (one to three dot-separated numeric parts). Error strings match verbatim.
+fn validate_feature_target(
+    feature: Option<&str>,
+    target_version: Option<&str>,
+) -> Result<(), String> {
+    if feature.is_some() != target_version.is_some() {
+        return Err(
+            "The '--target-version' and '--feature' flag must be used together.".to_owned(),
+        );
+    }
+    if let Some(version) = target_version
+        && !is_valid_target_version(version)
+    {
+        return Err(format!(
+            "Invalid version '{version}'.  Must be in the form of 'x', 'x.y', or 'x.y.z'"
+        ));
+    }
+    Ok(())
+}
+
+/// Match the official `/^\d+(\.\d+(\.\d+)?)?$/`: one to three dot-separated
+/// parts, each a non-empty run of ASCII digits.
+fn is_valid_target_version(version: &str) -> bool {
+    let mut parts = 0u8;
+    for part in version.split('.') {
+        parts += 1;
+        if parts > 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Outcome of pinning a Feature version into the raw devcontainer.json text.
+enum PinOutcome {
+    /// The config declares no `features` object.
+    NoFeatures,
+    /// No matching Feature, or the text is already at the target version.
+    NoChange,
+    /// The config text with the matched Feature key re-pinned.
+    Changed(String),
+}
+
+/// Re-pin `target_feature` to `target_version` in the raw config text.
+///
+/// Mirrors the official `updateFeatureVersionInConfig`: find the user Feature
+/// whose id-without-version matches the target, then rewrite its key to
+/// `<id-without-version>:<target_version>`.
+///
+/// Deliberate bug-fix vs upstream: the official builds `new RegExp(current)` and
+/// does an unanchored global replace, so `.` acts as a wildcard and a bare id
+/// corrupts longer ids sharing its prefix (`.../node` rewrites inside
+/// `.../nodejs`). cella replaces the quoted key token `"<id>"` literally —
+/// byte-identical for normal configs, but it never corrupts prefixes.
+///
+/// Like the official, this is still an all-occurrences replace of the quoted
+/// token. Two accepted limitations, both matching upstream behavior on the
+/// configs that trigger them:
+/// - A string *value* byte-identical to the quoted feature key (rare) is
+///   rewritten too. The official `replaceAll` does the same; a precise fix needs
+///   a structural JSONC edit, out of scope for this hidden dependabot flag.
+/// - When two keys strip to the same id-without-version (an invalid config — a
+///   Feature can't be installed twice), the first match wins; iteration order
+///   may differ from the official's, but the input is already malformed.
+fn pin_feature_version_in_text(
+    raw: &str,
+    config: &serde_json::Value,
+    target_feature: &str,
+    target_version: &str,
+) -> PinOutcome {
+    let Some(features) = config
+        .get("features")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return PinOutcome::NoFeatures;
+    };
+    let target_no_version = feature_id_without_version(target_feature);
+    let Some(user_id) = features
+        .keys()
+        .find(|key| feature_id_without_version(key) == target_no_version)
+    else {
+        return PinOutcome::NoChange;
+    };
+    let new_key = format!("{target_no_version}:{target_version}");
+    let updated = raw.replace(&format!("\"{user_id}\""), &format!("\"{new_key}\""));
+    if updated == raw {
+        PinOutcome::NoChange
+    } else {
+        PinOutcome::Changed(updated)
+    }
+}
+
+/// Pin the requested Feature version in devcontainer.json and write it back.
+///
+/// Emits the same progress lines as the official `featuresUpgrade`. The write is
+/// unconditional (not gated by `--dry-run`) to match upstream behavior.
+fn apply_feature_pin(
+    config_path: &Path,
+    config_json: &serde_json::Value,
+    feature: &str,
+    target_version: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("Updating '{feature}' to '{target_version}' in devcontainer.json");
+    let raw = std::fs::read_to_string(config_path)?;
+    match pin_feature_version_in_text(&raw, config_json, feature, target_version) {
+        PinOutcome::NoFeatures => {
+            eprintln!("No Features found in '{}'.", config_path.display());
+        }
+        PinOutcome::NoChange => {
+            tracing::trace!("No changes to config file: {}", config_path.display());
+        }
+        PinOutcome::Changed(updated) => {
+            eprintln!("Updating config file: '{}'", config_path.display());
+            std::fs::write(config_path, updated)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -163,11 +305,137 @@ mod tests {
         }
     }
 
+    fn cfg(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("test config parses")
+    }
+
+    #[test]
+    fn validate_requires_both_or_neither() {
+        assert!(super::validate_feature_target(None, None).is_ok());
+        assert!(super::validate_feature_target(Some("node"), Some("1")).is_ok());
+
+        let only_feature = super::validate_feature_target(Some("node"), None).unwrap_err();
+        let only_version = super::validate_feature_target(None, Some("1")).unwrap_err();
+        let expected = "The '--target-version' and '--feature' flag must be used together.";
+        assert_eq!(only_feature, expected);
+        assert_eq!(only_version, expected);
+    }
+
+    #[test]
+    fn validate_rejects_malformed_version() {
+        // Exact official message, including the double space after the period.
+        let err = super::validate_feature_target(Some("node"), Some("1.2.3.4")).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid version '1.2.3.4'.  Must be in the form of 'x', 'x.y', or 'x.y.z'"
+        );
+    }
+
+    #[test]
+    fn target_version_format_matches_official_regex() {
+        for ok in ["0", "1", "10", "1.2", "1.2.3", "01", "1.0.0"] {
+            assert!(super::is_valid_target_version(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "", "1.", ".1", "1..2", "1.2.3.4", "1.x", "v1", "1.2.", "latest",
+        ] {
+            assert!(
+                !super::is_valid_target_version(bad),
+                "{bad} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn pin_no_features_object() {
+        assert!(matches!(
+            super::pin_feature_version_in_text(r"{}", &cfg(r"{}"), "node", "2"),
+            super::PinOutcome::NoFeatures
+        ));
+    }
+
+    #[test]
+    fn pin_empty_features_is_no_change() {
+        let raw = r#"{"features":{}}"#;
+        assert!(matches!(
+            super::pin_feature_version_in_text(raw, &cfg(raw), "ghcr.io/x/node", "2"),
+            super::PinOutcome::NoChange
+        ));
+    }
+
+    #[test]
+    fn pin_normal_case_rewrites_version() {
+        let raw = "{\n  \"features\": {\n    \"ghcr.io/x/node:1\": {}\n  }\n}\n";
+        let super::PinOutcome::Changed(updated) =
+            super::pin_feature_version_in_text(raw, &cfg(raw), "ghcr.io/x/node", "2")
+        else {
+            panic!("expected Changed");
+        };
+        // Identical to what the official regex would produce for this case.
+        let expected = "{\n  \"features\": {\n    \"ghcr.io/x/node:2\": {}\n  }\n}\n";
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn pin_does_not_corrupt_prefix_sharing_ids() {
+        // The official `new RegExp("ghcr.io/x/node")` would rewrite the prefix
+        // inside `ghcr.io/x/nodejs` too. cella's quoted-key replace must not.
+        let raw = "{\n  \"features\": {\n    \"ghcr.io/x/node\": {},\n    \"ghcr.io/x/nodejs\": {}\n  }\n}\n";
+        let super::PinOutcome::Changed(updated) =
+            super::pin_feature_version_in_text(raw, &cfg(raw), "ghcr.io/x/node", "2")
+        else {
+            panic!("expected Changed");
+        };
+        assert!(updated.contains("\"ghcr.io/x/node:2\""));
+        assert!(
+            updated.contains("\"ghcr.io/x/nodejs\""),
+            "sibling feature must stay intact, got: {updated}"
+        );
+        assert!(
+            !updated.contains("nodejs:2"),
+            "prefix bug regression: {updated}"
+        );
+    }
+
+    #[test]
+    fn pin_no_matching_feature_is_no_change() {
+        let raw = r#"{"features":{"ghcr.io/x/go:1":{}}}"#;
+        assert!(matches!(
+            super::pin_feature_version_in_text(raw, &cfg(raw), "ghcr.io/x/node", "2"),
+            super::PinOutcome::NoChange
+        ));
+    }
+
+    #[test]
+    fn pin_already_at_target_is_no_change() {
+        let raw = r#"{"features":{"ghcr.io/x/node:2":{}}}"#;
+        assert!(matches!(
+            super::pin_feature_version_in_text(raw, &cfg(raw), "ghcr.io/x/node", "2"),
+            super::PinOutcome::NoChange
+        ));
+    }
+
+    #[test]
+    fn apply_feature_pin_writes_config_file() {
+        // Proves the config write happens (the dependabot side effect that is
+        // NOT gated by --dry-run). Pure FS, no registry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("devcontainer.json");
+        let raw = "{\n  \"features\": {\n    \"ghcr.io/x/node:1\": {}\n  }\n}\n";
+        std::fs::write(&path, raw).expect("write seed");
+        let config = cfg(raw);
+
+        super::apply_feature_pin(&path, &config, "ghcr.io/x/node", "2").expect("pin");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(after.contains("\"ghcr.io/x/node:2\""), "got: {after}");
+    }
+
     #[test]
     fn upgrade_accepts_official_flags() {
         // Regression: `--docker-path`, `--docker-compose-path`, `--feature`
         // (alias -f) and `--target-version` (alias -v) are official
-        // featuresUpgradeOptions flags that were missing. They must all parse.
+        // featuresUpgradeOptions flags. They must all parse.
         let args = upgrade_args(&[
             "--docker-path",
             "/x",
