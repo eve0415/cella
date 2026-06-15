@@ -418,6 +418,13 @@ fn shell_quote_argv(argv: &[&str]) -> String {
 pub struct LifecycleState {
     #[serde(default)]
     pub oncreate_done: bool,
+    /// The container's `started_at` when `run-user-commands` last ran
+    /// `postStartCommand`. Lets a later `run-user-commands` skip postStart when
+    /// the container has not restarted. Written ONLY by `run-user-commands` (the
+    /// single writer — `up` deliberately doesn't touch it, which avoids a
+    /// foreground/background write race on this file).
+    #[serde(default)]
+    pub started_at: Option<String>,
 }
 
 /// Read the persisted lifecycle state from a running container.
@@ -2322,6 +2329,7 @@ mod tests {
     fn lifecycle_state_roundtrip_serde() {
         let state = LifecycleState {
             oncreate_done: true,
+            started_at: Some("2026-06-15T12:00:00Z".to_owned()),
         };
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: LifecycleState = serde_json::from_str(&json).unwrap();

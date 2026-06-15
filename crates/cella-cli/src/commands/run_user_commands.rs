@@ -349,6 +349,7 @@ impl RunUserCommandsArgs {
                 target_path: &self.dotfiles.target_path,
             },
             workspace_root: workspace.as_deref(),
+            container_started_at: container.started_at.as_deref(),
         };
         let status = orchestrator::run_user_commands(&lc_ctx, &input, &sender).await;
         drop(sender);
