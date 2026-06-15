@@ -1090,6 +1090,34 @@ fn entry_to_shell_command(entry: &cella_features::LifecycleEntry) -> String {
     "true".to_string()
 }
 
+/// Whether the workspace content differs from the content hash stored in the container.
+///
+/// Returns `true` (→ run the content phases) when no hash is stored yet or when
+/// the stored hash does not match the current workspace hash. This is a pure
+/// reader: it never writes to the container.
+pub async fn content_changed(
+    lc_ctx: &LifecycleContext<'_>,
+    workspace_root: &std::path::Path,
+) -> bool {
+    let current = cella_git::content_hash::compute(workspace_root);
+    let stored = lc_ctx
+        .client
+        .exec_command(
+            lc_ctx.container_id,
+            &ExecOptions {
+                cmd: vec!["cat".to_string(), "/tmp/.cella/content_hash".to_string()],
+                user: lc_ctx.user.map(String::from),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| r.stdout.trim().to_string());
+    stored.as_deref() != Some(&current)
+}
+
 /// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
 ///
 /// # Errors
@@ -1120,32 +1148,17 @@ pub async fn check_and_run_content_update(
         return Ok(());
     }
 
-    let current_hash = cella_git::content_hash::compute(workspace_root);
-
-    let read_result = lc_ctx
-        .client
-        .exec_command(
-            lc_ctx.container_id,
-            &ExecOptions {
-                cmd: vec!["cat".to_string(), "/tmp/.cella/content_hash".to_string()],
-                user: lc_ctx.user.map(String::from),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    let stored_hash = read_result
-        .ok()
-        .filter(|r| r.exit_code == 0)
-        .map(|r| r.stdout.trim().to_string());
-
     // --prebuild force-reruns updateContentCommand even when the hash matches
     // (official injectHeadless.ts: rerun = !!prebuild). Otherwise honor the
     // content-hash short-circuit.
-    if stored_hash.as_deref() == Some(&current_hash) && !gate.rerun_update_content() {
+    if !content_changed(lc_ctx, workspace_root).await && !gate.rerun_update_content() {
         return Ok(());
     }
+
+    // Recompute the hash here; we need it for the write-back below and
+    // content_changed() does not expose the computed value — recomputing once
+    // at this boundary is simpler than threading it through the helper return type.
+    let current_hash = cella_git::content_hash::compute(workspace_root);
 
     let phases: &[&str] = if run_post_create {
         progress
