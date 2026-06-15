@@ -379,6 +379,31 @@ impl ContainerBackend for AppleContainerBackend {
         })
     }
 
+    fn find_container_by_labels<'a>(
+        &'a self,
+        labels: &'a [String],
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            if labels.is_empty() {
+                return Ok(None);
+            }
+            // List all containers once and AND-filter by all labels. The default
+            // trait impl finds by the first label then post-filters, which fails
+            // when multiple containers share the first label (e.g. same
+            // local_folder, different config_file). Listing once and scanning
+            // all entries avoids that first-match-wins limitation.
+            let entries = self.cli.list().await?;
+            for entry in entries {
+                if let Some(info) = entry_to_container_info(&entry)
+                    && cella_backend::traits::labels_match_all(&info.labels, labels)
+                {
+                    return Ok(Some(info));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

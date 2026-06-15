@@ -83,11 +83,22 @@ impl ExecArgs {
 
         // Determine container resolution path before consuming self's fields.
         let has_id = self.has_id_target();
-        // Capture whether an explicit config path was given before consuming self.
-        // On a spec-identity miss, an explicit --config/--override-config must
-        // error (no container for this config → run `cella up`); a bare
-        // invocation falls back to the interactive picker instead.
-        let has_explicit_config = self.config.is_some() || self.override_config.is_some();
+        // Capture whether the user gave any explicit selector before consuming self.
+        // An explicit selector (--config, --override-config, or --workspace-folder)
+        // means the user asked for a specific environment; on a spec-identity miss
+        // we must error rather than showing the picker. Bare invocations (no selector,
+        // not even a workspace override) degrade to the picker instead.
+        // This matches picker::has_explicit_target, which includes workspace_folder.
+        let has_explicit_selector = self.config.is_some()
+            || self.override_config.is_some()
+            || self.workspace_folder.is_some();
+        // Keep a display-friendly copy of the config path for the error message
+        // before self is consumed into resolve_workspace_folder / config.as_deref().
+        let config_display = self
+            .config
+            .as_deref()
+            .or(self.override_config.as_deref())
+            .map(|p| p.display().to_string());
 
         let container = if has_id {
             // Explicit id target wins: --container-id, --container-name, or --id-label.
@@ -115,13 +126,15 @@ impl ExecArgs {
             .await?;
             if let Some(c) = maybe_container {
                 c
-            } else if has_explicit_config {
-                // An explicit --config/--override-config was given but no running
-                // container matched. Error instead of showing the picker — the user
-                // asked for a specific config and it isn't up.
+            } else if has_explicit_selector {
+                // An explicit selector was given but no running container matched.
+                // Error instead of showing the picker — the user targeted a specific
+                // environment and it isn't running yet.
+                let target_desc = config_display
+                    .as_deref()
+                    .unwrap_or_else(|| ws.to_str().unwrap_or("?"));
                 return Err(format!(
-                    "no dev container found for workspace '{}' — run `cella up` to start it",
-                    ws.display()
+                    "no dev container found for '{target_desc}' — run `cella up` to start it"
                 )
                 .into());
             } else {
