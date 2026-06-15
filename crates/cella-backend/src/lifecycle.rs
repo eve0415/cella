@@ -1106,7 +1106,9 @@ pub async fn content_changed(
     lc_ctx: &LifecycleContext<'_>,
     workspace_root: &std::path::Path,
 ) -> bool {
-    let current = cella_git::content_hash::compute(workspace_root);
+    // Read the stored hash FIRST: when none is stored (first run / older
+    // container) the answer is "changed" regardless, so we skip the workspace
+    // scan entirely.
     let stored = lc_ctx
         .client
         .exec_command(
@@ -1122,7 +1124,7 @@ pub async fn content_changed(
         .ok()
         .filter(|r| r.exit_code == 0)
         .map(|r| r.stdout.trim().to_string());
-    stored.as_deref() != Some(&current)
+    stored.is_none_or(|stored| cella_git::content_hash::compute(workspace_root) != stored)
 }
 
 /// Whether the container's last background lifecycle run recorded a failure.
@@ -1186,8 +1188,8 @@ pub async fn check_and_run_content_update(
 
     // --prebuild force-reruns updateContentCommand even when the hash matches
     // (official injectHeadless.ts: rerun = !!prebuild). Otherwise honor the
-    // content-hash short-circuit.
-    if !content_changed(lc_ctx, workspace_root).await && !gate.rerun_update_content() {
+    // content-hash short-circuit. Check rerun FIRST so prebuild skips the scan.
+    if !gate.rerun_update_content() && !content_changed(lc_ctx, workspace_root).await {
         return Ok(());
     }
 
