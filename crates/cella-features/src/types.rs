@@ -58,6 +58,7 @@ pub struct FeatureMetadata {
     pub name: Option<String>,
     pub description: Option<String>,
     pub documentation_url: Option<String>,
+    pub license_url: Option<String>,
     pub options: HashMap<String, FeatureOption>,
     /// Hard dependencies declared via `dependsOn` in `devcontainer-feature.json`.
     ///
@@ -99,6 +100,10 @@ pub struct FeatureOption {
     pub default: serde_json::Value,
     pub description: Option<String>,
     pub enum_values: Option<Vec<String>>,
+    /// Suggested string values (for IDE autocompletion); only valid on
+    /// `string`-typed options. Distinct from `enum_values` — proposals are
+    /// non-exhaustive hints, not a closed set.
+    pub proposals: Option<Vec<String>>,
 }
 
 /// Option type variants.

@@ -559,6 +559,7 @@ mod tests {
             default,
             description: None,
             enum_values: None,
+            proposals: None,
         }
     }
 
