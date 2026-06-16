@@ -157,6 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_run_args_maps_correctly() {
+        let err = CellaDockerError::InvalidRunArgs {
+            message: "no variable name on line '=x'".to_string(),
+        };
+        // Display format carries the env-file context plus the inner message.
+        assert_eq!(
+            err.to_string(),
+            "invalid runArgs --env-file: no variable name on line '=x'"
+        );
+        let be: BackendError = err.into();
+        assert!(
+            matches!(be, BackendError::InvalidRunArgs { message } if message == "no variable name on line '=x'")
+        );
+    }
+
+    #[test]
     fn docker_cli_not_found_maps_to_cli_not_found() {
         let err = CellaDockerError::DockerCliNotFound {
             message: "not in PATH".to_string(),
@@ -483,6 +499,9 @@ mod tests {
             CellaDockerError::AgentChecksumMismatch {
                 expected: "a".to_string(),
                 actual: "b".to_string(),
+            },
+            CellaDockerError::InvalidRunArgs {
+                message: "x".to_string(),
             },
         ];
         for err in variants {
