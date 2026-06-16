@@ -520,14 +520,15 @@ fn parse_ulimit(s: &str) -> Option<UlimitSpec> {
 /// Errors are appended to `result.errors`; the `up` path checks them before
 /// calling into Docker, matching Docker's failure point.
 ///
-/// On I/O error, emits a warning and pushes nothing from the failed file (no
-/// `result.errors` entry — Docker would fail before even opening the file, but
-/// that error is indistinguishable from a normal I/O failure).
+/// On I/O error (missing path, permissions, …), records an error and pushes no
+/// vars: Docker fails `docker run` when it cannot read the env-file, so `up`
+/// fails too. The error rides the same create-time check, so `read-configuration`
+/// and `build` (which never reach container creation) are unaffected.
 fn parse_env_file(path: &str, result: &mut RunArgsOverrides) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
-            warn!("runArgs: --env-file {path:?}: {err}");
+            result.errors.push(format!("--env-file {path:?}: {err}"));
             return;
         }
     };
@@ -981,9 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_file_missing_warns_and_continues() {
-        // A missing env-file should not crash; the env list stays empty and
-        // other flags still parse correctly.
+    fn parse_env_file_missing_records_error() {
+        // A missing env-file must record a fatal error — Docker fails `docker
+        // run` when it can't read the file, so `up` fails too. Parsing itself
+        // doesn't crash and other flags still parse.
         let r = parse_run_args(&args(&[
             "--env-file",
             "/nonexistent/does/not/exist.env",
@@ -992,6 +994,11 @@ mod tests {
         assert!(r.env.is_empty());
         assert_eq!(r.privileged, Some(true));
         assert!(r.unrecognized.is_empty());
+        assert!(
+            r.errors.iter().any(|e| e.contains("--env-file")),
+            "missing env-file must record an error, got {:?}",
+            r.errors
+        );
     }
 
     // -- Malformed env-file: Docker-matching rejection --
