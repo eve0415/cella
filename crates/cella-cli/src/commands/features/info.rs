@@ -313,8 +313,9 @@ fn tags_fetch_error(
 /// Single-line and multi-line inputs are supported.  The first line is wrapped
 /// in ANSI bold (`\x1b[1m` … `\x1b[22m`) unconditionally — no TTY check —
 /// to match the official behaviour.  The box width equals the maximum VISIBLE
-/// character width across all lines (ANSI escape sequences are excluded from
-/// the count).
+/// character width across all lines: only the bold markers this helper injects
+/// on the first line are discounted (the official likewise compensates solely
+/// for those, not for arbitrary ANSI in the input).
 ///
 /// `indent` prepends that many spaces to every line of output.
 fn enclose_string_in_box(s: &str, indent: usize) -> String {
@@ -423,8 +424,8 @@ mod tests {
     fn box_dependency_tree_header() {
         let header = "Dependency Tree (Render with https://mermaid.live/)";
         let result = enclose_string_in_box(header, 0);
-        // 51 visible chars → 51 dashes
-        let dash_line = "─".repeat(header.len());
+        // 51 visible chars → 51 dashes (count chars, mirroring the impl's width).
+        let dash_line = "─".repeat(header.chars().count());
         assert!(result.starts_with(&format!("┌{dash_line}┐")));
     }
 
