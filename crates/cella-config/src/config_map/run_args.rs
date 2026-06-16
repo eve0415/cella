@@ -528,7 +528,10 @@ fn parse_env_file(path: &str, result: &mut RunArgsOverrides) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
-            result.errors.push(format!("--env-file {path:?}: {err}"));
+            // The error is surfaced wrapped as `invalid runArgs --env-file: …`,
+            // so don't repeat `--env-file` here; Display (not Debug) keeps the
+            // path unquoted, closer to Docker's message.
+            result.errors.push(format!("{path}: {err}"));
             return;
         }
     };
@@ -995,8 +998,8 @@ mod tests {
         assert_eq!(r.privileged, Some(true));
         assert!(r.unrecognized.is_empty());
         assert!(
-            r.errors.iter().any(|e| e.contains("--env-file")),
-            "missing env-file must record an error, got {:?}",
+            r.errors.iter().any(|e| e.contains("exist.env")),
+            "missing env-file must record an error naming the path, got {:?}",
             r.errors
         );
     }
