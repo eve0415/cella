@@ -112,9 +112,10 @@ impl InfoArgs {
                         println!("{}", serde_json::to_string_pretty(&out)?);
                     }
                     OutputFormat::Text => {
-                        println!("{}", serde_json::to_string_pretty(&manifest)?);
-                        println!();
-                        println!("Canonical identifier: {canonical_id}");
+                        println!("{}", enclose_string_in_box("Manifest", 0));
+                        println!("{}\n", serde_json::to_string_pretty(&manifest)?);
+                        println!("{}", enclose_string_in_box("Canonical Identifier", 0));
+                        println!("{canonical_id}\n");
                     }
                 }
             }
@@ -138,9 +139,8 @@ impl InfoArgs {
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }
                 OutputFormat::Text => {
-                    for tag in &tags {
-                        println!("{tag}");
-                    }
+                    println!("{}", enclose_string_in_box("Published Tags", 0));
+                    println!("{}", tags.join("\n   "));
                 }
             },
             Err(e) => {
@@ -160,6 +160,10 @@ impl InfoArgs {
             OutputFormat::Text => {
                 let graph = build_dependency_graph(&[self.feature.as_str()]).await?;
                 let diagram = render_mermaid(&[self.feature.as_str()], &graph.edges);
+                println!(
+                    "{}",
+                    enclose_string_in_box("Dependency Tree (Render with https://mermaid.live/)", 0)
+                );
                 println!("{diagram}");
             }
         }
@@ -190,11 +194,10 @@ impl InfoArgs {
                 match manifest_result {
                     Ok((manifest, digest)) => {
                         let canonical_id = build_canonical_id(&self.feature, &digest);
-                        println!("=== Manifest ===");
-                        println!("{}", serde_json::to_string_pretty(&manifest)?);
-                        println!();
-                        println!("Canonical identifier: {canonical_id}");
-                        println!();
+                        println!("{}", enclose_string_in_box("Manifest", 0));
+                        println!("{}\n", serde_json::to_string_pretty(&manifest)?);
+                        println!("{}", enclose_string_in_box("Canonical Identifier", 0));
+                        println!("{canonical_id}\n");
                     }
                     Err(e) => {
                         eprintln!("Failed to fetch manifest: {e}");
@@ -203,11 +206,8 @@ impl InfoArgs {
                 // Tags section
                 match tags_result {
                     Ok(tags) => {
-                        println!("=== Published Tags ===");
-                        for tag in &tags {
-                            println!("{tag}");
-                        }
-                        println!();
+                        println!("{}", enclose_string_in_box("Published Tags", 0));
+                        println!("{}", tags.join("\n   "));
                     }
                     Err(e) => {
                         eprintln!("Failed to fetch tags: {e}");
@@ -217,7 +217,13 @@ impl InfoArgs {
                 // the manifest and tags sections above.
                 match build_dependency_graph(&[self.feature.as_str()]).await {
                     Ok(graph) => {
-                        println!("=== Dependency Graph ===");
+                        println!(
+                            "{}",
+                            enclose_string_in_box(
+                                "Dependency Tree (Render with https://mermaid.live/)",
+                                0
+                            )
+                        );
                         println!("{}", render_mermaid(&[self.feature.as_str()], &graph.edges));
                     }
                     Err(e) => {
@@ -297,6 +303,81 @@ fn tags_fetch_error(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Box drawing helper
+// ---------------------------------------------------------------------------
+
+/// Enclose a string in a Unicode box, matching the official devcontainer CLI
+/// `encloseStringInBox` helper exactly.
+///
+/// Single-line and multi-line inputs are supported.  The first line is wrapped
+/// in ANSI bold (`\x1b[1m` … `\x1b[22m`) unconditionally — no TTY check —
+/// to match the official behaviour.  The box width equals the maximum VISIBLE
+/// character width across all lines: only the bold markers this helper injects
+/// on the first line are discounted (the official likewise compensates solely
+/// for those, not for arbitrary ANSI in the input).
+///
+/// `indent` prepends that many spaces to every line of output.
+fn enclose_string_in_box(s: &str, indent: usize) -> String {
+    // The ANSI bold markers add 9 bytes (4 + 5) but zero visible columns.
+    const ANSI_BOLD_BYTES: usize = 9;
+
+    let raw_lines: Vec<&str> = s.split('\n').collect();
+
+    // Build the display lines: first line gets bold markers injected.
+    let display_lines: Vec<String> = raw_lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("\x1b[1m{line}\x1b[22m")
+            } else {
+                (*line).to_owned()
+            }
+        })
+        .collect();
+
+    // Visible width per line: subtract ANSI bytes for the line that carries them.
+    let max_width = display_lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let char_count = line.chars().count();
+            if i == 0 {
+                char_count.saturating_sub(ANSI_BOLD_BYTES)
+            } else {
+                char_count
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    let pad = " ".repeat(indent);
+    let top = format!("{pad}┌{}┐", "─".repeat(max_width));
+    let bottom = format!("{pad}└{}┘", "─".repeat(max_width));
+
+    let middle: Vec<String> = display_lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            // How many spaces are needed to reach max_width visible columns?
+            let visible_len = if i == 0 {
+                line.chars().count().saturating_sub(ANSI_BOLD_BYTES)
+            } else {
+                line.chars().count()
+            };
+            let padding = " ".repeat(max_width.saturating_sub(visible_len));
+            format!("{pad}│{line}{padding}│")
+        })
+        .collect();
+
+    let mut parts = Vec::with_capacity(2 + middle.len());
+    parts.push(top);
+    parts.extend(middle);
+    parts.push(bottom);
+    parts.join("\n")
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -304,6 +385,49 @@ fn tags_fetch_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // enclose_string_in_box
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn box_manifest_exact_bytes() {
+        // Must match official encloseStringInBox("Manifest", 0) byte-for-byte.
+        // "Manifest" is 8 visible chars → 8 ─ chars in top/bottom borders.
+        // The content line: │ + \x1b[1m + Manifest + \x1b[22m + │
+        let result = enclose_string_in_box("Manifest", 0);
+        let expected = "┌────────┐\n│\x1b[1mManifest\x1b[22m│\n└────────┘";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn box_single_line_no_indent() {
+        // "AB" = 2 visible chars → 2 dashes, no trailing padding needed.
+        let result = enclose_string_in_box("AB", 0);
+        assert_eq!(result, "┌──┐\n│\x1b[1mAB\x1b[22m│\n└──┘");
+    }
+
+    #[test]
+    fn box_with_indent() {
+        let result = enclose_string_in_box("Hi", 2);
+        assert_eq!(result, "  ┌──┐\n  │\x1b[1mHi\x1b[22m│\n  └──┘");
+    }
+
+    #[test]
+    fn box_canonical_identifier_width() {
+        // "Canonical Identifier" is 20 chars → 20 dashes.
+        let result = enclose_string_in_box("Canonical Identifier", 0);
+        assert!(result.starts_with("┌────────────────────┐"));
+    }
+
+    #[test]
+    fn box_dependency_tree_header() {
+        let header = "Dependency Tree (Render with https://mermaid.live/)";
+        let result = enclose_string_in_box(header, 0);
+        // 51 visible chars → 51 dashes (count chars, mirroring the impl's width).
+        let dash_line = "─".repeat(header.chars().count());
+        assert!(result.starts_with(&format!("┌{dash_line}┐")));
+    }
 
     // -----------------------------------------------------------------------
     // InfoMode parsing via clap ValueEnum
