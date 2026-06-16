@@ -80,6 +80,17 @@ pub enum CellaDockerError {
     #[error("I/O error: {0}")]
     #[diagnostic(code(cella::docker::io))]
     Io(#[from] std::io::Error),
+
+    /// A `runArgs` `--env-file` contained a malformed variable definition.
+    ///
+    /// Docker errors here and aborts `docker run`; cella surfaces the same
+    /// failure at container-creation time.
+    #[error("invalid runArgs --env-file: {message}")]
+    #[diagnostic(
+        code(cella::docker::invalid_run_args),
+        help("Fix the env-file referenced by runArgs --env-file in devcontainer.json.")
+    )]
+    InvalidRunArgs { message: String },
 }
 
 impl From<CellaDockerError> for cella_backend::BackendError {
@@ -115,6 +126,7 @@ impl From<CellaDockerError> for cella_backend::BackendError {
                 Self::AgentChecksumMismatch { expected, actual }
             }
             CellaDockerError::Io(e) => Self::Io(e),
+            CellaDockerError::InvalidRunArgs { message } => Self::InvalidRunArgs { message },
         }
     }
 }
@@ -142,6 +154,22 @@ mod tests {
         };
         let be: BackendError = err.into();
         assert!(matches!(be, BackendError::ImageNotFound { image } if image == "ubuntu:latest"));
+    }
+
+    #[test]
+    fn invalid_run_args_maps_correctly() {
+        let err = CellaDockerError::InvalidRunArgs {
+            message: "no variable name on line '=x'".to_string(),
+        };
+        // Display format carries the env-file context plus the inner message.
+        assert_eq!(
+            err.to_string(),
+            "invalid runArgs --env-file: no variable name on line '=x'"
+        );
+        let be: BackendError = err.into();
+        assert!(
+            matches!(be, BackendError::InvalidRunArgs { message } if message == "no variable name on line '=x'")
+        );
     }
 
     #[test]
@@ -471,6 +499,9 @@ mod tests {
             CellaDockerError::AgentChecksumMismatch {
                 expected: "a".to_string(),
                 actual: "b".to_string(),
+            },
+            CellaDockerError::InvalidRunArgs {
+                message: "x".to_string(),
             },
         ];
         for err in variants {

@@ -82,7 +82,7 @@ pub fn parse_run_args(args: &[String]) -> RunArgsOverrides {
 
             "--env-file" => {
                 if let Some(path) = next_val(&mut i, inline_val) {
-                    parse_env_file(&path, &mut result.env);
+                    parse_env_file(&path, &mut result);
                 }
             }
 
@@ -498,17 +498,32 @@ fn parse_ulimit(s: &str) -> Option<UlimitSpec> {
     })
 }
 
-/// Read an env-file and push `KEY=VAL` entries into `out`, matching Docker's
-/// `--env-file` parsing.
+/// Read an env-file and push `KEY=VAL` entries into `result.env`, matching
+/// Docker's `--env-file` parsing.
 ///
 /// Each line is left-trimmed; blank lines and those beginning with `#` are
 /// skipped. For `KEY=VALUE`, the variable name is trimmed but the value is
 /// passed through verbatim (Docker never trims the value, so a trailing space
 /// is significant). A bare `KEY` with no `=` inherits the value from cella's
 /// own environment, exactly as `docker run --env-file` resolves it from the
-/// client environment. On I/O error, emits a warning and pushes nothing from
-/// the failed file.
-fn parse_env_file(path: &str, out: &mut Vec<String>) {
+/// client environment.
+///
+/// Rejects malformed lines like Docker does (all-or-nothing per file):
+///
+/// - A line whose key part (before `=`), when trimmed, is empty records a
+///   `"no variable name on line '…'"` error and contributes NO vars from the
+///   whole file (matches `docker/cli pkg/kvfile/kvfile.go`).
+/// - A key that contains internal ASCII whitespace records a
+///   `"variable '…' contains whitespaces"` error with the same all-or-nothing
+///   semantics.
+///
+/// Errors are appended to `result.errors`; the `up` path checks them before
+/// calling into Docker, matching Docker's failure point.
+///
+/// On I/O error, emits a warning and pushes nothing from the failed file (no
+/// `result.errors` entry — Docker would fail before even opening the file, but
+/// that error is indistinguishable from a normal I/O failure).
+fn parse_env_file(path: &str, result: &mut RunArgsOverrides) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
@@ -516,26 +531,59 @@ fn parse_env_file(path: &str, out: &mut Vec<String>) {
             return;
         }
     };
+
+    // Buffer vars for this file; only extend result.env if the whole file is clean.
+    let mut buffered: Vec<String> = Vec::new();
+
     for raw in content.lines() {
         // Docker left-trims the line before testing for blank / comment lines.
         let line = raw.trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            // `KEY=VALUE`: trim only the name, keep the value untouched.
-            let key = key.trim();
-            if !key.is_empty() {
-                out.push(format!("{key}={value}"));
+
+        if let Some((key_raw, value)) = line.split_once('=') {
+            // `KEY=VALUE`: trim the name, keep the value untouched.
+            let key = key_raw.trim();
+
+            if key.is_empty() {
+                // Empty key — e.g. `=value` or `  =value`.
+                result
+                    .errors
+                    .push(format!("no variable name on line '{line}'"));
+                return;
             }
+
+            if key.contains(|c: char| c.is_ascii_whitespace()) {
+                // Key contains internal whitespace — e.g. `MY KEY=value`.
+                result
+                    .errors
+                    .push(format!("variable '{key}' contains whitespaces"));
+                return;
+            }
+
+            buffered.push(format!("{key}={value}"));
         } else {
-            // Bare `KEY`: inherit from the current environment, like Docker.
+            // Bare `KEY` (no `=`): inherit from the current environment, like Docker.
             let key = line.trim();
-            if let Ok(value) = std::env::var(key) {
-                out.push(format!("{key}={value}"));
+
+            if key.contains(|c: char| c.is_ascii_whitespace()) {
+                // Bare key with internal whitespace — e.g. `MY KEY`.
+                result
+                    .errors
+                    .push(format!("variable '{key}' contains whitespaces"));
+                return;
             }
+
+            if let Ok(value) = std::env::var(key) {
+                buffered.push(format!("{key}={value}"));
+            }
+            // If unset, Docker contributes nothing for bare keys — skip silently.
         }
     }
+
+    // Whole file parsed cleanly — commit all entries.
+    result.env.extend(buffered);
 }
 
 /// Emit warnings for any unrecognized flags.
@@ -944,5 +992,96 @@ mod tests {
         assert!(r.env.is_empty());
         assert_eq!(r.privileged, Some(true));
         assert!(r.unrecognized.is_empty());
+    }
+
+    // -- Malformed env-file: Docker-matching rejection --
+
+    #[test]
+    fn parse_env_file_empty_key_records_error_and_no_vars() {
+        // A line like `=value` has an empty key — Docker errors with
+        // "no variable name on line '…'".  The whole file's vars must be
+        // discarded (all-or-nothing).
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "GOOD=val").unwrap();
+        writeln!(f, "=bad_empty_key").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert!(
+            r.env.is_empty(),
+            "all-or-nothing: no vars when the file has an empty key"
+        );
+        assert_eq!(r.errors.len(), 1, "exactly one error recorded");
+        assert!(
+            r.errors[0].contains("no variable name"),
+            "error message must mention missing name: {:?}",
+            r.errors[0]
+        );
+        assert!(
+            r.errors[0].contains("=bad_empty_key"),
+            "error message must include the offending line: {:?}",
+            r.errors[0]
+        );
+    }
+
+    #[test]
+    fn parse_env_file_whitespace_key_records_error_and_no_vars() {
+        // A line like `MY KEY=value` has a key with internal whitespace —
+        // Docker errors with "variable '…' contains whitespaces".
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "GOOD=val").unwrap();
+        writeln!(f, "MY KEY=value").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert!(
+            r.env.is_empty(),
+            "all-or-nothing: no vars when the file has a whitespace key"
+        );
+        assert_eq!(r.errors.len(), 1, "exactly one error recorded");
+        assert!(
+            r.errors[0].contains("contains whitespaces"),
+            "error message must mention whitespaces: {:?}",
+            r.errors[0]
+        );
+        assert!(
+            r.errors[0].contains("MY KEY"),
+            "error message must include the key: {:?}",
+            r.errors[0]
+        );
+    }
+
+    #[test]
+    fn parse_env_file_all_or_nothing_mixed_file() {
+        // If a file has one good line followed by a bad line, zero vars
+        // must be contributed — the good line is not partially written.
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "VALID=yes").unwrap();
+        writeln!(f, "ALSO_VALID=yes").unwrap();
+        writeln!(f, "=bad_empty").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert!(
+            r.env.is_empty(),
+            "good lines before a bad one must not leak"
+        );
+        assert!(!r.errors.is_empty(), "error must be recorded");
+    }
+
+    #[test]
+    fn parse_env_file_clean_file_still_works() {
+        // Sanity: a fully valid file must still push its vars and record no
+        // errors.  Regression guard for the existing valid-input behaviour.
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "ALPHA=1").unwrap();
+        writeln!(f, "BETA=hello world").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert_eq!(r.env, vec!["ALPHA=1", "BETA=hello world"]);
+        assert!(r.errors.is_empty(), "no errors for a clean file");
     }
 }

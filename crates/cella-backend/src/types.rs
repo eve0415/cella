@@ -658,6 +658,15 @@ pub struct RunArgsOverrides {
 
     /// Flags not recognized by the parser (emitted as warnings).
     pub unrecognized: Vec<String>,
+
+    /// Fatal env-file parse errors collected during `--env-file` processing.
+    ///
+    /// Docker aborts `docker run` if an env-file contains a malformed line (e.g.
+    /// an empty variable name or a variable name containing whitespace).  cella
+    /// mirrors this by recording the error here during `parse_run_args` and then
+    /// failing at container-creation time — the same point the official CLI would
+    /// fail.  Empty means no errors were found.
+    pub errors: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
