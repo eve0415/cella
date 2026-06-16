@@ -105,4 +105,15 @@ pub enum BackendError {
     #[error(transparent)]
     #[diagnostic(code(cella::backend::runtime))]
     Runtime(Box<dyn std::error::Error + Send + Sync>),
+
+    /// A `runArgs` `--env-file` contained a malformed variable definition.
+    ///
+    /// Docker errors here and aborts `docker run`; cella surfaces the same
+    /// failure at container-creation time.
+    #[error("invalid runArgs --env-file: {message}")]
+    #[diagnostic(
+        code(cella::backend::invalid_run_args),
+        help("Fix the env-file referenced by runArgs --env-file in devcontainer.json.")
+    )]
+    InvalidRunArgs { message: String },
 }

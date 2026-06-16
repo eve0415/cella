@@ -80,6 +80,17 @@ pub enum CellaDockerError {
     #[error("I/O error: {0}")]
     #[diagnostic(code(cella::docker::io))]
     Io(#[from] std::io::Error),
+
+    /// A `runArgs` `--env-file` contained a malformed variable definition.
+    ///
+    /// Docker errors here and aborts `docker run`; cella surfaces the same
+    /// failure at container-creation time.
+    #[error("invalid runArgs --env-file: {message}")]
+    #[diagnostic(
+        code(cella::docker::invalid_run_args),
+        help("Fix the env-file referenced by runArgs --env-file in devcontainer.json.")
+    )]
+    InvalidRunArgs { message: String },
 }
 
 impl From<CellaDockerError> for cella_backend::BackendError {
@@ -115,6 +126,7 @@ impl From<CellaDockerError> for cella_backend::BackendError {
                 Self::AgentChecksumMismatch { expected, actual }
             }
             CellaDockerError::Io(e) => Self::Io(e),
+            CellaDockerError::InvalidRunArgs { message } => Self::InvalidRunArgs { message },
         }
     }
 }

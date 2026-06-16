@@ -113,6 +113,28 @@ pub(crate) fn container_info_from_summary(
     }
 }
 
+/// Validate `run_args_overrides` before container creation.
+///
+/// Returns `Err(CellaDockerError::InvalidRunArgs)` if the overrides carry any
+/// env-file parse errors (populated by `parse_run_args` when it encounters a
+/// malformed `--env-file`).  This is the single, early, fallible check that
+/// mirrors the point at which Docker would reject the file via `docker run`.
+///
+/// `build` and `read-configuration` never call this function — they do not
+/// reach `create_container` — so they are unaffected by malformed env-files.
+fn validate_run_args_overrides(
+    opts: &cella_backend::CreateContainerOptions,
+) -> Result<(), CellaDockerError> {
+    if let Some(ra) = opts.run_args_overrides.as_ref()
+        && let Some(first_err) = ra.errors.first()
+    {
+        return Err(CellaDockerError::InvalidRunArgs {
+            message: first_err.clone(),
+        });
+    }
+    Ok(())
+}
+
 impl DockerClient {
     /// Find an existing container for the given workspace.
     ///
@@ -186,12 +208,19 @@ impl DockerClient {
     ///
     /// # Errors
     ///
+    /// Returns `CellaDockerError::InvalidRunArgs` if any `--env-file` referenced
+    /// in `runArgs` contained a malformed variable definition (e.g. an empty
+    /// variable name or a variable name containing whitespace).  This matches
+    /// Docker's behaviour: `docker run` would abort with the same error.
+    ///
     /// Returns `CellaDockerError::DockerApi` on API errors.
     pub async fn create_container(
         &self,
         opts: &cella_backend::CreateContainerOptions,
     ) -> Result<String, CellaDockerError> {
         info!("Creating container: {}", opts.name);
+
+        validate_run_args_overrides(opts)?;
 
         let bollard_opts = BollardCreateOptions {
             name: Some(opts.name.clone()),
@@ -1692,6 +1721,91 @@ mod tests {
         assert!(
             info.labels.contains_key("dev.cella.workspace_path"),
             "cella-managed container must have dev.cella.workspace_path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_run_args_overrides
+    // -----------------------------------------------------------------------
+
+    /// Minimal `CreateContainerOptions` with clean (no errors) `run_args_overrides`.
+    fn minimal_opts_no_errors() -> cella_backend::CreateContainerOptions {
+        cella_backend::CreateContainerOptions {
+            name: "test".to_string(),
+            image: "ubuntu:latest".to_string(),
+            labels: std::collections::HashMap::new(),
+            env: Vec::new(),
+            remote_env: Vec::new(),
+            user: None,
+            workspace_folder: "/workspace".to_string(),
+            workspace_mount: None,
+            mounts: Vec::new(),
+            port_bindings: std::collections::HashMap::new(),
+            entrypoint: None,
+            cmd: None,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            privileged: false,
+            init: false,
+            run_args_overrides: None,
+            gpu_request: None,
+        }
+    }
+
+    #[test]
+    fn validate_run_args_overrides_no_overrides_ok() {
+        // No run_args_overrides at all — must pass.
+        let opts = minimal_opts_no_errors();
+        assert!(validate_run_args_overrides(&opts).is_ok());
+    }
+
+    #[test]
+    fn validate_run_args_overrides_clean_overrides_ok() {
+        // run_args_overrides present but errors is empty — must pass.
+        let mut opts = minimal_opts_no_errors();
+        opts.run_args_overrides = Some(cella_backend::RunArgsOverrides {
+            env: vec!["FOO=bar".to_string()],
+            ..Default::default()
+        });
+        assert!(validate_run_args_overrides(&opts).is_ok());
+    }
+
+    #[test]
+    fn validate_run_args_overrides_with_errors_returns_err() {
+        // run_args_overrides.errors non-empty — must Err with InvalidRunArgs.
+        let mut opts = minimal_opts_no_errors();
+        opts.run_args_overrides = Some(cella_backend::RunArgsOverrides {
+            errors: vec!["no variable name on line '=bad'".to_string()],
+            ..Default::default()
+        });
+        let result = validate_run_args_overrides(&opts);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CellaDockerError::InvalidRunArgs { .. }),
+            "expected InvalidRunArgs, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no variable name"),
+            "error message should surface the env-file error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_run_args_overrides_surfaces_first_error() {
+        // When multiple errors are present, the first is surfaced.
+        let mut opts = minimal_opts_no_errors();
+        opts.run_args_overrides = Some(cella_backend::RunArgsOverrides {
+            errors: vec![
+                "no variable name on line '=first'".to_string(),
+                "variable 'MY KEY' contains whitespaces".to_string(),
+            ],
+            ..Default::default()
+        });
+        let err = validate_run_args_overrides(&opts).unwrap_err();
+        assert!(
+            err.to_string().contains("=first"),
+            "first error must be surfaced: {err}"
         );
     }
 }
