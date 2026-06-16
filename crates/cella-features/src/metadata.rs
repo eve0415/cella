@@ -51,6 +51,8 @@ struct FeatureMetadataDto {
     description: Option<String>,
     #[serde(rename = "documentationURL")]
     documentation_url: Option<String>,
+    #[serde(rename = "licenseURL")]
+    license_url: Option<String>,
     #[serde(default)]
     options: HashMap<String, FeatureOptionDto>,
     /// Hard dependencies: `Record<featureId, options>` where options is
@@ -97,6 +99,7 @@ struct FeatureOptionDto {
     description: Option<String>,
     #[serde(rename = "enum")]
     enum_values: Option<Vec<String>>,
+    proposals: Option<Vec<String>>,
 }
 
 impl FeatureMetadataDto {
@@ -122,6 +125,7 @@ impl FeatureMetadataDto {
                     default: dto.default,
                     description: dto.description,
                     enum_values: dto.enum_values,
+                    proposals: dto.proposals,
                 },
             );
         }
@@ -145,6 +149,7 @@ impl FeatureMetadataDto {
             name: self.name,
             description: self.description,
             documentation_url: self.documentation_url,
+            license_url: self.license_url,
             options,
             depends_on: self.depends_on,
             installs_after: self.installs_after,
@@ -439,6 +444,65 @@ mod tests {
         let meta = parse_feature_metadata(json).unwrap();
         let opt = &meta.options["name"];
         assert!(opt.default.is_null());
+    }
+
+    #[test]
+    fn license_url_parsed() {
+        let json = r#"{
+            "id": "node",
+            "version": "2.0.0",
+            "licenseURL": "https://github.com/devcontainers/features/blob/main/LICENSE"
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse licenseURL");
+        assert_eq!(
+            meta.license_url.as_deref(),
+            Some("https://github.com/devcontainers/features/blob/main/LICENSE")
+        );
+    }
+
+    #[test]
+    fn license_url_absent_yields_none() {
+        let json = r#"{"id": "node", "version": "1.0.0"}"#;
+        let meta = parse_feature_metadata(json).expect("should parse without licenseURL");
+        assert!(meta.license_url.is_none());
+    }
+
+    #[test]
+    fn proposals_parsed() {
+        let json = r#"{
+            "id": "test",
+            "version": "1.0.0",
+            "options": {
+                "flavor": {
+                    "type": "string",
+                    "default": "vanilla",
+                    "proposals": ["vanilla", "chocolate", "strawberry"]
+                }
+            }
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse proposals");
+        let opt = &meta.options["flavor"];
+        assert_eq!(
+            opt.proposals.as_deref(),
+            Some(&["vanilla", "chocolate", "strawberry"].map(String::from)[..])
+        );
+    }
+
+    #[test]
+    fn proposals_absent_yields_none() {
+        let json = r#"{
+            "id": "test",
+            "version": "1.0.0",
+            "options": {
+                "flavor": {
+                    "type": "string",
+                    "default": "vanilla"
+                }
+            }
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse without proposals");
+        let opt = &meta.options["flavor"];
+        assert!(opt.proposals.is_none());
     }
 
     #[test]

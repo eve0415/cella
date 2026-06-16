@@ -118,6 +118,7 @@ mod tests {
                 default: json!(false),
                 description: None,
                 enum_values: None,
+                proposals: None,
             },
         )]);
         let user = HashMap::from([("flag".to_string(), json!(42))]);
@@ -143,6 +144,7 @@ mod tests {
                 default: json!(false),
                 description: None,
                 enum_values: None,
+                proposals: None,
             },
         )]);
 
@@ -171,6 +173,7 @@ mod tests {
                 default: json!(false),
                 description: None,
                 enum_values: None,
+                proposals: None,
             },
         )]);
         let user = HashMap::from([("flag".to_string(), json!("yes"))]);
@@ -200,6 +203,7 @@ mod tests {
                     "latest".to_string(),
                     "18".to_string(),
                 ]),
+                proposals: None,
             },
         )]);
         let user = HashMap::from([("version".to_string(), json!("99"))]);
@@ -225,6 +229,7 @@ mod tests {
                 default: json!("lts"),
                 description: None,
                 enum_values: Some(vec!["lts".to_string(), "latest".to_string()]),
+                proposals: None,
             },
         )]);
         let user = HashMap::from([("version".to_string(), json!("lts"))]);
@@ -243,6 +248,7 @@ mod tests {
                     default: json!("lts"),
                     description: None,
                     enum_values: None,
+                    proposals: None,
                 },
             ),
             (
@@ -252,6 +258,7 @@ mod tests {
                     default: json!(true),
                     description: None,
                     enum_values: None,
+                    proposals: None,
                 },
             ),
         ]);
@@ -273,6 +280,7 @@ mod tests {
                 default: json!(false),
                 description: None,
                 enum_values: None,
+                proposals: None,
             },
         )]);
         let user = HashMap::from([

@@ -19,8 +19,6 @@
 //!
 //! Follow-ups, gated on `cella-features` modelling the field (it currently does
 //! not parse them, so they are dropped before reaching here, not invented):
-//! - `features[].documentationURL` / `licenseURL`, and string-option
-//!   `proposals` — unmodelled in `FeatureMetadata` / `FeatureOption`.
 //! - non-OCI `sourceInformation.tarballUri` (direct-tarball) /
 //!   `resolvedFilePath` (file-path) — not carried on `ResolvedFeature`.
 //! - explicitly-empty collections (`"capAdd": []`) are emitted as absent,
@@ -114,6 +112,10 @@ struct FeatureOut {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(rename = "documentationURL", skip_serializing_if = "Option::is_none")]
+    documentation_url: Option<String>,
+    #[serde(rename = "licenseURL", skip_serializing_if = "Option::is_none")]
+    license_url: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     options: BTreeMap<String, FeatureOptionOut>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -164,6 +166,8 @@ struct FeatureOptionOut {
     description: Option<String>,
     #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
     enum_values: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposals: Option<Vec<String>>,
 }
 
 /// Build the `featuresConfiguration` value, or `None` when no features are
@@ -249,6 +253,8 @@ fn feature_out(f: &ResolvedFeature, idx: usize) -> FeatureOut {
         version: non_empty(&m.version),
         name: m.name.clone(),
         description: m.description.clone(),
+        documentation_url: m.documentation_url.clone(),
+        license_url: m.license_url.clone(),
         options: map_options(&m.options),
         container_env: m
             .container_env
@@ -289,6 +295,7 @@ fn map_options(options: &HashMap<String, FeatureOption>) -> BTreeMap<String, Fea
                     default: o.default.clone(),
                     description: o.description.clone(),
                     enum_values: o.enum_values.clone(),
+                    proposals: o.proposals.clone(),
                 },
             )
         })
@@ -393,7 +400,8 @@ fn parse_mount_spec(spec: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use cella_features::types::{
-        FeatureMetadata, ResolvedFeature, ResolvedFeatures, ResolvedOciManifest,
+        FeatureMetadata, FeatureOption, OptionType, ResolvedFeature, ResolvedFeatures,
+        ResolvedOciManifest,
     };
     use std::path::PathBuf;
 
@@ -526,6 +534,76 @@ mod tests {
             feat["customizations"]["vscode"]["extensions"][0],
             "dbaeumer.vscode-eslint"
         );
+    }
+
+    #[test]
+    fn documentation_url_license_url_and_proposals_emitted() {
+        let mut f = oci_feature();
+        f.metadata.documentation_url =
+            Some("https://github.com/devcontainers/features/tree/main/src/node".to_string());
+        f.metadata.license_url =
+            Some("https://github.com/devcontainers/features/blob/main/LICENSE".to_string());
+        f.metadata.options = HashMap::from([(
+            "version".to_string(),
+            FeatureOption {
+                option_type: OptionType::String,
+                default: serde_json::json!("lts"),
+                description: None,
+                enum_values: None,
+                proposals: Some(vec!["lts".to_string(), "20".to_string(), "18".to_string()]),
+            },
+        )]);
+        let fc = build(&resolved(vec![f]))
+            .unwrap()
+            .expect("features present");
+        let v = serde_json::to_value(&fc).unwrap();
+        let feat = &v["featureSets"][0]["features"][0];
+
+        // All three new fields present with the exact official key names.
+        assert_eq!(
+            feat["documentationURL"],
+            "https://github.com/devcontainers/features/tree/main/src/node"
+        );
+        assert_eq!(
+            feat["licenseURL"],
+            "https://github.com/devcontainers/features/blob/main/LICENSE"
+        );
+        assert_eq!(
+            feat["options"]["version"]["proposals"],
+            serde_json::json!(["lts", "20", "18"])
+        );
+
+        // Sanity: camelCase variants must NOT appear (wrong key casing).
+        assert!(
+            feat.get("documentationUrl").is_none(),
+            "must be documentationURL, not documentationUrl"
+        );
+        assert!(
+            feat.get("licenseUrl").is_none(),
+            "must be licenseURL, not licenseUrl"
+        );
+    }
+
+    #[test]
+    fn documentation_url_license_url_and_proposals_omitted_when_absent() {
+        // oci_feature() sets no documentationURL/licenseURL and default options
+        // have no proposals — verify the keys are completely absent (not null).
+        let fc = build(&resolved(vec![oci_feature()]))
+            .unwrap()
+            .expect("features present");
+        let v = serde_json::to_value(&fc).unwrap();
+        let feat = &v["featureSets"][0]["features"][0];
+
+        assert!(
+            feat.get("documentationURL").is_none(),
+            "documentationURL must be omitted when absent, not null"
+        );
+        assert!(
+            feat.get("licenseURL").is_none(),
+            "licenseURL must be omitted when absent, not null"
+        );
+        // oci_feature has no options, so no proposals to check — any option
+        // without proposals must not emit the key.
     }
 
     #[test]
