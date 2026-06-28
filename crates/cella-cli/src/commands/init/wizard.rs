@@ -745,8 +745,6 @@ fn read_template_config(template_dir: &std::path::Path) -> Option<String> {
         .or_else(|| std::fs::read_to_string(template_dir.join("devcontainer.json")).ok())
 }
 
-const PIN_IMAGE_SENTINEL: &str = "Pin to specific image version...";
-
 /// Prompt for template options with optional image pinning support.
 ///
 /// Returns `(options, pinned_image)` where `pinned_image` is `Some` if the
@@ -797,9 +795,10 @@ async fn prompt_options_with_pin(
     Ok((resolved, pinned_image))
 }
 
-/// Prompt for an image variant option with a pin sentinel at the end.
+/// Prompt for an image variant option with automatic version discovery.
 ///
-/// Returns `(chosen_value, optional_pinned_image)`.
+/// After the user selects a proposal, fetches registry tags and presents
+/// version-specific options. Returns `(chosen_value, optional_pinned_image)`.
 async fn prompt_variant_with_pin(
     key: &str,
     opt: &cella_templates::types::TemplateOption,
@@ -808,13 +807,13 @@ async fn prompt_variant_with_pin(
     refresh: bool,
     progress: &Progress,
 ) -> Result<(serde_json::Value, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    const DEFAULT_SUFFIX: &str = " (default)";
+
     let description = opt.description.as_deref().unwrap_or(key);
     let proposals = opt.proposals.as_deref().unwrap_or_default();
 
-    // Build choices: proposals + (custom) + pin sentinel
     let mut choices: Vec<String> = proposals.to_vec();
     choices.push("(custom)".to_owned());
-    choices.push(PIN_IMAGE_SENTINEL.to_owned());
 
     let default_str = opt.default.as_str().unwrap_or("");
     let default_idx = choices.iter().position(|v| v == default_str).unwrap_or(0);
@@ -830,58 +829,54 @@ async fn prompt_variant_with_pin(
         return Ok((serde_json::json!(custom), None));
     }
 
-    if selection == PIN_IMAGE_SENTINEL {
-        // Step 1: Ask which codename to filter by
-        let codename =
-            Select::new("Select variant to filter tags:", proposals.to_vec()).prompt()?;
-
-        // Step 2: Fetch tags
-        let tags_result = progress
-            .run_step_result(
-                "Fetching image tags",
-                cella_templates::tags::fetch_image_tags(&variant_info.base_image, cache, refresh),
-            )
-            .await;
-
-        match tags_result {
-            Ok(all_tags) => {
-                let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-                let mut filtered =
-                    cella_templates::tags::filter_tags_by_suffix(&tag_refs, &codename);
-                cella_templates::tags::sort_tags_descending(&mut filtered);
-                filtered.truncate(cella_templates::tags::MAX_PINNED_TAGS);
-
-                if filtered.is_empty() {
-                    eprintln!(
-                        "  {} No pinnable tags found for variant \"{codename}\"; using as-is",
-                        style::dim("(note)")
-                    );
-                    return Ok((serde_json::json!(codename), None));
-                }
-
-                let pinned_tag = Select::new(
-                    "Select image version:",
-                    filtered.iter().map(|s| (*s).to_owned()).collect(),
-                )
-                .with_page_size(15)
-                .prompt()?;
-
-                let full_image = format!("{}:{pinned_tag}", variant_info.base_image);
-                // Still set the codename as the option value for substitution of
-                // other template files that reference this option.
-                Ok((serde_json::json!(codename), Some(full_image)))
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} could not fetch image tags: {e}; using variant as-is",
-                    style::dim("(note)")
-                );
-                Ok((serde_json::json!(codename), None))
-            }
+    let all_tags = match progress
+        .run_step_result(
+            "Fetching image tags",
+            cella_templates::tags::fetch_image_tags(&variant_info.base_image, cache, refresh),
+        )
+        .await
+    {
+        Ok(tags) => tags,
+        Err(e) => {
+            eprintln!(
+                "  {} could not fetch image tags: {e}; using variant as-is",
+                style::dim("(note)")
+            );
+            return Ok((serde_json::json!(selection), None));
         }
-    } else {
-        Ok((serde_json::json!(selection), None))
+    };
+
+    let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+    let mut filtered = cella_templates::tags::filter_tags_by_suffix(&tag_refs, &selection);
+    cella_templates::tags::sort_tags_descending(&mut filtered);
+    filtered.truncate(cella_templates::tags::MAX_PINNED_TAGS);
+
+    if filtered.is_empty() {
+        eprintln!(
+            "  {} no version-specific tags found for \"{selection}\"",
+            style::dim("(note)")
+        );
+        return Ok((serde_json::json!(selection), None));
     }
+
+    let default_label = format!("{selection}{DEFAULT_SUFFIX}");
+    let mut version_choices: Vec<String> = Vec::with_capacity(filtered.len() + 1);
+    version_choices.push(default_label.clone());
+    version_choices.extend(filtered.iter().map(|s| (*s).to_owned()));
+
+    let version_selection = Select::new(
+        &format!("Select image version ({selection}):"),
+        version_choices,
+    )
+    .with_page_size(15)
+    .prompt()?;
+
+    if version_selection == default_label {
+        return Ok((serde_json::json!(selection), None));
+    }
+
+    let full_image = format!("{}:{version_selection}", variant_info.base_image);
+    Ok((serde_json::json!(selection), Some(full_image)))
 }
 
 /// Prompt for which optional paths to include via multi-select.
