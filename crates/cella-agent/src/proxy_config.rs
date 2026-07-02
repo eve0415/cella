@@ -134,6 +134,20 @@ impl AgentProxyConfig {
         self.credential_routes.iter().find(|r| r.domain == domain)
     }
 
+    /// Log an allowed request to the proxy log file.
+    pub fn log_allowed(&self, domain: &str, path: &str) {
+        let Ok(mut guard) = self.log_file.lock() else {
+            return;
+        };
+        let Some(ref mut file) = *guard else {
+            return;
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let _ = writeln!(file, "{timestamp}\tALLOWED\t{domain}\t{path}");
+    }
+
     /// Log a blocked request to the proxy log file.
     pub fn log_blocked(&self, domain: &str, path: &str, reason: &str) {
         let Ok(mut guard) = self.log_file.lock() else {
@@ -388,6 +402,23 @@ mod tests {
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\tERROR\texample.com\tTLS handshake failed: test error"));
+    }
+
+    #[test]
+    fn log_allowed_writes_to_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let json = make_json(
+            "denylist",
+            "",
+            &format!(r#","log_path":"{}""#, path.display()),
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        config.log_allowed("example.com", "/api/v1");
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\tALLOWED\texample.com\t/api/v1"));
     }
 
     #[test]
