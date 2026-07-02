@@ -123,6 +123,27 @@ pub fn prepare_ca_injection(additional_ca_path: Option<&str>) -> Option<CaInject
     })
 }
 
+/// Build a combined PEM bundle containing host CAs and an additional PEM cert.
+///
+/// Used to create a bundle that replaces the default trust store while
+/// also trusting the MITM CA. Returns the host bundle content alone if
+/// no additional cert is provided, or the additional cert alone if no
+/// host bundle is detected.
+pub fn build_combined_ca_bundle(additional_pem: &str) -> String {
+    let mut bundle = String::new();
+
+    if let Some(host_bundle) = detect_host_ca_bundle() {
+        bundle.push_str(&host_bundle.pem_bundle);
+    }
+
+    if !bundle.is_empty() && !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
+    bundle.push_str(additional_pem);
+
+    bundle
+}
+
 /// Prepared CA injection data.
 pub struct CaInjection {
     /// The CA bundle PEM content to upload.
@@ -333,6 +354,16 @@ ID=custom
         assert_eq!(
             ContainerDistro::Unknown.ca_cert_path("test.crt"),
             "/usr/local/share/ca-certificates/test.crt"
+        );
+    }
+
+    #[test]
+    fn build_combined_ca_bundle_includes_additional_pem() {
+        let additional = "-----BEGIN CERTIFICATE-----\nMITM_CA\n-----END CERTIFICATE-----\n";
+        let bundle = build_combined_ca_bundle(additional);
+        assert!(
+            bundle.contains("MITM_CA"),
+            "combined bundle should contain the additional PEM"
         );
     }
 }
