@@ -613,16 +613,14 @@ mod tests {
         let distro = ca_bundle::ContainerDistro::Unknown;
         inject_mitm_ca_trust(&mut fwd, &distro, "CERT");
 
-        let mitm_paths: Vec<&str> = fwd
+        let mitm_count = fwd
             .post_start
             .file_uploads
             .iter()
             .filter(|u| u.container_path.contains("cella-mitm-ca.crt"))
-            .map(|u| u.container_path.as_str())
-            .collect();
+            .count();
         assert_eq!(
-            mitm_paths.len(),
-            2,
+            mitm_count, 2,
             "unknown distro should upload to both Debian and RHEL paths"
         );
     }
