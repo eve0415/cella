@@ -177,6 +177,8 @@ async fn handle_connect(
         return;
     }
 
+    config.log_allowed(&host, "/");
+
     // Tunnel without MITM.
     let upstream = match connect_upstream(&host, port, config).await {
         Ok(s) => s,
@@ -238,6 +240,8 @@ async fn handle_direct_http(
             .await;
         return;
     }
+
+    config.log_allowed(&host, &path);
 
     // Connect to upstream and forward the request.
     let mut upstream = match connect_upstream(&host, port, config).await {
