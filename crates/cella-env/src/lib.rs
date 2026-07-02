@@ -34,6 +34,13 @@ pub use platform::DockerRuntime;
 /// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
 
+/// In-container path of the combined CA bundle (host CAs + MITM CA).
+///
+/// Pointed to by `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and
+/// `REQUESTS_CA_BUNDLE` so that TLS clients inside the container trust
+/// both the host's CAs and cella's MITM CA.
+pub const CA_BUNDLE_PATH: &str = "/tmp/.cella/ca-bundle.pem";
+
 /// A bind mount to add to the container at creation time.
 #[derive(Debug, Clone)]
 pub struct ForwardMount {
@@ -278,6 +285,52 @@ pub struct ProxyForwardingConfig {
     pub full_config: Option<cella_network::config::NetworkConfig>,
     /// Detected container distro (for CA trust store paths).
     pub container_distro: ca_bundle::ContainerDistro,
+    /// Whether credential protection is active (also requires MITM CA).
+    pub credentials_protect: bool,
+}
+
+/// Inject MITM CA trust into the container.
+///
+/// Adds the MITM CA cert to the system trust store (distro-appropriate path)
+/// and uploads a combined PEM bundle (host CAs + MITM CA) that application-level
+/// env vars point to.
+fn inject_mitm_ca_trust(
+    fwd: &mut EnvForwarding,
+    distro: &ca_bundle::ContainerDistro,
+    mitm_cert_pem: &str,
+) {
+    // System trust store: upload MITM CA cert.
+    let mitm_path = distro.ca_cert_path("cella-mitm-ca.crt");
+    fwd.post_start.file_uploads.push(FileUpload {
+        container_path: mitm_path,
+        content: mitm_cert_pem.as_bytes().to_vec(),
+        mode: 0o644,
+    });
+    if *distro == ca_bundle::ContainerDistro::Unknown {
+        fwd.post_start.file_uploads.push(FileUpload {
+            container_path: "/etc/pki/ca-trust/source/anchors/cella-mitm-ca.crt".to_string(),
+            content: mitm_cert_pem.as_bytes().to_vec(),
+            mode: 0o644,
+        });
+    }
+    fwd.post_start
+        .root_commands
+        .push(distro.trust_store_update_command());
+
+    // Application-level: combined CA bundle for runtimes that ignore the
+    // system trust store (Node.js, Python requests, Go, curl).
+    let combined = ca_bundle::build_combined_ca_bundle(mitm_cert_pem);
+    fwd.post_start.file_uploads.push(FileUpload {
+        container_path: CA_BUNDLE_PATH.to_string(),
+        content: combined.into_bytes(),
+        mode: 0o644,
+    });
+    for key in ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"] {
+        fwd.env.push(ForwardEnv {
+            key: key.to_string(),
+            value: CA_BUNDLE_PATH.to_string(),
+        });
+    }
 }
 
 /// Prepare environment forwarding for a container.
@@ -312,7 +365,8 @@ pub fn prepare_env_forwarding(
         if net_config.has_blocking_rules
             && let Some(ref net_full) = net_config.full_config
         {
-            let json = proxy::build_agent_proxy_config_json(net_full);
+            let json =
+                proxy::build_agent_proxy_config_json(net_full, net_config.credentials_protect);
             fwd.post_start.file_uploads.push(FileUpload {
                 container_path: PROXY_CONFIG_PATH.to_string(),
                 content: json.into_bytes(),
@@ -332,35 +386,18 @@ pub fn prepare_env_forwarding(
             ca_injection.apply_to(&mut fwd.post_start, distro);
         }
 
-        // If MITM CA was generated (for path-level blocking), also inject it
-        // so the container trusts cella's intercepted certificates.
-        if let Some(ref net_full) = net_config.full_config {
-            let has_path_rules = net_full.rules.iter().any(|r| !r.paths.is_empty());
-            if has_path_rules && let Ok(ca) = cella_network::ca::ensure_ca() {
-                let mitm_path = distro.ca_cert_path("cella-mitm-ca.crt");
-                let mitm_upload = FileUpload {
-                    container_path: mitm_path,
-                    content: ca.cert_pem.clone().into_bytes(),
-                    mode: 0o644,
-                };
-                fwd.post_start.file_uploads.push(mitm_upload);
+        // If MITM TLS interception is needed (path-level blocking or
+        // credential protection), inject the MITM CA into the system trust
+        // store and set application-level env vars pointing to a combined
+        // CA bundle (host CAs + MITM CA).
+        let has_path_rules = net_config
+            .full_config
+            .as_ref()
+            .is_some_and(|c| c.rules.iter().any(|r| !r.paths.is_empty()));
+        let needs_mitm = has_path_rules || net_config.credentials_protect;
 
-                // For unknown distro, also upload to RHEL path.
-                if *distro == ca_bundle::ContainerDistro::Unknown {
-                    fwd.post_start.file_uploads.push(FileUpload {
-                        container_path: "/etc/pki/ca-trust/source/anchors/cella-mitm-ca.crt"
-                            .to_string(),
-                        content: ca.cert_pem.into_bytes(),
-                        mode: 0o644,
-                    });
-                }
-
-                // Always refresh trust store after MITM CA upload,
-                // even when host CA injection was None.
-                fwd.post_start
-                    .root_commands
-                    .push(distro.trust_store_update_command());
-            }
+        if needs_mitm && let Ok(ca) = cella_network::ca::ensure_ca() {
+            inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem);
         }
     }
 
@@ -481,11 +518,112 @@ mod tests {
             has_blocking_rules: true,
             full_config: Some(net_config),
             container_distro: ca_bundle::ContainerDistro::Debian,
+            credentials_protect: false,
         };
 
         assert!(pfc.has_blocking_rules);
         assert!(pfc.proxy.enabled);
         assert!(pfc.full_config.is_some());
         assert_eq!(pfc.container_distro, ca_bundle::ContainerDistro::Debian);
+        assert!(!pfc.credentials_protect);
+    }
+
+    #[test]
+    fn inject_mitm_ca_trust_adds_uploads_and_env_vars() {
+        let mut fwd = EnvForwarding::default();
+        let distro = ca_bundle::ContainerDistro::Debian;
+        inject_mitm_ca_trust(
+            &mut fwd,
+            &distro,
+            "-----BEGIN CERTIFICATE-----\nMITM\n-----END CERTIFICATE-----\n",
+        );
+
+        // System trust store upload.
+        assert!(
+            fwd.post_start
+                .file_uploads
+                .iter()
+                .any(|u| u.container_path.contains("cella-mitm-ca.crt")),
+            "should upload MITM CA cert to system trust store"
+        );
+
+        // Combined CA bundle upload.
+        assert!(
+            fwd.post_start
+                .file_uploads
+                .iter()
+                .any(|u| u.container_path == CA_BUNDLE_PATH),
+            "should upload combined CA bundle"
+        );
+
+        // Trust store update command.
+        assert!(
+            !fwd.post_start.root_commands.is_empty(),
+            "should add trust store update command"
+        );
+
+        // Application-level env vars.
+        let env_keys: Vec<&str> = fwd.env.iter().map(|e| e.key.as_str()).collect();
+        assert!(
+            env_keys.contains(&"SSL_CERT_FILE"),
+            "should set SSL_CERT_FILE"
+        );
+        assert!(
+            env_keys.contains(&"NODE_EXTRA_CA_CERTS"),
+            "should set NODE_EXTRA_CA_CERTS"
+        );
+        assert!(
+            env_keys.contains(&"REQUESTS_CA_BUNDLE"),
+            "should set REQUESTS_CA_BUNDLE"
+        );
+
+        for env in &fwd.env {
+            assert_eq!(
+                env.value, CA_BUNDLE_PATH,
+                "{} should point to combined bundle",
+                env.key
+            );
+        }
+    }
+
+    #[test]
+    fn inject_mitm_ca_trust_combined_bundle_contains_mitm_pem() {
+        let mut fwd = EnvForwarding::default();
+        let distro = ca_bundle::ContainerDistro::Debian;
+        let mitm_pem = "-----BEGIN CERTIFICATE-----\nTEST_MITM_CA\n-----END CERTIFICATE-----\n";
+        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem);
+
+        let bundle_upload = fwd
+            .post_start
+            .file_uploads
+            .iter()
+            .find(|u| u.container_path == CA_BUNDLE_PATH)
+            .expect("combined bundle upload should exist");
+
+        let content = String::from_utf8(bundle_upload.content.clone()).unwrap();
+        assert!(
+            content.contains("TEST_MITM_CA"),
+            "combined bundle should contain the MITM CA PEM"
+        );
+    }
+
+    #[test]
+    fn inject_mitm_ca_trust_unknown_distro_uploads_both_paths() {
+        let mut fwd = EnvForwarding::default();
+        let distro = ca_bundle::ContainerDistro::Unknown;
+        inject_mitm_ca_trust(&mut fwd, &distro, "CERT");
+
+        let mitm_paths: Vec<&str> = fwd
+            .post_start
+            .file_uploads
+            .iter()
+            .filter(|u| u.container_path.contains("cella-mitm-ca.crt"))
+            .map(|u| u.container_path.as_str())
+            .collect();
+        assert_eq!(
+            mitm_paths.len(),
+            2,
+            "unknown distro should upload to both Debian and RHEL paths"
+        );
     }
 }
