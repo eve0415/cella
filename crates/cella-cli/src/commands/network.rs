@@ -1,6 +1,10 @@
 //! `cella network` subcommands for inspecting proxy and blocking state.
 
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
+
+use crate::picker;
 
 #[derive(Args)]
 pub struct NetworkArgs {
@@ -17,19 +21,36 @@ enum NetworkCommand {
         /// The URL to test (e.g., `https://api.prod.internal/v1/data`).
         url: String,
     },
-    /// Tail the proxy blocked-request log from a running container.
-    Log,
+    /// View the proxy log from a running container.
+    Log {
+        /// Follow log output (streams new entries in real-time).
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show from the end of the log.
+        #[arg(long, default_value = "100")]
+        tail: u32,
+
+        /// Explicit workspace folder path (defaults to current directory).
+        #[arg(long)]
+        workspace_folder: Option<PathBuf>,
+
+        #[command(flatten)]
+        backend: crate::backend::BackendArgs,
+    },
 }
 
 impl NetworkArgs {
-    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             NetworkCommand::Status => execute_status(),
             NetworkCommand::Test { url } => execute_test(&url),
-            NetworkCommand::Log => {
-                execute_log();
-                Ok(())
-            }
+            NetworkCommand::Log {
+                follow,
+                tail,
+                workspace_folder,
+                backend,
+            } => execute_log(follow, tail, workspace_folder.as_deref(), &backend).await,
         }
     }
 }
@@ -124,14 +145,74 @@ fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync
     Ok(())
 }
 
-fn execute_log() {
-    // This runs on the host — it needs to exec into the container to read the log.
-    // For now, print instructions.
-    println!("To view the proxy log, run inside the container:");
-    println!("  cat /tmp/.cella/proxy.log");
-    println!();
-    println!("Or from the host:");
-    println!("  cella exec -- cat /tmp/.cella/proxy.log");
+async fn execute_log(
+    follow: bool,
+    tail: u32,
+    workspace_folder: Option<&std::path::Path>,
+    backend: &crate::backend::BackendArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = backend.resolve_client().await?;
+    let cwd = super::resolve_workspace_folder(workspace_folder)?;
+
+    let container = match client.as_ref().find_container(&cwd).await? {
+        Some(c) => c,
+        None if workspace_folder.is_none() => {
+            let containers = client.as_ref().list_cella_containers(false).await?;
+            picker::resolve_container_interactive(
+                &containers,
+                None,
+                "Select a container for proxy log:",
+                None,
+            )?
+        }
+        None => return Err("No cella container found for this workspace".into()),
+    };
+
+    let cmd = if follow {
+        vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "-n".to_string(),
+            tail.to_string(),
+            "/tmp/.cella/proxy.log".to_string(),
+        ]
+    } else {
+        vec![
+            "tail".to_string(),
+            "-n".to_string(),
+            tail.to_string(),
+            "/tmp/.cella/proxy.log".to_string(),
+        ]
+    };
+
+    let opts = cella_backend::ExecOptions {
+        cmd,
+        user: None,
+        env: None,
+        working_dir: None,
+    };
+
+    if follow {
+        client
+            .as_ref()
+            .exec_stream(
+                &container.id,
+                &opts,
+                Box::new(std::io::stdout()),
+                Box::new(std::io::stderr()),
+            )
+            .await?;
+    } else {
+        let result = client.as_ref().exec_command(&container.id, &opts).await?;
+        if !result.stdout.is_empty() {
+            print!("{}", result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            eprint!("{}", result.stderr);
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse a URL into (domain, path).
@@ -155,9 +236,9 @@ fn parse_url_parts(url: &str) -> (String, String) {
     (host.to_string(), path.to_string())
 }
 
-fn dirs_home() -> std::path::PathBuf {
+fn dirs_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    PathBuf::from(home)
 }
 
 #[cfg(test)]
@@ -224,12 +305,6 @@ mod tests {
     fn dirs_home_returns_path() {
         let home = dirs_home();
         assert!(!home.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn execute_log_does_not_panic() {
-        // execute_log just prints instructions
-        execute_log();
     }
 
     #[test]

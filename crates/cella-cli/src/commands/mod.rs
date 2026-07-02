@@ -602,7 +602,7 @@ impl Command {
                 Ok(())
             }
             Self::Credential(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Network(args) => args.execute().map_err(boxed_err_to_report),
+            Self::Network(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Ports(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Status(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Daemon(args) => args.execute().await.map_err(boxed_err_to_report),
