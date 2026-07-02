@@ -1514,6 +1514,7 @@ impl EnsureUpContext<'_> {
             has_blocking_rules: needs_proxy,
             full_config: if needs_proxy { Some(net_config) } else { None },
             container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+            credentials_protect: settings.credentials.protect && managed_agent,
         });
         let mut env_fwd =
             cella_env::prepare_env_forwarding(config, &remote_user, proxy_fwd.as_ref());
