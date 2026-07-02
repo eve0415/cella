@@ -1987,6 +1987,7 @@ pub fn build_proxy_forwarding_config(
             None
         },
         container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+        credentials_protect: settings.credentials.protect && managed_agent,
     })
 }
 
