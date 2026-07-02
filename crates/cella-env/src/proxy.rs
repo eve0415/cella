@@ -48,7 +48,10 @@ pub fn apply_proxy_env(
 ///
 /// This is set as `CELLA_PROXY_CONFIG` env var in the container so
 /// the agent can start its forward proxy with the right rules.
-pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
+///
+/// When `credentials_protect` is true, CA materials are always included
+/// (credential routes require MITM TLS interception).
+pub fn build_agent_proxy_config_json(config: &NetworkConfig, credentials_protect: bool) -> String {
     let proxy_env = ProxyEnvVars::detect(&config.proxy);
     let upstream = proxy_env.and_then(|p| p.http_proxy.or(p.https_proxy));
 
@@ -70,15 +73,14 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
         })
         .collect();
 
-    // Check if any rules require path-level inspection (MITM).
-    // If so, ensure the CA cert/key are available and include them.
     let has_path_rules = config.rules.iter().any(|r| !r.paths.is_empty());
-    let (ca_cert_pem, ca_key_pem) = if has_path_rules {
+    let needs_mitm = has_path_rules || credentials_protect;
+    let (ca_cert_pem, ca_key_pem) = if needs_mitm {
         match cella_network::ca::ensure_ca() {
             Ok(ca) => (Some(ca.cert_pem), Some(ca.key_pem)),
             Err(e) => {
                 tracing::warn!(
-                    "Failed to generate CA for MITM: {e}. Path-level blocking will be domain-only."
+                    "Failed to generate CA for MITM: {e}. TLS interception will be unavailable."
                 );
                 (None, None)
             }
@@ -225,7 +227,7 @@ mod tests {
             }],
         };
 
-        let json_str = build_agent_proxy_config_json(&config);
+        let json_str = build_agent_proxy_config_json(&config, false);
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(json["mode"], "denylist");
@@ -256,7 +258,7 @@ mod tests {
             ],
         };
 
-        let json_str = build_agent_proxy_config_json(&config);
+        let json_str = build_agent_proxy_config_json(&config, false);
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(json["mode"], "allowlist");
@@ -279,7 +281,7 @@ mod tests {
             }],
         };
 
-        let json_str = build_agent_proxy_config_json(&config);
+        let json_str = build_agent_proxy_config_json(&config, false);
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         let rules = json["rules"].as_array().unwrap();
@@ -300,11 +302,32 @@ mod tests {
             rules: vec![],
         };
 
-        let json_str = build_agent_proxy_config_json(&config);
+        let json_str = build_agent_proxy_config_json(&config, false);
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         let rules = json["rules"].as_array().unwrap();
         assert!(rules.is_empty(), "rules array should be empty");
         assert_eq!(json["mode"], "denylist");
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_without_credentials_has_no_ca() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            proxy: ProxyConfig::default(),
+            rules: vec![],
+        };
+
+        let json_str = build_agent_proxy_config_json(&config, false);
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert!(
+            json["ca_cert_pem"].is_null(),
+            "no path rules and no credential protection should not include CA"
+        );
+        assert!(
+            json["ca_key_pem"].is_null(),
+            "no path rules and no credential protection should not include CA key"
+        );
     }
 }
