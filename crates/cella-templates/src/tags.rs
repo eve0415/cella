@@ -283,6 +283,29 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    #[test]
+    fn filter_tags_composite_selection_uses_extracted_suffix() {
+        let tags = vec![
+            "24.7.0-trixie",
+            "24.6.0-trixie",
+            "24-trixie",
+            "22-trixie",
+            "22.12.0-bookworm",
+            "latest",
+        ];
+        let selection = "24-trixie";
+        let suffix = extract_variant_suffix(selection);
+        assert_eq!(suffix, "trixie");
+
+        let filtered = filter_tags_by_suffix(&tags, suffix);
+        assert!(filtered.contains(&"24.7.0-trixie"));
+        assert!(filtered.contains(&"24.6.0-trixie"));
+        assert!(filtered.contains(&"24-trixie"));
+        assert!(filtered.contains(&"22-trixie"));
+        assert!(!filtered.contains(&"22.12.0-bookworm"));
+        assert!(!filtered.contains(&"latest"));
+    }
+
     // -----------------------------------------------------------------------
     // parse_version_key
     // -----------------------------------------------------------------------
