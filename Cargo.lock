@@ -144,9 +144,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -154,14 +154,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -308,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "cella-filesync",
@@ -339,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "cella-backend"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-env",
  "cella-features",
@@ -361,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -405,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "heck",
  "indexmap",
@@ -421,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -448,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-codegen",
@@ -470,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "cella-container"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-testing",
@@ -483,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "cella-daemon-client",
@@ -516,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon-client"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-env",
  "cella-protocol",
@@ -529,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bollard",
  "cella-backend",
@@ -550,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -567,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-network",
  "clap",
@@ -580,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -606,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "cella-filesync"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "hex",
  "notify",
@@ -618,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "fs4",
  "hex",
@@ -632,14 +633,14 @@ dependencies = [
 
 [[package]]
 name = "cella-jsonc"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cella-network"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "miette",
@@ -654,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "cella-oci"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -675,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "cella-orchestrator"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -703,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-protocol",
  "miette",
@@ -714,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "cella-protocol"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "regex",
  "serde",
@@ -723,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "cella-proxy"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "futures-util",
  "hex",
@@ -737,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "cella-templates"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -765,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "cella-test-macros"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -774,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "cella-testing"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bollard",
  "cella-test-macros",
@@ -784,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "cella-tool-install"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -902,9 +903,9 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
 dependencies = [
  "encode_unicode",
  "libc",
@@ -1744,9 +1745,9 @@ dependencies = [
 
 [[package]]
 name = "inotify-sys"
-version = "0.1.5"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
+checksum = "9ea94e891b3606826e9c998be69ddca42247dad8ad50b1649a5cb7e1c9ae06fd"
 dependencies = [
  "libc",
 ]
@@ -1929,9 +1930,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libredox"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
+checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
 ]
@@ -2126,9 +2127,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c863e9ab5e7bf9c99ba75e1050f1e4d624ae87ed3532d6238ffbdc7b585dbbe6"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -2283,9 +2284,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pest"
-version = "2.8.6"
+version = "2.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0848c601009d37dfa3430c4666e147e49cdcf1b92ecd3e63657d8a5f19da662"
+checksum = "47627dd7305c6a2d6c8c6bcd24c5a4c17dbbf425f4f9c5313e724b38fc9782e9"
 dependencies = [
  "memchr",
  "ucd-trie",
@@ -2293,9 +2294,9 @@ dependencies = [
 
 [[package]]
 name = "pest_derive"
-version = "2.8.6"
+version = "2.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11f486f1ea21e6c10ed15d5a7c77165d0ee443402f0780849d1768e7d9d6fe77"
+checksum = "4b4254325ecad416ab689e27ba51da03ba01a9632bc6e108f5fe7c3c4ad29d58"
 dependencies = [
  "pest",
  "pest_generator",
@@ -2303,9 +2304,9 @@ dependencies = [
 
 [[package]]
 name = "pest_generator"
-version = "2.8.6"
+version = "2.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8040c4647b13b210a963c1ed407c1ff4fdfa01c31d6d2a098218702e6664f94f"
+checksum = "6c4c0e91ead7a8f7acecbca6f003fc2e8282b1dbe2dd9c9d2f16aba42995e0a7"
 dependencies = [
  "pest",
  "pest_meta",
@@ -2316,12 +2317,11 @@ dependencies = [
 
 [[package]]
 name = "pest_meta"
-version = "2.8.6"
+version = "2.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
+checksum = "f9744bc48116fee06334924bb5f2bad41eed5e89bd26e29b0b799f9a3f82c210"
 dependencies = [
  "pest",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2329,6 +2329,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "portable-atomic"
@@ -2670,9 +2676,9 @@ checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc-hash"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"
@@ -2744,9 +2750,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
@@ -3256,9 +3262,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
  "num-conv",
@@ -3276,9 +3282,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
