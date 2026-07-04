@@ -78,6 +78,22 @@ pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
         })
 }
 
+/// Extract the variant suffix (trailing codename) from a possibly composite
+/// selection like `"24-trixie"` → `"trixie"`.
+///
+/// Finds the last `-` followed by purely alphabetic text and returns that
+/// trailing segment. For pure codenames (`"trixie"`) with no `-`, returns
+/// the input unchanged.
+pub fn extract_variant_suffix(selection: &str) -> &str {
+    if let Some(pos) = selection.rfind('-') {
+        let suffix = &selection[pos + 1..];
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return suffix;
+        }
+    }
+    selection
+}
+
 /// Filter tags to those ending with `-{suffix}` that have a version prefix.
 ///
 /// Bare codenames (e.g. just `"trixie"`) are excluded — only tags with a
@@ -267,6 +283,29 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    #[test]
+    fn filter_tags_composite_selection_uses_extracted_suffix() {
+        let tags = vec![
+            "24.7.0-trixie",
+            "24.6.0-trixie",
+            "24-trixie",
+            "22-trixie",
+            "22.12.0-bookworm",
+            "latest",
+        ];
+        let selection = "24-trixie";
+        let suffix = extract_variant_suffix(selection);
+        assert_eq!(suffix, "trixie");
+
+        let filtered = filter_tags_by_suffix(&tags, suffix);
+        assert!(filtered.contains(&"24.7.0-trixie"));
+        assert!(filtered.contains(&"24.6.0-trixie"));
+        assert!(filtered.contains(&"24-trixie"));
+        assert!(filtered.contains(&"22-trixie"));
+        assert!(!filtered.contains(&"22.12.0-bookworm"));
+        assert!(!filtered.contains(&"latest"));
+    }
+
     // -----------------------------------------------------------------------
     // parse_version_key
     // -----------------------------------------------------------------------
@@ -341,5 +380,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(dir.path());
         assert!(cache.get_image_tags("nonexistent").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_variant_suffix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_suffix_pure_codename() {
+        assert_eq!(extract_variant_suffix("trixie"), "trixie");
+    }
+
+    #[test]
+    fn extract_suffix_composite_version_variant() {
+        assert_eq!(extract_variant_suffix("24-trixie"), "trixie");
+    }
+
+    #[test]
+    fn extract_suffix_single_digit_version() {
+        assert_eq!(extract_variant_suffix("1-bookworm"), "bookworm");
+    }
+
+    #[test]
+    fn extract_suffix_numeric_only() {
+        assert_eq!(extract_variant_suffix("22"), "22");
+    }
+
+    #[test]
+    fn extract_suffix_multi_segment_version() {
+        assert_eq!(extract_variant_suffix("3.12-bookworm"), "bookworm");
     }
 }
