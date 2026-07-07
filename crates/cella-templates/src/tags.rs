@@ -24,12 +24,14 @@ pub struct ImageVariantInfo {
 }
 
 /// Detect which template option controls the image variant by parsing the
-/// template's `devcontainer.json` content (as raw JSONC-stripped JSON).
+/// template's `devcontainer.json` content (JSONC accepted — comments and
+/// trailing commas are stripped before parsing).
 ///
 /// Looks for `${templateOption:KEY}` in the `"image"` field value. Returns
 /// the last option reference found in the tag portion (after `:`).
 pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantInfo> {
-    let parsed: serde_json::Value = serde_json::from_str(config_content).ok()?;
+    let stripped = cella_jsonc::strip(config_content).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&stripped).ok()?;
     let image = parsed.get("image")?.as_str()?;
 
     // Split image into base and tag. The tag separator is the first ':'
@@ -204,6 +206,31 @@ mod tests {
     #[test]
     fn detect_variant_multiple_options_returns_last() {
         let config = r#"{"image": "mcr.microsoft.com/devcontainers/typescript-node:${templateOption:nodeVersion}-${templateOption:imageVariant}"}"#;
+        let info = detect_image_variant_option(config).unwrap();
+        assert_eq!(
+            info.base_image,
+            "mcr.microsoft.com/devcontainers/typescript-node"
+        );
+        assert_eq!(info.option_key, "imageVariant");
+    }
+
+    #[test]
+    fn detect_variant_jsonc_with_comments() {
+        // Regression: official templates ship JSONC with `//` comments.
+        // Plain JSON parsing failed silently, so the version picker never
+        // appeared during `cella init`. Mirrors the real typescript-node
+        // template content.
+        let config = r#"
+// For format details, see https://aka.ms/devcontainer.json.
+{
+	"name": "Node.js & TypeScript",
+	// Or use a Dockerfile or Docker Compose file.
+	"image": "mcr.microsoft.com/devcontainers/typescript-node:4-${templateOption:imageVariant}"
+
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	// "features": {},
+}
+"#;
         let info = detect_image_variant_option(config).unwrap();
         assert_eq!(
             info.base_image,
