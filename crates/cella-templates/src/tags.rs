@@ -116,65 +116,6 @@ fn version_prefix_key(prefix: &str) -> Option<Vec<u64>> {
         .collect()
 }
 
-/// Extract the variant suffix (trailing codename) from a possibly composite
-/// selection like `"24-trixie"` → `"trixie"`.
-///
-/// Finds the last `-` followed by purely alphabetic text and returns that
-/// trailing segment. For pure codenames (`"trixie"`) with no `-`, returns
-/// the input unchanged.
-pub fn extract_variant_suffix(selection: &str) -> &str {
-    if let Some(pos) = selection.rfind('-') {
-        let suffix = &selection[pos + 1..];
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphabetic()) {
-            return suffix;
-        }
-    }
-    selection
-}
-
-/// Filter tags to those ending with `-{suffix}` that have a version prefix.
-///
-/// Bare codenames (e.g. just `"trixie"`) are excluded — only tags with a
-/// leading numeric component before the suffix are returned.
-pub fn filter_tags_by_suffix<'a>(tags: &[&'a str], suffix: &str) -> Vec<&'a str> {
-    let needle = format!("-{suffix}");
-    tags.iter()
-        .copied()
-        .filter(|tag| tag.ends_with(&needle) && tag.len() > needle.len())
-        .collect()
-}
-
-/// Parse leading dot-and-dash-separated numbers from a tag for sorting.
-///
-/// Stops at the first segment that cannot be parsed as `u64`.
-///
-/// # Examples
-///
-/// - `"4.0.6-trixie"` → `[4, 0, 6]`
-/// - `"4.0.6-22-trixie"` → `[4, 0, 6, 22]`
-/// - `"22-trixie"` → `[22]`
-/// - `"latest"` → `[]`
-pub fn parse_version_key(tag: &str) -> Vec<u64> {
-    let mut nums = Vec::new();
-    for segment in tag.split(['.', '-']) {
-        if let Ok(n) = segment.parse::<u64>() {
-            nums.push(n);
-        } else {
-            break;
-        }
-    }
-    nums
-}
-
-/// Sort tags in descending version order.
-pub fn sort_tags_descending(tags: &mut [&str]) {
-    tags.sort_by(|a, b| {
-        let a_key = parse_version_key(a);
-        let b_key = parse_version_key(b);
-        b_key.cmp(&a_key)
-    });
-}
-
 /// Fetch available tags for an image from its OCI registry.
 ///
 /// # Errors
@@ -317,59 +258,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // filter_tags_by_suffix
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn filter_tags_matching_codename() {
-        let tags = vec![
-            "4.0.6-trixie",
-            "4.0.5-trixie",
-            "4.0.6-bookworm",
-            "1-trixie",
-            "latest",
-            "trixie",
-        ];
-        let filtered = filter_tags_by_suffix(&tags, "trixie");
-        assert!(filtered.contains(&"4.0.6-trixie"));
-        assert!(filtered.contains(&"4.0.5-trixie"));
-        assert!(filtered.contains(&"1-trixie"));
-        assert!(!filtered.contains(&"4.0.6-bookworm"));
-        assert!(!filtered.contains(&"latest"));
-        assert!(!filtered.contains(&"trixie")); // bare codename excluded
-    }
-
-    #[test]
-    fn filter_tags_no_matches() {
-        let tags = vec!["latest", "bookworm"];
-        let filtered = filter_tags_by_suffix(&tags, "trixie");
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn filter_tags_composite_selection_uses_extracted_suffix() {
-        let tags = vec![
-            "24.7.0-trixie",
-            "24.6.0-trixie",
-            "24-trixie",
-            "22-trixie",
-            "22.12.0-bookworm",
-            "latest",
-        ];
-        let selection = "24-trixie";
-        let suffix = extract_variant_suffix(selection);
-        assert_eq!(suffix, "trixie");
-
-        let filtered = filter_tags_by_suffix(&tags, suffix);
-        assert!(filtered.contains(&"24.7.0-trixie"));
-        assert!(filtered.contains(&"24.6.0-trixie"));
-        assert!(filtered.contains(&"24-trixie"));
-        assert!(filtered.contains(&"22-trixie"));
-        assert!(!filtered.contains(&"22.12.0-bookworm"));
-        assert!(!filtered.contains(&"latest"));
-    }
-
-    // -----------------------------------------------------------------------
     // pinnable_tags
     // -----------------------------------------------------------------------
 
@@ -452,56 +340,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_version_key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn version_key_full_semver() {
-        assert_eq!(parse_version_key("4.0.6-trixie"), vec![4, 0, 6]);
-    }
-
-    #[test]
-    fn version_key_with_extra_number() {
-        assert_eq!(parse_version_key("4.0.6-22-trixie"), vec![4, 0, 6, 22]);
-    }
-
-    #[test]
-    fn version_key_major_only() {
-        assert_eq!(parse_version_key("22-trixie"), vec![22]);
-    }
-
-    #[test]
-    fn version_key_no_numbers() {
-        assert_eq!(parse_version_key("latest"), Vec::<u64>::new());
-    }
-
-    // -----------------------------------------------------------------------
-    // sort_tags_descending
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sort_descending_mixed_versions() {
-        let mut tags = vec![
-            "4.0.5-trixie",
-            "4.0.6-trixie",
-            "3.9.0-trixie",
-            "4.0.6-22-trixie",
-        ];
-        sort_tags_descending(&mut tags);
-        assert_eq!(tags[0], "4.0.6-22-trixie");
-        assert_eq!(tags[1], "4.0.6-trixie");
-        assert_eq!(tags[2], "4.0.5-trixie");
-        assert_eq!(tags[3], "3.9.0-trixie");
-    }
-
-    #[test]
-    fn sort_descending_same_prefix() {
-        let mut tags = vec!["1-trixie", "22-trixie", "20-trixie"];
-        sort_tags_descending(&mut tags);
-        assert_eq!(tags, vec!["22-trixie", "20-trixie", "1-trixie"]);
-    }
-
-    // -----------------------------------------------------------------------
     // Image tag cache
     // -----------------------------------------------------------------------
 
@@ -525,34 +363,5 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(dir.path());
         assert!(cache.get_image_tags("nonexistent").is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_variant_suffix
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn extract_suffix_pure_codename() {
-        assert_eq!(extract_variant_suffix("trixie"), "trixie");
-    }
-
-    #[test]
-    fn extract_suffix_composite_version_variant() {
-        assert_eq!(extract_variant_suffix("24-trixie"), "trixie");
-    }
-
-    #[test]
-    fn extract_suffix_single_digit_version() {
-        assert_eq!(extract_variant_suffix("1-bookworm"), "bookworm");
-    }
-
-    #[test]
-    fn extract_suffix_numeric_only() {
-        assert_eq!(extract_variant_suffix("22"), "22");
-    }
-
-    #[test]
-    fn extract_suffix_multi_segment_version() {
-        assert_eq!(extract_variant_suffix("3.12-bookworm"), "bookworm");
     }
 }
