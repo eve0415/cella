@@ -847,11 +847,7 @@ async fn prompt_variant_with_pin(
     };
 
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    let suffix = cella_templates::tags::extract_variant_suffix(&selection);
-    let mut filtered = cella_templates::tags::filter_tags_by_suffix(&tag_refs, suffix);
-    filtered.retain(|tag| *tag != selection.as_str());
-    cella_templates::tags::sort_tags_descending(&mut filtered);
-    filtered.truncate(cella_templates::tags::MAX_PINNED_TAGS);
+    let filtered = cella_templates::tags::pinnable_tags(&tag_refs, &selection);
 
     if filtered.is_empty() {
         eprintln!(

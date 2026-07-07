@@ -80,6 +80,42 @@ pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
         })
 }
 
+/// Select the tags that pin a variant selection to a specific image
+/// version, newest first.
+///
+/// A tag qualifies when it refines the selection with a leading version:
+/// it ends with `-{selection}` and everything before that suffix is
+/// dot/dash-separated numbers. For selection `"24-trixie"` this matches
+/// `4.0.10-24-trixie` and `5-24-trixie` but not `dev-24-trixie`, the bare
+/// `24-trixie`, or another variant's `22-trixie`.
+///
+/// Tags are sorted by that version prefix descending, with more specific
+/// prefixes ranking above their aliases (`4.0.10` > `4.0` > `4`), and
+/// capped at [`MAX_PINNED_TAGS`].
+pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
+    let needle = format!("-{selection}");
+    let mut keyed: Vec<(Vec<u64>, &'a str)> = tags
+        .iter()
+        .filter_map(|&tag| {
+            let prefix = tag.strip_suffix(needle.as_str())?;
+            Some((version_prefix_key(prefix)?, tag))
+        })
+        .collect();
+    keyed.sort_unstable_by(|a, b| b.cmp(a));
+    keyed.truncate(MAX_PINNED_TAGS);
+    keyed.into_iter().map(|(_, tag)| tag).collect()
+}
+
+/// Parse a version prefix like `"4.0.10"` into its numeric sort key.
+///
+/// Returns `None` unless every dot/dash-separated segment is numeric.
+fn version_prefix_key(prefix: &str) -> Option<Vec<u64>> {
+    prefix
+        .split(['.', '-'])
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect()
+}
+
 /// Extract the variant suffix (trailing codename) from a possibly composite
 /// selection like `"24-trixie"` → `"trixie"`.
 ///
@@ -331,6 +367,88 @@ mod tests {
         assert!(filtered.contains(&"22-trixie"));
         assert!(!filtered.contains(&"22.12.0-bookworm"));
         assert!(!filtered.contains(&"latest"));
+    }
+
+    // -----------------------------------------------------------------------
+    // pinnable_tags
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pinnable_tags_composite_selection_offers_only_matching_variant() {
+        // Regression: selecting "24-trixie" must offer version-prefixed
+        // refinements of exactly that variant — not other node versions,
+        // not dev builds. Tag list taken verbatim from
+        // mcr.microsoft.com/devcontainers/typescript-node.
+        let tags = vec![
+            "dev-24-trixie",
+            "5.0.1-24-trixie",
+            "24-trixie",
+            "5-24-trixie",
+            "5.0-24-trixie",
+            "4.0.10-24-trixie",
+            "4-24-trixie",
+            "4.0-24-trixie",
+            "4.0.9-24-trixie",
+            "dev-trixie",
+            "22-trixie",
+            "5.0.1-22-trixie",
+            "trixie",
+            "4.0.10-trixie",
+            "latest",
+        ];
+        let pinned = pinnable_tags(&tags, "24-trixie");
+        assert_eq!(
+            pinned,
+            vec![
+                "5.0.1-24-trixie",
+                "5.0-24-trixie",
+                "5-24-trixie",
+                "4.0.10-24-trixie",
+                "4.0.9-24-trixie",
+                "4.0-24-trixie",
+                "4-24-trixie",
+            ]
+        );
+    }
+
+    #[test]
+    fn pinnable_tags_codename_selection() {
+        let tags = vec![
+            "1.0.9-trixie",
+            "1-trixie",
+            "dev-trixie",
+            "trixie",
+            "1.0.9-bookworm",
+            "latest",
+        ];
+        assert_eq!(
+            pinnable_tags(&tags, "trixie"),
+            vec!["1.0.9-trixie", "1-trixie"]
+        );
+    }
+
+    #[test]
+    fn pinnable_tags_excludes_selection_and_non_numeric_prefixes() {
+        let tags = vec!["24-trixie", "dev-24-trixie", "-24-trixie", "rc1-24-trixie"];
+        assert!(pinnable_tags(&tags, "24-trixie").is_empty());
+    }
+
+    #[test]
+    fn pinnable_tags_no_matches() {
+        let tags = vec!["latest", "bookworm", "1.2.3-bookworm"];
+        assert!(pinnable_tags(&tags, "trixie").is_empty());
+    }
+
+    #[test]
+    fn pinnable_tags_truncates_to_max() {
+        let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)
+            .map(|i| format!("4.0.{i}-trixie"))
+            .collect();
+        let tags: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let pinned = pinnable_tags(&tags, "trixie");
+        assert_eq!(pinned.len(), MAX_PINNED_TAGS);
+        // Newest patch first after numeric (not lexicographic) sorting.
+        assert_eq!(pinned[0], format!("4.0.{}-trixie", MAX_PINNED_TAGS + 4));
     }
 
     // -----------------------------------------------------------------------
