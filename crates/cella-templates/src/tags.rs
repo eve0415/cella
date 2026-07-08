@@ -30,8 +30,20 @@ pub struct ImageVariantInfo {
 /// Looks for `${templateOption:KEY}` in the `"image"` field value. Returns
 /// the last option reference found in the tag portion (after `:`).
 pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantInfo> {
-    let stripped = cella_jsonc::strip(config_content).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&stripped).ok()?;
+    let stripped = match cella_jsonc::strip(config_content) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("variant detection: stripping JSONC failed: {e}");
+            return None;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&stripped) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("variant detection: parsing template config failed: {e}");
+            return None;
+        }
+    };
     let image = parsed.get("image")?.as_str()?;
 
     // Split image into base and tag. The tag separator is the first ':'
@@ -44,6 +56,14 @@ pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantI
             let colon_pos = last_slash + colon_offset;
             (&image[..colon_pos], &image[colon_pos + 1..])
         });
+
+    // A placeholder in the base (e.g. a templated repository name) means
+    // the image can't be resolved statically — no tags to offer. This also
+    // covers a `:` inside such a placeholder landing the split mid-token.
+    if base.contains("${") {
+        debug!("variant detection: base image {base:?} is not static");
+        return None;
+    }
 
     // Find the last ${templateOption:KEY} in the tag portion.
     let pattern = "${templateOption:";
@@ -267,6 +287,17 @@ mod tests {
         let info = detect_image_variant_option(config).unwrap();
         assert_eq!(info.base_image, "mcr.microsoft.com/devcontainers/go");
         assert_eq!(info.option_key, "imageVariant");
+    }
+
+    #[test]
+    fn detect_variant_templated_repository_is_skipped() {
+        // A placeholder in the repository segment makes the naive tag split
+        // land inside `${templateOption:flavor}`; there is no static base
+        // image to list tags for, so detection must bail instead of
+        // returning a mangled reference.
+        let config =
+            r#"{"image": "ghcr.io/org/${templateOption:flavor}:1-${templateOption:imageVariant}"}"#;
+        assert!(detect_image_variant_option(config).is_none());
     }
 
     #[test]
