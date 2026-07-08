@@ -94,11 +94,11 @@ pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
 /// capped at [`MAX_PINNED_TAGS`].
 pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
     let needle = format!("-{selection}");
-    let mut keyed: Vec<(Vec<u64>, &'a str)> = tags
+    let mut keyed: Vec<(VersionKey, &'a str)> = tags
         .iter()
         .filter_map(|&tag| {
             let prefix = tag.strip_suffix(needle.as_str())?;
-            Some((version_prefix_key(prefix)?, tag))
+            Some((version_key(prefix)?, tag))
         })
         .collect();
     keyed.sort_unstable_by(|a, b| b.cmp(a));
@@ -106,13 +106,25 @@ pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
     keyed.into_iter().map(|(_, tag)| tag).collect()
 }
 
-/// Parse a version prefix like `"4.0.10"` into its numeric sort key.
+/// Sort key for a pin's version part: dash-separated groups of
+/// dot-separated numbers, compared group by group so that a dotted
+/// refinement outranks its alias within the same group (`4.0.10` >
+/// `4.0` > `4`) regardless of what follows a dash.
+type VersionKey = Vec<Vec<u64>>;
+
+/// Parse a version prefix like `"4.0.10"` or `"4.0.10-24"` into its
+/// numeric sort key.
 ///
-/// Returns `None` unless every dot/dash-separated segment is numeric.
-fn version_prefix_key(prefix: &str) -> Option<Vec<u64>> {
+/// Returns `None` unless every segment is numeric.
+fn version_key(prefix: &str) -> Option<VersionKey> {
     prefix
-        .split(['.', '-'])
-        .map(|segment| segment.parse::<u64>().ok())
+        .split('-')
+        .map(|group| {
+            group
+                .split('.')
+                .map(|segment| segment.parse::<u64>().ok())
+                .collect()
+        })
         .collect()
 }
 
@@ -307,6 +319,18 @@ mod tests {
                 "4.0-24-trixie",
                 "4-24-trixie",
             ]
+        );
+    }
+
+    #[test]
+    fn pinnable_tags_specific_versions_rank_above_aliases_in_composite_tags() {
+        // Regression: the flat numeric key ranked "4-24-trixie" ([4, 24])
+        // above "4.0.10-24-trixie" ([4, 0, 10, 24]) because 24 > 0 at
+        // index 1. Dash groups must be compared before dot segments.
+        let tags = vec!["4-24-trixie", "4.0-24-trixie", "4.0.10-24-trixie"];
+        assert_eq!(
+            pinnable_tags(&tags, "trixie"),
+            vec!["4.0.10-24-trixie", "4.0-24-trixie", "4-24-trixie"]
         );
     }
 
