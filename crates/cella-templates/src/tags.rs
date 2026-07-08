@@ -217,6 +217,17 @@ mod tests {
     }
 
     #[test]
+    fn detect_variant_jsonc_trailing_comma_before_comments() {
+        // Regression: a trailing comma after the last real property,
+        // followed only by commented-out properties, must not break
+        // detection.
+        let config = "{\n\t\"name\": \"Go\",\n\t\"image\": \"mcr.microsoft.com/devcontainers/go:1-${templateOption:imageVariant}\",\n\t// \"features\": {},\n}";
+        let info = detect_image_variant_option(config).unwrap();
+        assert_eq!(info.base_image, "mcr.microsoft.com/devcontainers/go");
+        assert_eq!(info.option_key, "imageVariant");
+    }
+
+    #[test]
     fn detect_variant_no_image_field() {
         let config = r#"{"build": {"dockerfile": "Dockerfile"}}"#;
         assert!(detect_image_variant_option(config).is_none());
