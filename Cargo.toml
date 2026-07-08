@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -39,7 +39,7 @@ description = "A terminal-native devcontainer CLI built for the AI agent era"
 readme = "README.md"
 keywords = ["devcontainers", "containers", "cli", "docker", "vscode"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.96.0"
+rust-version = "1.96.1"
 
 [workspace.dependencies]
 # Async runtime
@@ -74,7 +74,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # CLI
 clap = { version = "=4.6.1", features = ["derive"] }
-clap_complete = "=4.6.5"
+clap_complete = "=4.6.7"
 
 # Interactive prompts
 inquire = "=0.9.4"
@@ -99,7 +99,7 @@ owo-colors = "=4.3.0"
 terminal_size = "=0.4.4"
 
 # Progress display
-indicatif = "=0.18.5"
+indicatif = "=0.18.6"
 
 # Timestamps
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
@@ -132,7 +132,7 @@ semver = "=1.0.28"
 glob = "=0.3.3"
 
 # JSONC editing
-jsonc-parser = { version = "=0.32.4", features = ["cst"] }
+jsonc-parser = { version = "=0.33.0", features = ["cst"] }
 
 # Certificate management
 rcgen = "=0.14.8"
