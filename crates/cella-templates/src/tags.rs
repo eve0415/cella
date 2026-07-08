@@ -83,27 +83,57 @@ pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
 /// Select the tags that pin a variant selection to a specific image
 /// version, newest first.
 ///
-/// A tag qualifies when it refines the selection with a leading version:
-/// it ends with `-{selection}` and everything before that suffix is
-/// dot/dash-separated numbers. For selection `"24-trixie"` this matches
-/// `4.0.10-24-trixie` and `5-24-trixie` but not `dev-24-trixie`, the bare
-/// `24-trixie`, or another variant's `22-trixie`.
+/// A tag qualifies when it refines the selection in one of two ways:
 ///
-/// Tags are sorted by that version prefix descending, with more specific
-/// prefixes ranking above their aliases (`4.0.10` > `4.0` > `4`), and
+/// - **Version prefix** — it ends with `-{selection}` and everything
+///   before that suffix is dot/dash-separated numbers: for `"24-trixie"`
+///   this matches `4.0.10-24-trixie` and `5-24-trixie`.
+/// - **Version extension** — it extends the selection's own leading
+///   version with more dotted segments: for `"24-trixie"` this matches
+///   `24.7.0-trixie` (node-style registries).
+///
+/// Neither shape matches `dev-24-trixie`, the bare `24-trixie`, or
+/// another variant's `22-trixie`.
+///
+/// Tags are sorted by their version part descending, with more specific
+/// versions ranking above their aliases (`4.0.10` > `4.0` > `4`), and
 /// capped at [`MAX_PINNED_TAGS`].
 pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
-    let needle = format!("-{selection}");
     let mut keyed: Vec<(VersionKey, &'a str)> = tags
         .iter()
-        .filter_map(|&tag| {
-            let prefix = tag.strip_suffix(needle.as_str())?;
-            Some((version_key(prefix)?, tag))
-        })
+        .filter_map(|&tag| Some((pin_version_key(tag, selection)?, tag)))
         .collect();
     keyed.sort_unstable_by(|a, b| b.cmp(a));
     keyed.truncate(MAX_PINNED_TAGS);
     keyed.into_iter().map(|(_, tag)| tag).collect()
+}
+
+/// Compute the version sort key of a tag that refines `selection`, or
+/// `None` if it doesn't (see [`pinnable_tags`] for the accepted shapes).
+fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
+    // Version prefix: `{version}-{selection}`.
+    if let Some(prefix) = tag
+        .strip_suffix(selection)
+        .and_then(|rest| rest.strip_suffix('-'))
+        && let Some(key) = version_key(prefix)
+    {
+        return Some(key);
+    }
+
+    // Version extension: the selection's leading numeric part grows more
+    // dotted segments (`24-trixie` → `24.7.0-trixie`, `22` → `22.12.0`).
+    let numeric_end = selection
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(selection.len());
+    let (head, rest) = selection.split_at(numeric_end);
+    if head.is_empty() {
+        return None;
+    }
+    let extended = tag.strip_suffix(rest)?;
+    if !extended.strip_prefix(head)?.starts_with('.') {
+        return None;
+    }
+    version_key(extended)
 }
 
 /// Sort key for a pin's version part: dash-separated groups of
@@ -348,6 +378,32 @@ mod tests {
             pinnable_tags(&tags, "trixie"),
             vec!["1.0.9-trixie", "1-trixie"]
         );
+    }
+
+    #[test]
+    fn pinnable_tags_offers_extensions_of_the_selection_version() {
+        // Node-style registries refine "24-trixie" as "24.7.0-trixie"
+        // instead of prefixing an image version. These must be offered,
+        // still excluding other variants and codenames.
+        let tags = vec![
+            "24.7.0-trixie",
+            "24.6.1-trixie",
+            "24-trixie",
+            "22.1.0-trixie",
+            "24.7.0-bookworm",
+            "dev-trixie",
+            "latest",
+        ];
+        assert_eq!(
+            pinnable_tags(&tags, "24-trixie"),
+            vec!["24.7.0-trixie", "24.6.1-trixie"]
+        );
+    }
+
+    #[test]
+    fn pinnable_tags_numeric_only_selection_extension() {
+        let tags = vec!["22.12.0", "22.11.0", "22", "20.9.0", "latest"];
+        assert_eq!(pinnable_tags(&tags, "22"), vec!["22.12.0", "22.11.0"]);
     }
 
     #[test]
