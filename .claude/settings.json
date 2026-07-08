@@ -15,10 +15,7 @@
     ]
   },
   "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true,
-    "feature-dev@claude-plugins-official": true,
-    "code-review@claude-code-plugins": true,
-    "superpowers@claude-plugins-official": true
+    "rust-analyzer-lsp@claude-plugins-official": true
   },
   "permissions": {
     "allow": [
