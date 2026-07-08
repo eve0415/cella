@@ -54,15 +54,10 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
                 .ok()
                 .or_else(|| std::fs::read_to_string(template_dir.join("devcontainer.json")).ok());
 
-        if let Some(info) = config_content
+        let variant = config_content
             .as_deref()
-            .and_then(cella_templates::tags::detect_image_variant_option)
-        {
-            format!("{}:{tag}", info.base_image)
-        } else {
-            // No variant detected; use tag as-is (user knows what they're doing)
-            tag
-        }
+            .and_then(cella_templates::tags::detect_image_variant_option);
+        resolve_pinned_image(tag, variant.as_ref())
     });
 
     // Apply template (include all optional paths in non-interactive mode)
@@ -86,6 +81,23 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
     eprintln!("\u{2713} Created {}", written_path.display());
 
     Ok(())
+}
+
+/// Build the pinned image reference from a `--pin-image` value.
+///
+/// A bare tag is joined with the template's detected base image. A value
+/// that already names an image (contains `/` or `:`) passes through as-is,
+/// as does any value when no variant option was detected.
+fn resolve_pinned_image(
+    value: String,
+    variant: Option<&cella_templates::tags::ImageVariantInfo>,
+) -> String {
+    match variant {
+        Some(info) if !value.contains('/') && !value.contains(':') => {
+            format!("{}:{value}", info.base_image)
+        }
+        _ => value,
+    }
 }
 
 /// Parse `KEY=VALUE` pairs from CLI flag values.
@@ -154,6 +166,43 @@ fn parse_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn variant_info() -> cella_templates::tags::ImageVariantInfo {
+        cella_templates::tags::ImageVariantInfo {
+            base_image: "mcr.microsoft.com/devcontainers/typescript-node".to_owned(),
+            option_key: "imageVariant".to_owned(),
+        }
+    }
+
+    #[test]
+    fn resolve_pin_bare_tag_joins_base_image() {
+        let pinned = resolve_pinned_image("4.0.10-24-trixie".to_owned(), Some(&variant_info()));
+        assert_eq!(
+            pinned,
+            "mcr.microsoft.com/devcontainers/typescript-node:4.0.10-24-trixie"
+        );
+    }
+
+    #[test]
+    fn resolve_pin_full_reference_passes_through() {
+        // Regression: a full image reference was prefixed again, producing
+        // an invalid doubly-prefixed reference.
+        let full = "mcr.microsoft.com/devcontainers/typescript-node:4.0.10-24-trixie";
+        let pinned = resolve_pinned_image(full.to_owned(), Some(&variant_info()));
+        assert_eq!(pinned, full);
+    }
+
+    #[test]
+    fn resolve_pin_repo_and_tag_passes_through() {
+        let pinned = resolve_pinned_image("node:24-trixie".to_owned(), Some(&variant_info()));
+        assert_eq!(pinned, "node:24-trixie");
+    }
+
+    #[test]
+    fn resolve_pin_no_variant_passes_through() {
+        let pinned = resolve_pinned_image("4.0.10-24-trixie".to_owned(), None);
+        assert_eq!(pinned, "4.0.10-24-trixie");
+    }
 
     #[test]
     fn parse_key_value_simple() {

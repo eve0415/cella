@@ -129,12 +129,32 @@ pub fn strip(input: &str) -> Result<String, Error> {
 }
 
 /// Check if the comma at position `pos` is a trailing comma
-/// (only whitespace between it and the next `]` or `}`).
+/// (only whitespace and comments between it and the next `]` or `}`).
 fn is_trailing_comma(bytes: &[u8], pos: usize) -> bool {
     let mut j = pos + 1;
     while j < bytes.len() {
         match bytes[j] {
             b' ' | b'\t' | b'\r' | b'\n' => j += 1,
+            b'/' if bytes.get(j + 1) == Some(&b'/') => {
+                j += 2;
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            b'/' if bytes.get(j + 1) == Some(&b'*') => {
+                j += 2;
+                loop {
+                    if j + 1 >= bytes.len() {
+                        // Unterminated block comment — `strip` reports it.
+                        return false;
+                    }
+                    if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+            }
             b']' | b'}' => return true,
             _ => return false,
         }
@@ -172,6 +192,51 @@ mod tests {
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_trailing_comma_before_line_comment() {
+        // Regression: a trailing comma separated from `}` only by comments
+        // was kept, producing invalid JSON. Common devcontainer.json shape —
+        // last real property followed by commented-out ones.
+        let input = "{\n\t\"a\": 1,\n\t// \"b\": 2,\n}";
+        let output = strip(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_trailing_comma_before_block_comment() {
+        let input = r#"{"a": 1, /* note */ }"#;
+        let output = strip(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_trailing_comma_before_consecutive_comments() {
+        let input = "[1, 2,\n// one\n/* two */\n// three\n]";
+        let output = strip(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_comma_before_comment_then_value_is_kept() {
+        let input = "{\"a\": 1, // note\n\"b\": 2}";
+        let output = strip(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn test_comma_before_unterminated_block_comment_errors() {
+        let input = r#"{"a": 1, /* unterminated"#;
+        assert!(strip(input).is_err());
     }
 
     #[test]

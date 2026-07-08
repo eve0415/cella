@@ -24,12 +24,26 @@ pub struct ImageVariantInfo {
 }
 
 /// Detect which template option controls the image variant by parsing the
-/// template's `devcontainer.json` content (as raw JSONC-stripped JSON).
+/// template's `devcontainer.json` content (JSONC accepted — comments and
+/// trailing commas are stripped before parsing).
 ///
 /// Looks for `${templateOption:KEY}` in the `"image"` field value. Returns
 /// the last option reference found in the tag portion (after `:`).
 pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantInfo> {
-    let parsed: serde_json::Value = serde_json::from_str(config_content).ok()?;
+    let stripped = match cella_jsonc::strip(config_content) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("variant detection: stripping JSONC failed: {e}");
+            return None;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&stripped) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("variant detection: parsing template config failed: {e}");
+            return None;
+        }
+    };
     let image = parsed.get("image")?.as_str()?;
 
     // Split image into base and tag. The tag separator is the first ':'
@@ -42,6 +56,14 @@ pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantI
             let colon_pos = last_slash + colon_offset;
             (&image[..colon_pos], &image[colon_pos + 1..])
         });
+
+    // A placeholder in the base (e.g. a templated repository name) means
+    // the image can't be resolved statically — no tags to offer. This also
+    // covers a `:` inside such a placeholder landing the split mid-token.
+    if base.contains("${") {
+        debug!("variant detection: base image {base:?} is not static");
+        return None;
+    }
 
     // Find the last ${templateOption:KEY} in the tag portion.
     let pattern = "${templateOption:";
@@ -78,63 +100,82 @@ pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
         })
 }
 
-/// Extract the variant suffix (trailing codename) from a possibly composite
-/// selection like `"24-trixie"` → `"trixie"`.
+/// Select the tags that pin a variant selection to a specific image
+/// version, newest first.
 ///
-/// Finds the last `-` followed by purely alphabetic text and returns that
-/// trailing segment. For pure codenames (`"trixie"`) with no `-`, returns
-/// the input unchanged.
-pub fn extract_variant_suffix(selection: &str) -> &str {
-    if let Some(pos) = selection.rfind('-') {
-        let suffix = &selection[pos + 1..];
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphabetic()) {
-            return suffix;
-        }
-    }
-    selection
+/// A tag qualifies when it refines the selection in one of two ways:
+///
+/// - **Version prefix** — it ends with `-{selection}` and everything
+///   before that suffix is dot/dash-separated numbers: for `"24-trixie"`
+///   this matches `4.0.10-24-trixie` and `5-24-trixie`.
+/// - **Version extension** — it extends the selection's own leading
+///   version with more dotted segments: for `"24-trixie"` this matches
+///   `24.7.0-trixie` (node-style registries).
+///
+/// Neither shape matches `dev-24-trixie`, the bare `24-trixie`, or
+/// another variant's `22-trixie`.
+///
+/// Tags are sorted by their version part descending, with more specific
+/// versions ranking above their aliases (`4.0.10` > `4.0` > `4`), and
+/// capped at [`MAX_PINNED_TAGS`].
+pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
+    let mut keyed: Vec<(VersionKey, &'a str)> = tags
+        .iter()
+        .filter_map(|&tag| Some((pin_version_key(tag, selection)?, tag)))
+        .collect();
+    keyed.sort_unstable_by(|a, b| b.cmp(a));
+    keyed.truncate(MAX_PINNED_TAGS);
+    keyed.into_iter().map(|(_, tag)| tag).collect()
 }
 
-/// Filter tags to those ending with `-{suffix}` that have a version prefix.
+/// Compute the version sort key of a tag that refines `selection`, or
+/// `None` if it doesn't (see [`pinnable_tags`] for the accepted shapes).
+fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
+    // Version prefix: `{version}-{selection}`.
+    if let Some(prefix) = tag
+        .strip_suffix(selection)
+        .and_then(|rest| rest.strip_suffix('-'))
+        && let Some(key) = version_key(prefix)
+    {
+        return Some(key);
+    }
+
+    // Version extension: the selection's leading numeric part grows more
+    // dotted segments (`24-trixie` → `24.7.0-trixie`, `22` → `22.12.0`).
+    let numeric_end = selection
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(selection.len());
+    let (head, rest) = selection.split_at(numeric_end);
+    if head.is_empty() {
+        return None;
+    }
+    let extended = tag.strip_suffix(rest)?;
+    if !extended.strip_prefix(head)?.starts_with('.') {
+        return None;
+    }
+    version_key(extended)
+}
+
+/// Sort key for a pin's version part: dash-separated groups of
+/// dot-separated numbers, compared group by group so that a dotted
+/// refinement outranks its alias within the same group (`4.0.10` >
+/// `4.0` > `4`) regardless of what follows a dash.
+type VersionKey = Vec<Vec<u64>>;
+
+/// Parse a version prefix like `"4.0.10"` or `"4.0.10-24"` into its
+/// numeric sort key.
 ///
-/// Bare codenames (e.g. just `"trixie"`) are excluded — only tags with a
-/// leading numeric component before the suffix are returned.
-pub fn filter_tags_by_suffix<'a>(tags: &[&'a str], suffix: &str) -> Vec<&'a str> {
-    let needle = format!("-{suffix}");
-    tags.iter()
-        .copied()
-        .filter(|tag| tag.ends_with(&needle) && tag.len() > needle.len())
+/// Returns `None` unless every segment is numeric.
+fn version_key(prefix: &str) -> Option<VersionKey> {
+    prefix
+        .split('-')
+        .map(|group| {
+            group
+                .split('.')
+                .map(|segment| segment.parse::<u64>().ok())
+                .collect()
+        })
         .collect()
-}
-
-/// Parse leading dot-and-dash-separated numbers from a tag for sorting.
-///
-/// Stops at the first segment that cannot be parsed as `u64`.
-///
-/// # Examples
-///
-/// - `"4.0.6-trixie"` → `[4, 0, 6]`
-/// - `"4.0.6-22-trixie"` → `[4, 0, 6, 22]`
-/// - `"22-trixie"` → `[22]`
-/// - `"latest"` → `[]`
-pub fn parse_version_key(tag: &str) -> Vec<u64> {
-    let mut nums = Vec::new();
-    for segment in tag.split(['.', '-']) {
-        if let Ok(n) = segment.parse::<u64>() {
-            nums.push(n);
-        } else {
-            break;
-        }
-    }
-    nums
-}
-
-/// Sort tags in descending version order.
-pub fn sort_tags_descending(tags: &mut [&str]) {
-    tags.sort_by(|a, b| {
-        let a_key = parse_version_key(a);
-        let b_key = parse_version_key(b);
-        b_key.cmp(&a_key)
-    });
 }
 
 /// Fetch available tags for an image from its OCI registry.
@@ -213,6 +254,53 @@ mod tests {
     }
 
     #[test]
+    fn detect_variant_jsonc_with_comments() {
+        // Regression: official templates ship JSONC with `//` comments.
+        // Plain JSON parsing failed silently, so the version picker never
+        // appeared during `cella init`. Mirrors the real typescript-node
+        // template content.
+        let config = r#"
+// For format details, see https://aka.ms/devcontainer.json.
+{
+	"name": "Node.js & TypeScript",
+	// Or use a Dockerfile or Docker Compose file.
+	"image": "mcr.microsoft.com/devcontainers/typescript-node:4-${templateOption:imageVariant}"
+
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	// "features": {},
+}
+"#;
+        let info = detect_image_variant_option(config).unwrap();
+        assert_eq!(
+            info.base_image,
+            "mcr.microsoft.com/devcontainers/typescript-node"
+        );
+        assert_eq!(info.option_key, "imageVariant");
+    }
+
+    #[test]
+    fn detect_variant_jsonc_trailing_comma_before_comments() {
+        // Regression: a trailing comma after the last real property,
+        // followed only by commented-out properties, must not break
+        // detection.
+        let config = "{\n\t\"name\": \"Go\",\n\t\"image\": \"mcr.microsoft.com/devcontainers/go:1-${templateOption:imageVariant}\",\n\t// \"features\": {},\n}";
+        let info = detect_image_variant_option(config).unwrap();
+        assert_eq!(info.base_image, "mcr.microsoft.com/devcontainers/go");
+        assert_eq!(info.option_key, "imageVariant");
+    }
+
+    #[test]
+    fn detect_variant_templated_repository_is_skipped() {
+        // A placeholder in the repository segment makes the naive tag split
+        // land inside `${templateOption:flavor}`; there is no static base
+        // image to list tags for, so detection must bail instead of
+        // returning a mangled reference.
+        let config =
+            r#"{"image": "ghcr.io/org/${templateOption:flavor}:1-${templateOption:imageVariant}"}"#;
+        assert!(detect_image_variant_option(config).is_none());
+    }
+
+    #[test]
     fn detect_variant_no_image_field() {
         let config = r#"{"build": {"dockerfile": "Dockerfile"}}"#;
         assert!(detect_image_variant_option(config).is_none());
@@ -254,106 +342,123 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // filter_tags_by_suffix
+    // pinnable_tags
     // -----------------------------------------------------------------------
 
     #[test]
-    fn filter_tags_matching_codename() {
+    fn pinnable_tags_composite_selection_offers_only_matching_variant() {
+        // Regression: selecting "24-trixie" must offer version-prefixed
+        // refinements of exactly that variant — not other node versions,
+        // not dev builds. Tag list taken verbatim from
+        // mcr.microsoft.com/devcontainers/typescript-node.
         let tags = vec![
-            "4.0.6-trixie",
-            "4.0.5-trixie",
-            "4.0.6-bookworm",
-            "1-trixie",
-            "latest",
+            "dev-24-trixie",
+            "5.0.1-24-trixie",
+            "24-trixie",
+            "5-24-trixie",
+            "5.0-24-trixie",
+            "4.0.10-24-trixie",
+            "4-24-trixie",
+            "4.0-24-trixie",
+            "4.0.9-24-trixie",
+            "dev-trixie",
+            "22-trixie",
+            "5.0.1-22-trixie",
             "trixie",
+            "4.0.10-trixie",
+            "latest",
         ];
-        let filtered = filter_tags_by_suffix(&tags, "trixie");
-        assert!(filtered.contains(&"4.0.6-trixie"));
-        assert!(filtered.contains(&"4.0.5-trixie"));
-        assert!(filtered.contains(&"1-trixie"));
-        assert!(!filtered.contains(&"4.0.6-bookworm"));
-        assert!(!filtered.contains(&"latest"));
-        assert!(!filtered.contains(&"trixie")); // bare codename excluded
+        let pinned = pinnable_tags(&tags, "24-trixie");
+        assert_eq!(
+            pinned,
+            vec![
+                "5.0.1-24-trixie",
+                "5.0-24-trixie",
+                "5-24-trixie",
+                "4.0.10-24-trixie",
+                "4.0.9-24-trixie",
+                "4.0-24-trixie",
+                "4-24-trixie",
+            ]
+        );
     }
 
     #[test]
-    fn filter_tags_no_matches() {
-        let tags = vec!["latest", "bookworm"];
-        let filtered = filter_tags_by_suffix(&tags, "trixie");
-        assert!(filtered.is_empty());
+    fn pinnable_tags_specific_versions_rank_above_aliases_in_composite_tags() {
+        // Regression: the flat numeric key ranked "4-24-trixie" ([4, 24])
+        // above "4.0.10-24-trixie" ([4, 0, 10, 24]) because 24 > 0 at
+        // index 1. Dash groups must be compared before dot segments.
+        let tags = vec!["4-24-trixie", "4.0-24-trixie", "4.0.10-24-trixie"];
+        assert_eq!(
+            pinnable_tags(&tags, "trixie"),
+            vec!["4.0.10-24-trixie", "4.0-24-trixie", "4-24-trixie"]
+        );
     }
 
     #[test]
-    fn filter_tags_composite_selection_uses_extracted_suffix() {
+    fn pinnable_tags_codename_selection() {
+        let tags = vec![
+            "1.0.9-trixie",
+            "1-trixie",
+            "dev-trixie",
+            "trixie",
+            "1.0.9-bookworm",
+            "latest",
+        ];
+        assert_eq!(
+            pinnable_tags(&tags, "trixie"),
+            vec!["1.0.9-trixie", "1-trixie"]
+        );
+    }
+
+    #[test]
+    fn pinnable_tags_offers_extensions_of_the_selection_version() {
+        // Node-style registries refine "24-trixie" as "24.7.0-trixie"
+        // instead of prefixing an image version. These must be offered,
+        // still excluding other variants and codenames.
         let tags = vec![
             "24.7.0-trixie",
-            "24.6.0-trixie",
+            "24.6.1-trixie",
             "24-trixie",
-            "22-trixie",
-            "22.12.0-bookworm",
+            "22.1.0-trixie",
+            "24.7.0-bookworm",
+            "dev-trixie",
             "latest",
         ];
-        let selection = "24-trixie";
-        let suffix = extract_variant_suffix(selection);
-        assert_eq!(suffix, "trixie");
-
-        let filtered = filter_tags_by_suffix(&tags, suffix);
-        assert!(filtered.contains(&"24.7.0-trixie"));
-        assert!(filtered.contains(&"24.6.0-trixie"));
-        assert!(filtered.contains(&"24-trixie"));
-        assert!(filtered.contains(&"22-trixie"));
-        assert!(!filtered.contains(&"22.12.0-bookworm"));
-        assert!(!filtered.contains(&"latest"));
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_version_key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn version_key_full_semver() {
-        assert_eq!(parse_version_key("4.0.6-trixie"), vec![4, 0, 6]);
+        assert_eq!(
+            pinnable_tags(&tags, "24-trixie"),
+            vec!["24.7.0-trixie", "24.6.1-trixie"]
+        );
     }
 
     #[test]
-    fn version_key_with_extra_number() {
-        assert_eq!(parse_version_key("4.0.6-22-trixie"), vec![4, 0, 6, 22]);
+    fn pinnable_tags_numeric_only_selection_extension() {
+        let tags = vec!["22.12.0", "22.11.0", "22", "20.9.0", "latest"];
+        assert_eq!(pinnable_tags(&tags, "22"), vec!["22.12.0", "22.11.0"]);
     }
 
     #[test]
-    fn version_key_major_only() {
-        assert_eq!(parse_version_key("22-trixie"), vec![22]);
+    fn pinnable_tags_excludes_selection_and_non_numeric_prefixes() {
+        let tags = vec!["24-trixie", "dev-24-trixie", "-24-trixie", "rc1-24-trixie"];
+        assert!(pinnable_tags(&tags, "24-trixie").is_empty());
     }
 
     #[test]
-    fn version_key_no_numbers() {
-        assert_eq!(parse_version_key("latest"), Vec::<u64>::new());
-    }
-
-    // -----------------------------------------------------------------------
-    // sort_tags_descending
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sort_descending_mixed_versions() {
-        let mut tags = vec![
-            "4.0.5-trixie",
-            "4.0.6-trixie",
-            "3.9.0-trixie",
-            "4.0.6-22-trixie",
-        ];
-        sort_tags_descending(&mut tags);
-        assert_eq!(tags[0], "4.0.6-22-trixie");
-        assert_eq!(tags[1], "4.0.6-trixie");
-        assert_eq!(tags[2], "4.0.5-trixie");
-        assert_eq!(tags[3], "3.9.0-trixie");
+    fn pinnable_tags_no_matches() {
+        let tags = vec!["latest", "bookworm", "1.2.3-bookworm"];
+        assert!(pinnable_tags(&tags, "trixie").is_empty());
     }
 
     #[test]
-    fn sort_descending_same_prefix() {
-        let mut tags = vec!["1-trixie", "22-trixie", "20-trixie"];
-        sort_tags_descending(&mut tags);
-        assert_eq!(tags, vec!["22-trixie", "20-trixie", "1-trixie"]);
+    fn pinnable_tags_truncates_to_max() {
+        let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)
+            .map(|i| format!("4.0.{i}-trixie"))
+            .collect();
+        let tags: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let pinned = pinnable_tags(&tags, "trixie");
+        assert_eq!(pinned.len(), MAX_PINNED_TAGS);
+        // Newest patch first after numeric (not lexicographic) sorting.
+        assert_eq!(pinned[0], format!("4.0.{}-trixie", MAX_PINNED_TAGS + 4));
     }
 
     // -----------------------------------------------------------------------
@@ -380,34 +485,5 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(dir.path());
         assert!(cache.get_image_tags("nonexistent").is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_variant_suffix
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn extract_suffix_pure_codename() {
-        assert_eq!(extract_variant_suffix("trixie"), "trixie");
-    }
-
-    #[test]
-    fn extract_suffix_composite_version_variant() {
-        assert_eq!(extract_variant_suffix("24-trixie"), "trixie");
-    }
-
-    #[test]
-    fn extract_suffix_single_digit_version() {
-        assert_eq!(extract_variant_suffix("1-bookworm"), "bookworm");
-    }
-
-    #[test]
-    fn extract_suffix_numeric_only() {
-        assert_eq!(extract_variant_suffix("22"), "22");
-    }
-
-    #[test]
-    fn extract_suffix_multi_segment_version() {
-        assert_eq!(extract_variant_suffix("3.12-bookworm"), "bookworm");
     }
 }
