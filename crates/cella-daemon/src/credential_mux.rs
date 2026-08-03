@@ -975,7 +975,7 @@ async fn send_protocol_violation<W: AsyncWrite + Unpin>(
 }
 
 fn abort_in_flight(requests: &mut HashMap<u32, RequestState>) {
-    for (_, state) in requests.iter_mut() {
+    for state in requests.values_mut() {
         if let Some(handle) = state.task_handle.take() {
             handle.abort();
         }

@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## Summary
 
-cella is a terminal-native devcontainer CLI built as a drop-in replacement for the official devcontainer CLI and VS Code devcontainer extension. It is a Rust workspace (edition 2024, MSRV 1.95.0) organized into 25 crates across three tiers: CLI entry points, domain logic, and foundation libraries.
+cella is a terminal-native devcontainer CLI built as a drop-in replacement for the official devcontainer CLI and VS Code devcontainer extension. It is a Rust workspace (edition 2024, MSRV 1.97.1) organized into 25 crates across three tiers: CLI entry points, domain logic, and foundation libraries.
 
 The runtime architecture is a **host daemon + in-container agent** model. The `cella` binary on the host orchestrates container lifecycle, while a long-lived `cella-daemon` process manages port forwarding, credential protection, hostname routing, and SSH agent proxying across all active containers. Inside each container, a `cella-agent` binary handles port detection, MITM proxy for credential interception, clipboard bridging, and git credential forwarding.
 

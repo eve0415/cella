@@ -51,7 +51,7 @@ Always research before suggesting changes or asking the user questions. Use `/sp
 
 ## Architecture
 
-Rust workspace (edition 2024, MSRV 1.95.0) with crates in `crates/`. Three-tier structure:
+Rust workspace (edition 2024, MSRV 1.97.1) with crates in `crates/`. Three-tier structure:
 
 - **Tier 1 (CLI):** cella-cli — binary entry point, delegates to library crates
 - **Tier 2 (Domain):** cella-docker, cella-compose, cella-orchestrator, cella-config, cella-features, cella-git, cella-daemon, cella-agent, cella-env, cella-doctor, cella-container, cella-templates
