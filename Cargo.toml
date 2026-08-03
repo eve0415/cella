@@ -157,7 +157,7 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal", "te
 portable-pty = "=0.9.0"
 
 # Proc macros
-syn = { version = "=2.0.118", features = ["full"] }
+syn = { version = "=3.0.3", features = ["full"] }
 quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
