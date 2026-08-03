@@ -237,6 +237,7 @@ Claude Code has additional forwarding logic beyond the basic bind mount:
 2. A tmpfs overlay shadows the `plugins/` subdirectory within the main `~/.claude/` bind mount.
 3. Plugin data directories (`cache/`, `data/`, `marketplaces/`) are symlinked from the tmpfs to the hidden host mount.
 4. Manifest files (`installed_plugins.json`, `known_marketplaces.json`) are copied with path rewriting -- a regex-based `sed` rewrites home paths from any previous container user to the current container user's path.
+5. At container creation, `CELLA_PLUGINS_DIR` and `CELLA_HOST_HOME` pin the rewrite paths. The agent watches both manifests and writes changes back to the host with container paths rewritten to the host home.
 
 ### Custom Config Paths
 

@@ -378,10 +378,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     }
 
     // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
-    let container_home = std::env::var("HOME").unwrap_or_default();
-    if !container_home.is_empty() {
-        tokio::spawn(plugin_sync::run(container_home));
-    }
+    tokio::spawn(plugin_sync::run());
 
     // Spawn health reporter
     let ctrl = control.clone();
