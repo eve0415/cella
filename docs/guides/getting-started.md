@@ -7,7 +7,7 @@ Cella is a terminal-native devcontainer CLI built in Rust. It's a drop-in replac
 ```sh
 brew install eve0415/tap/cella                                        # Homebrew
 curl -fsSL https://raw.githubusercontent.com/eve0415/cella/main/install.sh | sh  # install script
-cargo install --git https://github.com/eve0415/cella cella-cli        # from source (Rust 1.95+)
+cargo install --git https://github.com/eve0415/cella cella-cli        # from source (Rust 1.97+)
 ```
 
 Pre-built binaries for macOS and Linux are also available on [GitHub Releases](https://github.com/eve0415/cella/releases).
