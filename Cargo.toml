@@ -172,6 +172,7 @@ tempfile = "=3.27.0"
 filetime = "=0.2.29"
 insta = { version = "=1.48.0", features = ["json", "yaml", "redactions"] }
 trybuild = "=1.0.120"
+divan = "=0.1.21"
 
 # Internal crates
 cella-backend = { path = "crates/cella-backend" }
