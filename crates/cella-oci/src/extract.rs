@@ -152,10 +152,15 @@ fn unpack_archive<R: Read>(
     for entry in archive.entries()? {
         let mut entry = entry?;
         validate_entry(&entry, dest)?;
-        let path = entry_path_string(&entry);
         let unpacked = entry.unpack_in(dest)?;
         if !unpacked {
-            return Err(ExtractionError::EntrySkipped { path });
+            // Built only here, not once per entry: the string is pure error
+            // material, and a fat layer has thousands of entries. `unpack_in`
+            // leaves the header (and any GNU long-name) intact, so the path is
+            // still readable after the call.
+            return Err(ExtractionError::EntrySkipped {
+                path: entry_path_string(&entry),
+            });
         }
     }
     Ok(())
@@ -572,6 +577,22 @@ mod tests {
             std::fs::read_to_string(dest.path().join("readme.txt")).unwrap(),
             "ok"
         );
+    }
+
+    /// `EntrySkipped` builds its path string *after* `unpack_in` runs, so the
+    /// error message is only correct if the entry still knows its own path at
+    /// that point. Pin that invariant directly — the skip branch itself is
+    /// unreachable for archives our own validation lets through, so this is
+    /// the part that can actually regress.
+    #[test]
+    fn entry_path_readable_after_unpack() {
+        let tar = build_safe_tar(&[("subdir/hello.txt", None, b"world")]);
+        let dest = dest_dir();
+        let mut archive = tar::Archive::new(&tar[..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        assert!(entry.unpack_in(dest.path()).unwrap());
+        assert_eq!(entry_path_string(&entry), "subdir/hello.txt");
     }
 
     #[test]
