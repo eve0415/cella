@@ -1082,12 +1082,14 @@ pub fn build_tool_config_seed_files(
     files
 }
 
-/// Container env vars required by forwarded single-file tool configs.
+/// Container env vars required by forwarded Claude Code config.
 ///
 /// `CELLA_SYNC_CLAUDE_CONFIG=1` opts the in-container agent into bidirectional
 /// `~/.claude.json` sync; `CELLA_CLAUDE_JSON_PATH` pins the exact file the agent
 /// must watch/write so it always matches the seeded path — even when the agent
 /// daemon runs as a different user than `remote_user` (so `$HOME` would differ).
+/// When plugin manifests are forwarded, `CELLA_PLUGINS_DIR` similarly pins the
+/// container path and `CELLA_HOST_HOME` provides the reverse-rewrite target.
 /// Container env is immutable after create, so this is injected at create time
 /// on both the single-container and compose paths.
 #[must_use]
@@ -1095,13 +1097,39 @@ pub fn tool_config_env_vars(
     settings: &cella_config::CellaConfig,
     remote_user: &str,
 ) -> Vec<String> {
+    let host_plugins = cella_env::claude_code::host_plugins_dir();
+    tool_config_env_vars_in(settings, remote_user, host_plugins.as_deref())
+}
+
+/// Inner form of [`tool_config_env_vars`] taking the host plugins directory
+/// explicitly, so the mapping is testable without touching the host filesystem.
+///
+/// The plugin vars are gated on `host_plugins` being present because that is the
+/// same condition under which [`build_tool_config_mount_specs`] emits the hidden
+/// host mount and the tmpfs shadow — env and mounts must not disagree. Deriving
+/// the host home from that same path (`…/.claude/plugins` → `…`) keeps them in
+/// lockstep by construction.
+fn tool_config_env_vars_in(
+    settings: &cella_config::CellaConfig,
+    remote_user: &str,
+    host_plugins: Option<&std::path::Path>,
+) -> Vec<String> {
     let mut env = Vec::new();
     if settings.tools.claude_code.forward_config {
+        let container_home = cella_env::claude_code::container_home(remote_user);
         env.push("CELLA_SYNC_CLAUDE_CONFIG=1".to_string());
         env.push(format!(
-            "CELLA_CLAUDE_JSON_PATH={}/.claude.json",
-            cella_env::claude_code::container_home(remote_user)
+            "CELLA_CLAUDE_JSON_PATH={container_home}/.claude.json"
         ));
+        if let Some(host_home) = host_plugins
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+        {
+            env.push(format!(
+                "CELLA_PLUGINS_DIR={container_home}/.claude/plugins"
+            ));
+            env.push(format!("CELLA_HOST_HOME={}", host_home.display()));
+        }
     }
     env
 }
@@ -1711,10 +1739,16 @@ mod tests {
         let settings = cella_config::CellaConfig::default();
         assert!(settings.tools.claude_code.forward_config, "precondition");
         assert_eq!(
-            tool_config_env_vars(&settings, "vscode"),
+            tool_config_env_vars_in(
+                &settings,
+                "vscode",
+                Some(Path::new("/Users/alice/.claude/plugins"))
+            ),
             vec![
                 "CELLA_SYNC_CLAUDE_CONFIG=1".to_string(),
                 "CELLA_CLAUDE_JSON_PATH=/home/vscode/.claude.json".to_string(),
+                "CELLA_PLUGINS_DIR=/home/vscode/.claude/plugins".to_string(),
+                "CELLA_HOST_HOME=/Users/alice".to_string(),
             ]
         );
     }
@@ -1724,9 +1758,25 @@ mod tests {
         // The agent may run as a different user than remote_user; pin the path
         // to remote_user's home regardless of the agent's $HOME.
         let settings = cella_config::CellaConfig::default();
-        assert!(
-            tool_config_env_vars(&settings, "root")
-                .contains(&"CELLA_CLAUDE_JSON_PATH=/root/.claude.json".to_string())
+        let env = tool_config_env_vars_in(
+            &settings,
+            "root",
+            Some(Path::new("/Users/alice/.claude/plugins")),
+        );
+        assert!(env.contains(&"CELLA_CLAUDE_JSON_PATH=/root/.claude.json".to_string()));
+        assert!(env.contains(&"CELLA_PLUGINS_DIR=/root/.claude/plugins".to_string()));
+        assert!(env.contains(&"CELLA_HOST_HOME=/Users/alice".to_string()));
+    }
+
+    #[test]
+    fn tool_config_env_vars_keeps_original_vars_without_plugins() {
+        let settings = cella_config::CellaConfig::default();
+        assert_eq!(
+            tool_config_env_vars_in(&settings, "vscode", None),
+            vec![
+                "CELLA_SYNC_CLAUDE_CONFIG=1".to_string(),
+                "CELLA_CLAUDE_JSON_PATH=/home/vscode/.claude.json".to_string(),
+            ]
         );
     }
 
@@ -1734,7 +1784,14 @@ mod tests {
     fn tool_config_env_vars_empty_when_forwarding_off() {
         let mut settings = cella_config::CellaConfig::default();
         settings.tools.claude_code.forward_config = false;
-        assert!(tool_config_env_vars(&settings, "vscode").is_empty());
+        assert!(
+            tool_config_env_vars_in(
+                &settings,
+                "vscode",
+                Some(Path::new("/Users/alice/.claude/plugins"))
+            )
+            .is_empty()
+        );
     }
 
     #[test]

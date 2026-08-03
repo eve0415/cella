@@ -15,7 +15,7 @@ cella-agent is a binary that runs inside dev containers started by cella. It is 
 5. **Browser interception** — handles `BROWSER` environment variable calls, forwarding URL open requests to the host (enables OAuth callbacks)
 6. **Credential forwarding** — forwards git credential requests to the host daemon for transparent authentication
 7. **Clipboard forwarding** — bidirectional clipboard sync (xsel/xclip) between container and host
-8. **Plugin synchronization** — synchronizes editor plugin/extension manifests between host and container
+8. **Plugin synchronization** — writes Claude Code plugin manifest changes back to the host with path rewriting
 9. **Reverse tunnels** — handles daemon tunnel requests by connecting back and relaying to local services
 10. **SSH agent bridge** — bridges a container-local Unix socket to the host's SSH agent over TCP, enabling transparent SSH signing (e.g. via 1Password)
 11. **CLI mode** — when invoked as `cella` (via symlink, `cella` -> `cella-agent`), provides in-container CLI commands that delegate to the host daemon
@@ -51,7 +51,7 @@ cella-agent credential <operation>           # Handle git credential request (ge
 | `cli` | CLI mode for in-container `cella` commands (when agent binary is symlinked as `cella`) |
 | `forward_proxy` | Forward proxy for localhost-bound applications |
 | `mitm` | MITM proxy for HTTPS interception and path-level blocking |
-| `plugin_sync` | Plugin/extension synchronization for editors |
+| `plugin_sync` | Claude Code plugin manifest write-back and path rewriting |
 | `proxy_config` | Network proxy configuration parsing and rule matching |
 | `clipboard` | Bidirectional clipboard forwarding — intercepts xsel/xclip calls and relays copy/paste/clear to the host daemon |
 | `tunnel` | Reverse tunnel handler — responds to daemon `TunnelRequest` messages by connecting back and relaying to local services |
@@ -79,6 +79,10 @@ The agent connects to the host daemon using environment variables set during con
 - `CELLA_DAEMON_ADDR` — host daemon address
 - `CELLA_DAEMON_TOKEN` — authentication token
 - `CELLA_CONTAINER_NAME` — container identifier
+
+Claude Code plugin manifest sync uses two additional create-time variables:
+- `CELLA_PLUGINS_DIR` — remote user's Claude Code plugin directory watched for manifest changes
+- `CELLA_HOST_HOME` — host home used when reverse-rewriting manifest paths
 
 Log level is controlled via `CELLA_AGENT_LOG` (or `RUST_LOG`).
 
