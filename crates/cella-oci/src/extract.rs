@@ -228,21 +228,17 @@ fn validate_link_target<R: Read>(
         return Ok(());
     }
 
-    let link_target = match entry.link_name().map_err(ExtractionError::Io)? {
-        Some(t) => t.into_owned(),
-        None => return Ok(()),
+    // Borrowed, not owned: the target is only read here, and link-heavy layers
+    // (`bin/` trees) hit this path thousands of times.
+    let Some(link_target) = entry.link_name().map_err(ExtractionError::Io)? else {
+        return Ok(());
     };
 
     let entry_path = entry.path().map_err(ExtractionError::Io)?;
-    let entry_name = entry_path.display().to_string();
-    let target_display = link_target.display().to_string();
 
     // Absolute link targets always escape the destination.
     if link_target.is_absolute() {
-        return Err(ExtractionError::UnsafeLinkTarget {
-            entry: entry_name,
-            target: target_display,
-        });
+        return Err(unsafe_link_target(&entry_path, &link_target));
     }
 
     // Resolve the relative target against its correct base inside dest.
@@ -250,21 +246,31 @@ fn validate_link_target<R: Read>(
     // link's own directory, while hardlink targets are relative to the archive
     // root (dest). Using the entry parent for both would under-validate
     // hardlinks (e.g. `a/b/link -> ../../etc/passwd` would look contained).
-    let base = if kind.is_hard_link() {
+    let mut candidate = if kind.is_hard_link() {
         dest.to_path_buf()
     } else {
         entry_path
             .parent()
             .map_or_else(|| dest.to_path_buf(), |p| dest.join(p))
     };
-    if escapes_dest(&base.join(&link_target), dest) {
-        return Err(ExtractionError::UnsafeLinkTarget {
-            entry: entry_name,
-            target: target_display,
-        });
+    candidate.push(&link_target);
+    if escapes_dest(&candidate, dest) {
+        return Err(unsafe_link_target(&entry_path, &link_target));
     }
 
     Ok(())
+}
+
+/// Build the [`ExtractionError::UnsafeLinkTarget`] error for a rejected link.
+///
+/// Outlined and `#[cold]` so the two `String`s it needs are built only for
+/// links that actually escape — not for every safe link the archive contains.
+#[cold]
+fn unsafe_link_target(entry_path: &Path, link_target: &Path) -> ExtractionError {
+    ExtractionError::UnsafeLinkTarget {
+        entry: entry_path.display().to_string(),
+        target: link_target.display().to_string(),
+    }
 }
 
 /// Returns `true` when the normalised form of `candidate` escapes `dest`.
