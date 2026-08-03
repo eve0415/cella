@@ -39,7 +39,7 @@ description = "A terminal-native devcontainer CLI built for the AI agent era"
 readme = "README.md"
 keywords = ["devcontainers", "containers", "cli", "docker", "vscode"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.96.1"
+rust-version = "1.97.1"
 
 [workspace.dependencies]
 # Async runtime
