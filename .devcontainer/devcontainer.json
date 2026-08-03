@@ -1,70 +1,17 @@
 {
   "name": "cella",
-  "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:2.0.14-trixie",
   "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "extensions": "github/gh-stack",
+      "installDirectlyFromGitHubRelease": true,
+      "version": "latest"
+    },
     "ghcr.io/devcontainers/features/node:1": {
       "version": "lts",
       "pnpmVersion": "none",
       "nvmVersion": "latest"
     }
   },
-  "postCreateCommand": "cargo install cargo-insta",
-  "customizations": {
-    "vscode": {
-      "extensions": [
-        "redhat.vscode-yaml",
-        "tamasfe.even-better-toml",
-        "ms-azuretools.vscode-docker",
-        "ambar.bundle-size",
-        "github.vscode-github-actions",
-        "GitHub.vscode-pull-request-github",
-        "Anthropic.claude-code",
-        "openai.chatgpt",
-        "google.gemini-cli-vscode-ide-companion"
-      ],
-      "settings": {
-        "diffEditor.diffAlgorithm": "advanced",
-        "diffEditor.experimental.showMoves": true,
-        "editor.formatOnSave": true,
-        "editor.formatOnType": true,
-        "editor.formatOnPaste": true,
-        "editor.codeActionsOnSave": {
-          "source.organizeImports": "always",
-          "source.addMissingImports": "always",
-          "source.fixAll.eslint": "always"
-        },
-        "editor.cursorBlinking": "smooth",
-        "editor.cursorSmoothCaretAnimation": "on",
-        "editor.linkedEditing": true,
-        "editor.smoothScrolling": true,
-        "editor.tabSize": 2,
-        "files.insertFinalNewline": true,
-        "files.eol": "\n",
-        "files.trimFinalNewlines": true,
-        "files.trimTrailingWhitespace": true,
-        "search.exclude": {
-          "Cargo.lock": true
-        },
-        "terminal.integrated.defaultProfile.linux": "zsh",
-        "terminal.integrated.profiles.linux": {
-          "zsh": {
-            "path": "/bin/zsh"
-          }
-        },
-        "[markdown]": {
-          "diffEditor.ignoreTrimWhitespace": false,
-          "editor.quickSuggestions": {
-            "comments": "off",
-            "strings": "off",
-            "other": "off"
-          },
-          "editor.tabSize": 4,
-          "editor.unicodeHighlight.ambiguousCharacters": false,
-          "editor.unicodeHighlight.invisibleCharacters": false,
-          "editor.wordWrap": "on"
-        }
-      }
-    }
-  }
+  "postCreateCommand": "cargo install cargo-insta"
 }
