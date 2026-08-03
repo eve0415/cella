@@ -171,6 +171,12 @@ fn rewrite_plugin_paths(content: &str, container_home: &Path, host_home: &Path) 
 
 /// Build the inotify watcher that signals `tx` on manifest create/modify.
 ///
+/// The send is non-blocking and its result discarded: the channel carries a bare
+/// signal, so a full one means a sync is already pending and [`sync_manifests`]
+/// re-reads both files from disk when it runs. Dropping the extra signal costs
+/// nothing, whereas blocking here would stall the watcher thread — which is the
+/// one reading the inotify queue — for the whole debounce interval.
+///
 /// `plugins_dir` is carried only to name the directory in watcher errors.
 fn create_watcher(
     tx: mpsc::Sender<()>,
@@ -184,7 +190,7 @@ fn create_watcher(
                     .is_some_and(|name| SYNC_FILES.contains(&name))
             });
             if is_sync_file {
-                let _ = tx.blocking_send(());
+                let _ = tx.try_send(());
             }
         }
         Err(e) => tracing::warn!(
