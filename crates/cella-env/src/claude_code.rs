@@ -175,14 +175,29 @@ impl PathMap {
         let mut subs: Vec<(&str, &str)> = std::iter::once(&self.claude)
             .chain(self.workspace.iter())
             .map(|(container, host)| match direction {
-                Direction::ToHost => (container.as_str(), host.as_str()),
-                Direction::ToContainer => (host.as_str(), container.as_str()),
+                Direction::ToHost => (trim_trailing_slash(container), trim_trailing_slash(host)),
+                Direction::ToContainer => {
+                    (trim_trailing_slash(host), trim_trailing_slash(container))
+                }
             })
             .collect();
         subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
         let mut out = doc.clone();
         rewrite_path_fields(&mut out, &subs);
         out
+    }
+}
+
+/// Drop a trailing separator, except from the root itself.
+///
+/// A custom `workspaceMount` may legitimately give `target=/workspace/`, and a
+/// prefix carrying that separator would leave `subdir` rather than `/subdir`
+/// after stripping, failing the component-boundary test against the unsuffixed
+/// form Docker and `projectPath` actually use.
+fn trim_trailing_slash(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some("") | None => path,
+        Some(trimmed) => trimmed,
     }
 }
 
@@ -823,5 +838,36 @@ mod tests {
             denormalize_installed_plugins(&normalize_installed_plugins(&doc)),
             doc
         );
+    }
+
+    /// A custom mount may supply a trailing separator; matching must still land
+    /// on component boundaries and must not produce a doubled separator.
+    #[test]
+    fn trailing_separators_do_not_break_matching() {
+        let map = PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some(("/workspace/".to_string(), "/host/code/".to_string())),
+        };
+        let doc = json!({ "p": [
+            { "projectPath": "/workspace/sub" },
+            { "projectPath": "/workspace" }
+        ]});
+        let hosted = map.to_host(&doc);
+        assert_eq!(hosted["p"][0]["projectPath"], json!("/host/code/sub"));
+        assert_eq!(hosted["p"][1]["projectPath"], json!("/host/code"));
+        assert_eq!(
+            map.to_container(&hosted)["p"][0]["projectPath"],
+            json!("/workspace/sub")
+        );
+    }
+
+    #[test]
+    fn root_prefix_keeps_its_separator() {
+        assert_eq!(trim_trailing_slash("/"), "/");
+        assert_eq!(trim_trailing_slash("/a/"), "/a");
+        assert_eq!(trim_trailing_slash("/a"), "/a");
     }
 }

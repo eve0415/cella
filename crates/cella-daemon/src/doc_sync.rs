@@ -141,29 +141,36 @@ async fn ingest_host(
     host_path: &Path,
     doc: SyncDoc,
 ) -> Option<(String, String, bool, bool)> {
+    // The whole transaction — read, hash, parse, snapshot — runs under one
+    // guard, and the read happens *inside* it. The watcher and an agent can both
+    // reach this concurrently: with the read outside, one caller could pick up an
+    // older revision, lose the race to a caller holding a newer one, and then
+    // reacquire the lock and diff the snapshot back down to its stale version —
+    // which `last_hash` would then mask, because it already names the newer file.
+    // Nothing here awaits, so holding the guard costs a file read.
+    let mut st = state.lock().await;
+
     let Ok(raw) = std::fs::read(host_path) else {
         debug!("doc sync: host file unreadable (mid-rename?); waiting for next event");
         return None;
     };
 
     let incoming_hash = cella_filesync::sha256_hex(&raw);
-    {
-        let mut st = state.lock().await;
-        if incoming_hash == st.last_hash {
-            return None; // our own write, or already processed
-        }
-        st.last_hash = incoming_hash;
+    if incoming_hash == st.last_hash {
+        return None; // our own write, or already processed
     }
+    st.last_hash = incoming_hash;
 
     let Some(incoming) = std::str::from_utf8(&raw)
         .ok()
         .and_then(|s| cella_env::claude_code::to_canonical(doc, s, None))
     else {
+        // `last_hash` still advanced, so the same invalid bytes are not
+        // re-parsed on every subsequent event.
         warn!("doc sync: host {doc:?} is not valid JSON; skipping");
         return None;
     };
 
-    let mut st = state.lock().await;
     let patch = cella_env::claude_code::diff_merge_patch(&st.host_snapshot, &incoming);
     let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
     let canonical_changed = merged != st.canonical;
