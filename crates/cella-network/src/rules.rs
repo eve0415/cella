@@ -279,6 +279,14 @@ fn match_segments(pattern: &[PatternPart], segments: &[&str]) -> bool {
 
 /// Segment matching with `**` support (for paths).
 fn match_segments_with_doublestar(pattern: &[PatternPart], segments: &[&str]) -> bool {
+    // Only `**` can make a pattern match a different number of segments than
+    // it has parts. Without one the match is positional, so it needs neither
+    // the recursion nor the memo set that guards it against `**` blowup —
+    // and the memo set is an allocation on every path check.
+    if !pattern.contains(&PatternPart::DoubleStar) {
+        return match_segments(pattern, segments);
+    }
+
     let mut visited = std::collections::HashSet::new();
     match_recursive(pattern, segments, 0, 0, &mut visited)
 }

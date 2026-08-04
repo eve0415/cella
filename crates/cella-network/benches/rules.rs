@@ -87,6 +87,26 @@ fn evaluate_hit(bencher: divan::Bencher, rules: usize) {
     });
 }
 
+/// A path rule whose patterns contain no `**`. Positional matching needs
+/// neither recursion nor memo state, so this isolates the cost of the
+/// `**`-only machinery from the common single-`*` pattern.
+#[divan::bench(args = RULE_COUNTS)]
+fn evaluate_path_star_only(bencher: divan::Bencher, rules: usize) {
+    let mut config = build_config(rules);
+    config.rules.push(NetworkRule {
+        domain: "star.example.com".to_owned(),
+        paths: vec!["/v1/*/items".to_owned(), "/api/*".to_owned()],
+        action: RuleAction::Block,
+    });
+    let matcher = RuleMatcher::new(&config);
+    bencher.bench(|| {
+        divan::black_box(matcher.evaluate(
+            divan::black_box("star.example.com"),
+            divan::black_box("/v1/things/items"),
+        ));
+    });
+}
+
 /// Uppercase input forces the domain-lowercasing path that lowercase input
 /// can skip — kept separate so the fast path is not averaged with it.
 #[divan::bench(args = RULE_COUNTS)]
