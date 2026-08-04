@@ -20,7 +20,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 
 cella-oci.workspace = true
@@ -30,6 +29,8 @@ semver.workspace = true
 cella-testing.workspace = true
 filetime.workspace = true
 tempfile.workspace = true
+# Not referenced by name in this crate — the `runtime_test` macro expands to it.
+tokio.workspace = true
 
 [lints]
 workspace = true

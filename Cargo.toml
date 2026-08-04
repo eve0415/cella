@@ -112,7 +112,6 @@ reqwest = { version = "=0.13.4", default-features = false, features = ["rustls",
 
 # Filesystem
 dirs = "=6.0.0"
-fs4 = "=1.1.0"
 
 # Compression
 # zlib-rs backend: pure Rust (no C toolchain), ~1.26x faster inflate than the
