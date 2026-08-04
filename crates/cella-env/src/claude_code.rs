@@ -186,6 +186,16 @@ impl PathMap {
     }
 }
 
+/// Whether `prefix` covers `text` at a path-component boundary.
+///
+/// A raw `starts_with` would let a mapping rooted at `/workspaces/app` capture
+/// `/workspaces/application` and rewrite it into the wrong workspace namespace,
+/// which for `projectPath` also produces the wrong normalized context key.
+fn is_path_prefix(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// Walk `value`, replacing a leading `from` with `to` in every path field.
 fn rewrite_path_fields(value: &mut serde_json::Value, subs: &[(&str, &str)]) {
     match value {
@@ -193,7 +203,8 @@ fn rewrite_path_fields(value: &mut serde_json::Value, subs: &[(&str, &str)]) {
             for (key, child) in map.iter_mut() {
                 if PATH_FIELDS.contains(&key.as_str())
                     && let Some(text) = child.as_str()
-                    && let Some((from, to)) = subs.iter().find(|(from, _)| text.starts_with(from))
+                    && let Some((from, to)) =
+                        subs.iter().find(|(from, _)| is_path_prefix(text, from))
                 {
                     *child = serde_json::Value::String(text.replacen(from, to, 1));
                     continue;
@@ -259,6 +270,23 @@ pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value
     out
 }
 
+/// Whether `value` is the exact shape [`normalize_installed_plugins`] produces:
+/// an object whose every key is its own entry's context key.
+///
+/// Checked rather than assumed because normalization deliberately passes an
+/// unrecognised `plugins` value through untouched for forward compatibility. If
+/// denormalization then turned *any* object into an array, an object-shaped
+/// entry from a newer Claude Code would survive normalization only to be
+/// corrupted on the very next write.
+fn is_normalized_entry_map(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        !map.is_empty()
+            && map
+                .iter()
+                .all(|(key, entry)| *key == entry_context_key(entry))
+    })
+}
+
 /// Restore the on-disk entry-array schema from the normalized form.
 ///
 /// Entries are emitted in sorted context-key order so the output is byte-stable:
@@ -274,6 +302,9 @@ pub fn denormalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Val
         return out;
     };
     for value in plugins.values_mut() {
+        if !is_normalized_entry_map(value) {
+            continue;
+        }
         let Some(keyed) = value.as_object() else {
             continue;
         };
@@ -729,5 +760,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A mapping rooted at `/workspaces/app` must not capture
+    /// `/workspaces/application`.
+    #[test]
+    fn prefix_match_respects_component_boundaries() {
+        let map = PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some((
+                "/workspaces/app".to_string(),
+                "/Users/alice/src/app".to_string(),
+            )),
+        };
+        let doc = json!({ "p": [
+            { "projectPath": "/workspaces/application" },
+            { "projectPath": "/workspaces/app" },
+            { "projectPath": "/workspaces/app/sub" }
+        ]});
+        let out = map.to_host(&doc);
+        assert_eq!(
+            out["p"][0]["projectPath"],
+            json!("/workspaces/application"),
+            "a sibling sharing the prefix must be left alone"
+        );
+        assert_eq!(out["p"][1]["projectPath"], json!("/Users/alice/src/app"));
+        assert_eq!(
+            out["p"][2]["projectPath"],
+            json!("/Users/alice/src/app/sub")
+        );
+    }
+
+    /// Normalization passes an unrecognised `plugins` value through for forward
+    /// compatibility; denormalization must not then mangle it into an array.
+    #[test]
+    fn denormalize_leaves_unrecognized_object_shapes_untouched() {
+        let doc = json!({
+            "version": 3,
+            "plugins": { "p@m": { "someFutureKey": { "nested": true } } }
+        });
+        assert_eq!(denormalize_installed_plugins(&doc), doc);
+        // And the pair still round-trips such a document unchanged.
+        assert_eq!(
+            denormalize_installed_plugins(&normalize_installed_plugins(&doc)),
+            doc
+        );
     }
 }

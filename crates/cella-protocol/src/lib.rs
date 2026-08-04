@@ -9,7 +9,13 @@ pub mod credential_frame;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for the agent↔daemon handshake.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Bumped to 2 when `ClaudeConfigChanged`/`SyncClaudeConfig` were replaced by
+/// the doc-tagged `ConfigDocPatch`/`SyncConfigDoc`. Without the bump a v1 agent
+/// would handshake successfully and then have its whole control connection —
+/// port forwarding, browser, clipboard — torn down by the first unknown
+/// message; with it, the mismatch is rejected cleanly at the handshake.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Which forwarded Claude Code document a sync message or codec call refers to.
 ///

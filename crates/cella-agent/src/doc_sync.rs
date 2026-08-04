@@ -409,14 +409,21 @@ async fn run_watcher(st: Arc<DocState>, control: Arc<Mutex<ReconnectingClient>>)
 }
 
 /// Forward a container-side edit to the daemon as a merge patch, advancing
-/// `last_hash` and the baseline only on a successful send.
+/// `last_hash` only on a successful send.
 ///
-/// Recording them *after* a successful send (not before) is the fix for a silent
-/// data-loss bug: if the daemon is unreachable, a failed send leaves both
+/// Recording it *after* a successful send (not before) is the fix for a silent
+/// data-loss bug: if the daemon is unreachable, a failed send leaves it
 /// unchanged so the edit is re-sent on the next watcher event or on reconnect,
 /// instead of being marked already-synced and later clobbered by a stale daemon
 /// push. Content whose hash already matches `last_hash` is the agent's own
 /// (daemon-applied) write and is skipped without sending.
+///
+/// The baseline deliberately does **not** advance here. A successful `send`
+/// only means the bytes reached the socket, not that the daemon applied them —
+/// so the baseline advances in [`apply_canonical`], when the daemon's canonical
+/// reply comes back. That reply is unconditional, which makes it a de facto
+/// acknowledgment: if the daemon dies in the window, the baseline stays put and
+/// the reconnect re-announce re-derives the same patch.
 async fn forward_change<F, Fut>(st: &DocState, send: F)
 where
     F: FnOnce(AgentMessage) -> Fut,
@@ -447,10 +454,7 @@ where
         patch: patch.to_string(),
     };
     match send(msg).await {
-        Ok(()) => {
-            *st.last_hash.lock().await = hash;
-            st.set_baseline(canonical).await;
-        }
+        Ok(()) => *st.last_hash.lock().await = hash,
         Err(e) => warn!(
             "doc sync: failed to send {:?} change to daemon: {e}",
             st.doc
@@ -714,8 +718,11 @@ mod tests {
         );
     }
 
+    /// A successful send advances the hash but NOT the baseline: the bytes
+    /// reaching the socket is not proof the daemon applied them, so the baseline
+    /// waits for the canonical reply.
     #[tokio::test]
-    async fn forward_change_advances_hash_and_baseline_on_success() {
+    async fn forward_change_advances_hash_but_not_baseline_on_success() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(".claude.json"), r#"{"a":1}"#).expect("seed");
         let st = doc_state(tmp.path(), SyncDoc::ClaudeJson, ".claude.json", None);
@@ -727,7 +734,33 @@ mod tests {
             *st.last_hash.lock().await,
             cella_filesync::sha256_hex(br#"{"a":1}"#)
         );
-        assert_eq!(*st.baseline.lock().await, json!({"a":1}));
+        assert_eq!(
+            *st.baseline.lock().await,
+            json!({}),
+            "an unacknowledged send must leave the baseline alone"
+        );
+    }
+
+    /// The daemon's canonical reply is the acknowledgment: it is what advances
+    /// the baseline, so an edit lost between the socket and the daemon is
+    /// re-derived on the next event or reconnect instead of vanishing.
+    #[tokio::test]
+    async fn daemon_reply_advances_the_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".claude.json"), r#"{"a":1}"#).expect("seed");
+        let st = doc_state(tmp.path(), SyncDoc::ClaudeJson, ".claude.json", None);
+        *st.baseline.lock().await = json!({});
+        *st.last_hash.lock().await = String::new();
+
+        forward_change(&st, |_msg| async { Ok(()) }).await;
+        assert_eq!(*st.baseline.lock().await, json!({}), "not yet acknowledged");
+
+        apply_canonical(&st, r#"{"a":1}"#).await;
+        assert_eq!(
+            *st.baseline.lock().await,
+            json!({"a":1}),
+            "the canonical reply acknowledges the patch"
+        );
     }
 
     #[tokio::test]

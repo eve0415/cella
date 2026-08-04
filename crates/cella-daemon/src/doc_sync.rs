@@ -78,11 +78,23 @@ impl DocSyncState {
         }
     }
 
-    /// The canonical document in the host's on-disk form, for transport and for
-    /// writing the host file. Routed through the codec so `installed_plugins`
-    /// keeps its real entry-array schema on disk.
+    /// The canonical document in the host's on-disk form, for writing the host
+    /// file. Routed through the codec so `installed_plugins` keeps its real
+    /// entry-array schema on disk.
     fn on_disk_string(&self) -> String {
         cella_env::claude_code::to_local(self.doc, &self.canonical, None)
+    }
+
+    /// The canonical document as sent to agents — canonical form verbatim, NOT
+    /// the on-disk form.
+    ///
+    /// These differ for `InstalledPlugins`: on disk the entries are arrays,
+    /// canonically they are keyed by install context. An agent that persisted
+    /// the array shape as its baseline would diff its next normalized read
+    /// against it as a whole-value replacement and send back a full-entry patch
+    /// that clobbers peers — the exact failure this hub exists to remove.
+    fn wire_string(&self) -> String {
+        serde_json::to_string(&self.canonical).unwrap_or_else(|_| "{}".to_string())
     }
 }
 
@@ -121,7 +133,7 @@ pub async fn on_host_change(
         return;
     };
 
-    let (out, host_needs_update, canonical_changed) = {
+    let (on_disk, wire, host_needs_update, canonical_changed) = {
         let mut st = state.lock().await;
         let patch = cella_env::claude_code::diff_merge_patch(&st.host_snapshot, &incoming);
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
@@ -131,15 +143,20 @@ pub async fn on_host_change(
         // them back so the host file converges to the union.
         let host_needs_update = st.canonical != incoming;
         st.host_snapshot = incoming;
-        (st.on_disk_string(), host_needs_update, canonical_changed)
+        (
+            st.on_disk_string(),
+            st.wire_string(),
+            host_needs_update,
+            canonical_changed,
+        )
     };
 
     if host_needs_update {
-        write_host_guarded(state, host_path, &out).await;
+        write_host_guarded(state, host_path, &on_disk).await;
     }
 
     if canonical_changed {
-        broadcast(handles, doc, &out).await;
+        broadcast(handles, doc, &wire).await;
     }
 }
 
@@ -189,26 +206,26 @@ pub async fn on_agent_change(
         return;
     };
 
-    let (out, changed) = {
+    let (on_disk, wire, changed) = {
         let mut st = state.lock().await;
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
         let changed = merged != st.canonical;
         st.canonical = merged;
-        (st.on_disk_string(), changed)
+        (st.on_disk_string(), st.wire_string(), changed)
     };
 
     if !changed {
         // Nothing new for the peers, but the sender still gets canonical: its
         // patch may have been empty because it is *behind*, not in sync.
-        send_to(handles, sender, doc, &out).await;
+        send_to(handles, sender, doc, &wire).await;
         return;
     }
     if let Some(path) = host_path {
-        write_host_guarded(state, path, &out).await;
+        write_host_guarded(state, path, &on_disk).await;
     }
-    // Broadcast includes the sender — its own content hash drops the echo, so a
-    // separate reply would be a duplicate.
-    broadcast(handles, doc, &out).await;
+    // Broadcast includes the sender — its own content hash drops the echo, and
+    // the reply is what advances that agent's baseline.
+    broadcast(handles, doc, &wire).await;
 }
 
 /// Send one canonical document to a connected agent.
@@ -592,6 +609,51 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["official"]["lastUpdated"],
             json!("2")
         );
+    }
+
+    /// The wire must carry *canonical* (context-keyed) form, not the on-disk
+    /// entry arrays. An agent that persists an array-shaped baseline would diff
+    /// its next normalized read against it as a whole-value replacement, and
+    /// send back a full-entry patch that clobbers peers — reintroducing exactly
+    /// the bug this hub exists to remove.
+    #[tokio::test]
+    async fn broadcast_carries_normalized_installed_plugins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("installed_plugins.json");
+        std::fs::write(
+            &host,
+            r#"{"version":2,"plugins":{"p@m":[{"scope":"user","version":"1.0"}]}}"#,
+        )
+        .expect("seed host");
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::InstalledPlugins,
+        )));
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::InstalledPlugins,
+            r#"{"plugins":{"p@m":{"user":{"version":"2.0"}}}}"#,
+            "cella-a",
+        )
+        .await;
+
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            agent.try_recv().expect("agent must be notified")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        let sent: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert!(
+            sent["plugins"]["p@m"].is_object(),
+            "the wire form must stay context-keyed, got: {}",
+            sent["plugins"]["p@m"]
+        );
+        assert_eq!(sent["plugins"]["p@m"]["user"]["version"], json!("2.0"));
     }
 
     /// The host file keeps its real entry-array schema; the normalized
