@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.0",
  "bytes",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "cella-backend"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-env",
  "cella-features",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "heck",
  "indexmap",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-codegen",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "cella-container"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-testing",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.0",
  "cella-daemon-client",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon-client"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-env",
  "cella-protocol",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bollard",
  "cella-backend",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-network",
  "cella-protocol",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "cella-filesync"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "hex",
  "notify",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "hex",
  "insta",
@@ -625,14 +625,14 @@ dependencies = [
 
 [[package]]
 name = "cella-jsonc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cella-network"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.0",
  "divan",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "cella-oci"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.0",
  "dirs",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "cella-orchestrator"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-protocol",
  "miette",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "cella-protocol"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "regex",
  "serde",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "cella-proxy"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "futures-util",
  "hex",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "cella-templates"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "cella-test-macros"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cella-testing"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bollard",
  "cella-test-macros",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "cella-tool-install"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cella-backend",
  "cella-config",
