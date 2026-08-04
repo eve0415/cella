@@ -3,6 +3,8 @@
 //! Supports domain patterns like `*.example.com` and path patterns like `/api/**`.
 //! Domain matching is case-insensitive; path matching is case-sensitive.
 
+use std::borrow::Cow;
+
 use crate::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 
 /// Evaluates network rules against request URLs.
@@ -72,11 +74,18 @@ impl RuleMatcher {
     ///
     /// Domain matching is case-insensitive. Path matching is case-sensitive.
     pub fn evaluate(&self, domain: &str, path: &str) -> RuleVerdict {
-        let domain_lower = domain.to_ascii_lowercase();
+        let domain_lower = ascii_lowercase_cow(domain);
         let path = if path.is_empty() { "/" } else { path };
 
+        // Both splits are loop-invariant — the domain and path do not change
+        // as we walk the rules — so doing them inside the loop cost one Vec
+        // per rule per request. The path split stays lazy because a rule set
+        // of domain-only rules never needs it.
+        let labels = split_domain(&domain_lower);
+        let mut segments: Option<Vec<&str>> = None;
+
         for rule in &self.rules {
-            if !match_domain(&rule.domain_parts, &domain_lower) {
+            if !match_segments(&rule.domain_parts, &labels) {
                 continue;
             }
 
@@ -84,7 +93,10 @@ impl RuleMatcher {
             let path_matched = if rule.path_patterns.is_empty() {
                 true
             } else {
-                rule.path_patterns.iter().any(|pp| match_path(pp, path))
+                let segments = segments.get_or_insert_with(|| split_path(path));
+                rule.path_patterns
+                    .iter()
+                    .any(|pp| match_segments_with_doublestar(pp, segments))
             };
 
             if path_matched {
@@ -124,13 +136,14 @@ impl RuleMatcher {
     /// Used for CONNECT requests when MITM is unavailable — path-level rules
     /// are skipped entirely rather than evaluated against a fake path.
     pub fn evaluate_domain_only(&self, domain: &str) -> RuleVerdict {
-        let domain_lower = domain.to_ascii_lowercase();
+        let domain_lower = ascii_lowercase_cow(domain);
+        let labels = split_domain(&domain_lower);
 
         for rule in &self.rules {
             if !rule.path_patterns.is_empty() {
                 continue;
             }
-            if !match_domain(&rule.domain_parts, &domain_lower) {
+            if !match_segments(&rule.domain_parts, &labels) {
                 continue;
             }
 
@@ -168,11 +181,35 @@ impl RuleMatcher {
     /// If `true`, MITM TLS interception is needed for this domain.
     /// If `false`, domain-level blocking is sufficient (no MITM).
     pub fn domain_needs_path_inspection(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_ascii_lowercase();
+        let domain_lower = ascii_lowercase_cow(domain);
+        let labels = split_domain(&domain_lower);
         self.rules.iter().any(|rule| {
-            !rule.path_patterns.is_empty() && match_domain(&rule.domain_parts, &domain_lower)
+            !rule.path_patterns.is_empty() && match_segments(&rule.domain_parts, &labels)
         })
     }
+}
+
+/// Lowercase `s` only if it actually contains uppercase ASCII.
+///
+/// Hostnames arrive lowercase in the overwhelming majority of requests, so the
+/// unconditional `to_ascii_lowercase` this replaces allocated a `String` per
+/// request for nothing.
+fn ascii_lowercase_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Split a lowercase domain into its labels.
+fn split_domain(domain: &str) -> Vec<&str> {
+    domain.split('.').collect()
+}
+
+/// Split a path into non-empty segments.
+fn split_path(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
 fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
@@ -227,24 +264,6 @@ fn parse_path_pattern(pattern: &str) -> Vec<PatternPart> {
             other => PatternPart::Literal(other.to_string()),
         })
         .collect()
-}
-
-/// Match a domain (lowercase) against a compiled domain pattern.
-///
-/// `*` matches exactly one domain label.
-/// `*.example.com` matches `foo.example.com` but NOT `foo.bar.example.com`.
-fn match_domain(pattern: &[PatternPart], domain: &str) -> bool {
-    let labels: Vec<&str> = domain.split('.').collect();
-    match_segments(pattern, &labels)
-}
-
-/// Match a path against a compiled path pattern.
-///
-/// `*` matches exactly one path segment.
-/// `**` matches zero or more path segments.
-fn match_path(pattern: &[PatternPart], path: &str) -> bool {
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match_segments_with_doublestar(pattern, &segments)
 }
 
 /// Exact segment matching (for domains): `*` matches one, no `**` support.
@@ -317,6 +336,25 @@ mod tests {
     use crate::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 
     use super::*;
+
+    /// Match a domain (lowercase) against a compiled domain pattern.
+    ///
+    /// `*` matches exactly one domain label.
+    /// `*.example.com` matches `foo.example.com` but NOT `foo.bar.example.com`.
+    ///
+    /// `evaluate` splits the domain once per request rather than once per
+    /// rule, so this string-taking form only exists for the tests below.
+    fn match_domain(pattern: &[PatternPart], domain: &str) -> bool {
+        match_segments(pattern, &split_domain(domain))
+    }
+
+    /// Match a path against a compiled path pattern.
+    ///
+    /// `*` matches exactly one path segment.
+    /// `**` matches zero or more path segments.
+    fn match_path(pattern: &[PatternPart], path: &str) -> bool {
+        match_segments_with_doublestar(pattern, &split_path(path))
+    }
 
     // --- Domain pattern matching ---
 
