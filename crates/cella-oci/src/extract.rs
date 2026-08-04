@@ -601,6 +601,25 @@ mod tests {
         assert_eq!(entry_path_string(&entry), "subdir/hello.txt");
     }
 
+    /// The same invariant for a path too long for the 100-byte tar name field.
+    /// GNU long names live in a preceding `././@LongLink` entry rather than the
+    /// header, so this is where reading the path after `unpack_in` would break
+    /// if the long name were consumed by unpacking.
+    #[test]
+    fn long_entry_path_readable_after_unpack() {
+        let long_dir = "d".repeat(60);
+        let path = format!("{long_dir}/{long_dir}/file.txt");
+        assert!(path.len() > 100, "path must exceed the tar name field");
+
+        let tar = build_safe_tar(&[(path.as_str(), None, b"world")]);
+        let dest = dest_dir();
+        let mut archive = tar::Archive::new(&tar[..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        assert!(entry.unpack_in(dest.path()).unwrap());
+        assert_eq!(entry_path_string(&entry), path);
+    }
+
     #[test]
     fn benign_gz_tar_succeeds() {
         let tar = gz_compress(&build_safe_tar(&[("hello.txt", None, b"world")]));

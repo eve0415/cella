@@ -459,6 +459,44 @@ mod tests {
         assert!(!match_path(&parts, "/api/users/update"));
     }
 
+    /// `match_segments_with_doublestar` short-circuits to `match_segments`
+    /// when a pattern has no `**`. That is only sound if the two agree on
+    /// every such pattern, so check them against each other directly rather
+    /// than trusting a handful of spot cases.
+    #[test]
+    fn doublestar_free_patterns_agree_with_positional_matching() {
+        let patterns = ["/api", "/api/*", "/*", "/*/*", "/a/*/c", ""];
+        let paths = [
+            "",
+            "/",
+            "/api",
+            "/api/",
+            "/api/users",
+            "/api/users/123",
+            "/a/b/c",
+            "/a/b",
+            "/x",
+        ];
+
+        for pattern in patterns {
+            let parts = parse_path_pattern(pattern);
+            assert!(
+                !parts.contains(&PatternPart::DoubleStar),
+                "fixture must stay `**`-free: {pattern}"
+            );
+            for path in paths {
+                let segments = split_path(path);
+                let mut visited = std::collections::HashSet::new();
+                let recursive = match_recursive(&parts, &segments, 0, 0, &mut visited);
+                assert_eq!(
+                    match_segments(&parts, &segments),
+                    recursive,
+                    "pattern {pattern:?} vs path {path:?}"
+                );
+            }
+        }
+    }
+
     // --- Rule evaluation ---
 
     #[test]
