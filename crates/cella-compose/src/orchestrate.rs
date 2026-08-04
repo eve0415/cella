@@ -1392,12 +1392,13 @@ async fn build_override_and_start(
 
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     cella_tool_install::ensure_tool_config_paths(&settings);
-    // Container env is immutable after create, so the claude.json sync opt-in
-    // must be baked into the compose override here (mirrors the single-container
+    // Container env is immutable after create, so the config sync opt-in must
+    // be baked into the compose override here (mirrors the single-container
     // `apply_env_and_mounts` injection).
     extra_env.extend(cella_tool_install::tool_config_env_vars(
         &settings,
         remote_user,
+        Some((project.workspace_folder.as_str(), cfg.workspace_root)),
     ));
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 

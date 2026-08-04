@@ -305,6 +305,7 @@ version = "0.7.0"
 dependencies = [
  "base64 0.23.0",
  "bytes",
+ "cella-env",
  "cella-filesync",
  "cella-network",
  "cella-port",
@@ -563,6 +564,7 @@ name = "cella-env"
 version = "0.7.0"
 dependencies = [
  "cella-network",
+ "cella-protocol",
  "clap",
  "miette",
  "serde_json",

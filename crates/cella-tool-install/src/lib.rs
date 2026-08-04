@@ -1089,16 +1089,19 @@ pub fn build_tool_config_seed_files(
 /// must watch/write so it always matches the seeded path — even when the agent
 /// daemon runs as a different user than `remote_user` (so `$HOME` would differ).
 /// When plugin manifests are forwarded, `CELLA_PLUGINS_DIR` similarly pins the
-/// container path and `CELLA_HOST_HOME` provides the reverse-rewrite target.
+/// container path and `CELLA_HOST_HOME` provides the reverse-rewrite target;
+/// `CELLA_CONTAINER_WORKSPACE`/`CELLA_HOST_WORKSPACE` pin the workspace pair the
+/// agent needs to translate `projectPath`.
 /// Container env is immutable after create, so this is injected at create time
 /// on both the single-container and compose paths.
 #[must_use]
 pub fn tool_config_env_vars(
     settings: &cella_config::CellaConfig,
     remote_user: &str,
+    workspace: Option<(&str, &std::path::Path)>,
 ) -> Vec<String> {
     let host_plugins = cella_env::claude_code::host_plugins_dir();
-    tool_config_env_vars_in(settings, remote_user, host_plugins.as_deref())
+    tool_config_env_vars_in(settings, remote_user, host_plugins.as_deref(), workspace)
 }
 
 /// Inner form of [`tool_config_env_vars`] taking the host plugins directory
@@ -1113,6 +1116,7 @@ fn tool_config_env_vars_in(
     settings: &cella_config::CellaConfig,
     remote_user: &str,
     host_plugins: Option<&std::path::Path>,
+    workspace: Option<(&str, &std::path::Path)>,
 ) -> Vec<String> {
     let mut env = Vec::new();
     if settings.tools.claude_code.forward_config {
@@ -1129,6 +1133,14 @@ fn tool_config_env_vars_in(
                 "CELLA_PLUGINS_DIR={container_home}/.claude/plugins"
             ));
             env.push(format!("CELLA_HOST_HOME={}", host_home.display()));
+        }
+        // The workspace pair lets the agent translate `projectPath` in
+        // `installed_plugins.json`. Gated on both halves being known: a
+        // container whose workspace isn't bind-mounted from a host directory
+        // gets no mapping rather than a half-wrong one.
+        if let Some((container_workspace, host_workspace)) = workspace {
+            env.push(format!("CELLA_CONTAINER_WORKSPACE={container_workspace}"));
+            env.push(format!("CELLA_HOST_WORKSPACE={}", host_workspace.display()));
         }
     }
     env
@@ -1742,7 +1754,8 @@ mod tests {
             tool_config_env_vars_in(
                 &settings,
                 "vscode",
-                Some(Path::new("/Users/alice/.claude/plugins"))
+                Some(Path::new("/Users/alice/.claude/plugins")),
+                None,
             ),
             vec![
                 "CELLA_SYNC_CLAUDE_CONFIG=1".to_string(),
@@ -1762,6 +1775,7 @@ mod tests {
             &settings,
             "root",
             Some(Path::new("/Users/alice/.claude/plugins")),
+            None,
         );
         assert!(env.contains(&"CELLA_CLAUDE_JSON_PATH=/root/.claude.json".to_string()));
         assert!(env.contains(&"CELLA_PLUGINS_DIR=/root/.claude/plugins".to_string()));
@@ -1772,7 +1786,7 @@ mod tests {
     fn tool_config_env_vars_keeps_original_vars_without_plugins() {
         let settings = cella_config::CellaConfig::default();
         assert_eq!(
-            tool_config_env_vars_in(&settings, "vscode", None),
+            tool_config_env_vars_in(&settings, "vscode", None, None),
             vec![
                 "CELLA_SYNC_CLAUDE_CONFIG=1".to_string(),
                 "CELLA_CLAUDE_JSON_PATH=/home/vscode/.claude.json".to_string(),
@@ -1788,9 +1802,37 @@ mod tests {
             tool_config_env_vars_in(
                 &settings,
                 "vscode",
-                Some(Path::new("/Users/alice/.claude/plugins"))
+                Some(Path::new("/Users/alice/.claude/plugins")),
+                None,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn tool_config_env_vars_pins_the_workspace_pair() {
+        let env = tool_config_env_vars_in(
+            &cella_config::CellaConfig::default(),
+            "vscode",
+            Some(Path::new("/Users/alice/.claude/plugins")),
+            Some(("/workspaces/cella", Path::new("/Users/alice/src/cella"))),
+        );
+        assert!(env.contains(&"CELLA_CONTAINER_WORKSPACE=/workspaces/cella".to_string()));
+        assert!(env.contains(&"CELLA_HOST_WORKSPACE=/Users/alice/src/cella".to_string()));
+    }
+
+    #[test]
+    fn tool_config_env_vars_omits_workspace_pair_when_unmapped() {
+        let env = tool_config_env_vars_in(
+            &cella_config::CellaConfig::default(),
+            "vscode",
+            Some(Path::new("/Users/alice/.claude/plugins")),
+            None,
+        );
+        assert!(!env.iter().any(|v| v.starts_with("CELLA_HOST_WORKSPACE")));
+        assert!(
+            !env.iter()
+                .any(|v| v.starts_with("CELLA_CONTAINER_WORKSPACE"))
         );
     }
 
