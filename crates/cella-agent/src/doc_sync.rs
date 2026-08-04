@@ -299,8 +299,8 @@ pub async fn derive_patch(
 ) -> Option<serde_json::Value> {
     let raw = tokio::fs::read_to_string(path).await.ok()?;
     let canonical = to_canonical(doc, &raw, map)?;
-    Some(cella_env::claude_code::diff_merge_patch(
-        baseline, &canonical,
+    Some(cella_env::claude_code::diff_documents(
+        doc, baseline, &canonical,
     ))
 }
 
@@ -480,7 +480,8 @@ where
         );
         return;
     };
-    let patch = cella_env::claude_code::diff_merge_patch(&*st.baseline.lock().await, &canonical);
+    let patch =
+        cella_env::claude_code::diff_documents(st.doc, &*st.baseline.lock().await, &canonical);
     if patch.as_object().is_some_and(serde_json::Map::is_empty) {
         // Reformatted but semantically identical; nothing to send.
         *st.last_hash.lock().await = hash;

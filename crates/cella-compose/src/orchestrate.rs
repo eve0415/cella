@@ -1399,12 +1399,27 @@ async fn build_override_and_start(
     // mapping — so the pair is resolved from the primary service's binds rather
     // than assumed to be `(workspace_folder, workspace_root)`. A volume-backed
     // workspace yields no pair, and `projectPath` is left untranslated.
-    let workspace_bind = crate::parse::workspace_bind_for_service(
-        &project.compose_files,
-        &project.primary_service,
-        &project.workspace_folder,
-    )
-    .unwrap_or_default();
+    // Resolved rather than parsed from the raw `-f` files, so file merging,
+    // `extends`, profiles and interpolation are already applied. A failure to
+    // resolve degrades to no mapping, exactly like a volume-backed workspace.
+    let workspace_bind = {
+        let (dp, dcp) = cfg.docker_binaries();
+        let resolver = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
+        match resolver.config().await {
+            Ok(resolved) => resolved
+                .services
+                .get(&project.primary_service)
+                .and_then(|svc| {
+                    crate::parse::workspace_bind_for_service(svc, &project.workspace_folder)
+                }),
+            Err(e) => {
+                debug!(
+                    "compose: cannot resolve the workspace bind ({e}); projectPath untranslated"
+                );
+                None
+            }
+        }
+    };
     extra_env.extend(cella_tool_install::tool_config_env_vars(
         &settings,
         remote_user,

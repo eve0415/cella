@@ -307,10 +307,7 @@ pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value
         return out;
     };
     for value in plugins.values_mut() {
-        let Some(entries) = value.as_array().filter(|e| !e.is_empty()) else {
-            // An empty array normalizes to `{}`, which denormalization cannot
-            // tell from an unrecognised empty object — leaving it alone keeps
-            // the on-disk schema stable, and there is nothing in it to merge.
+        let Some(entries) = value.as_array() else {
             continue;
         };
         let mut keyed = serde_json::Map::new();
@@ -332,10 +329,12 @@ pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value
 /// corrupted on the very next write.
 fn is_normalized_entry_map(value: &serde_json::Value) -> bool {
     value.as_object().is_some_and(|map| {
-        !map.is_empty()
-            && map
-                .iter()
-                .all(|(key, entry)| *key == entry_context_key(entry))
+        // An empty map is the normalized form of an empty entry array. Treating
+        // it as such is what lets a plugin losing its last context diff into
+        // per-context deletions rather than a whole-key one; the cost is that an
+        // unrecognised empty object also denormalizes to `[]`.
+        map.iter()
+            .all(|(key, entry)| *key == entry_context_key(entry))
     })
 }
 
@@ -369,6 +368,50 @@ pub fn denormalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Val
         *value = serde_json::Value::Array(entries);
     }
     out
+}
+
+/// Diff two canonical documents into a merge patch, per document.
+///
+/// Identical to [`diff_merge_patch`] except for `InstalledPlugins`, where a
+/// plugin key disappearing entirely would otherwise become
+/// `plugins.<name> = null` — deleting every install context, including ones
+/// *other* containers added, which is exactly the independence normalization
+/// exists to provide. Such a deletion is expanded into one tombstone per context
+/// the old document held, so only this source's contexts are removed.
+#[must_use]
+pub fn diff_documents(
+    doc: SyncDoc,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> serde_json::Value {
+    let mut patch = diff_merge_patch(old, new);
+    if doc != SyncDoc::InstalledPlugins {
+        return patch;
+    }
+    let Some(old_plugins) = old.get("plugins").and_then(serde_json::Value::as_object) else {
+        return patch;
+    };
+    let Some(patch_plugins) = patch
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return patch;
+    };
+    for (name, entry_patch) in patch_plugins.iter_mut() {
+        if !entry_patch.is_null() {
+            continue;
+        }
+        let Some(contexts) = old_plugins.get(name).and_then(serde_json::Value::as_object) else {
+            continue; // not a context map — leave the wholesale deletion alone
+        };
+        *entry_patch = serde_json::Value::Object(
+            contexts
+                .keys()
+                .map(|ctx| (ctx.clone(), serde_json::Value::Null))
+                .collect(),
+        );
+    }
+    patch
 }
 
 /// On-disk content → canonical (host-shaped, normalized) form.
@@ -846,16 +889,16 @@ mod tests {
         );
     }
 
-    /// An empty entry array must survive the round trip as an array: normalized
-    /// it would be `{}`, indistinguishable from an unrecognised empty object.
+    /// An empty entry array normalizes to an empty context map — that is what
+    /// lets a plugin losing its last context diff into per-context tombstones
+    /// rather than a whole-key deletion — and must denormalize back to `[]` so
+    /// the on-disk schema is unchanged.
     #[test]
-    fn empty_entry_arrays_survive_the_round_trip() {
+    fn empty_entry_arrays_round_trip_through_an_empty_context_map() {
         let doc = json!({ "version": 2, "plugins": { "p@m": [] } });
-        assert_eq!(normalize_installed_plugins(&doc), doc);
-        assert_eq!(
-            denormalize_installed_plugins(&normalize_installed_plugins(&doc)),
-            doc
-        );
+        let normalized = normalize_installed_plugins(&doc);
+        assert_eq!(normalized["plugins"]["p@m"], json!({}));
+        assert_eq!(denormalize_installed_plugins(&normalized), doc);
     }
 
     /// Normalization passes an unrecognised `plugins` value through for forward
@@ -943,5 +986,84 @@ mod tests {
     fn repair_is_a_noop_for_already_host_shaped_paths() {
         let doc = json!({ "p": [{ "installPath": "/Users/alice/.claude/plugins/cache/p" }] });
         assert_eq!(repair_claude_home(&doc, "/Users/alice/.claude"), doc);
+    }
+
+    // ── diff_documents ──────────────────────────────────────────────────────
+
+    /// The independence normalization exists for must survive a *deletion*: a
+    /// container removing its own install context must not take a peer's with
+    /// it. A generic diff emits `plugins.<name> = null`, which does exactly that.
+    #[test]
+    fn deleting_a_plugin_emits_per_context_tombstones() {
+        let baseline = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        // Claude Code drops the key entirely once the last local context goes.
+        let after = normalize_installed_plugins(&json!({ "version": 2, "plugins": {} }));
+
+        let patch = diff_documents(SyncDoc::InstalledPlugins, &baseline, &after);
+        assert_eq!(
+            patch["plugins"]["p@m"],
+            json!({ "user": null, "project:/w/a": null }),
+            "the deletion must be expressed per context, not as a whole-key null"
+        );
+
+        // A peer added a context while this container was offline; it survives.
+        let canonical = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/peer", "version": "2.0" }
+            ]}
+        }));
+        let merged = apply_merge_patch(&canonical, &patch);
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/peer"]["version"],
+            json!("2.0"),
+            "a peer's context must survive another container's deletion"
+        );
+        assert!(merged["plugins"]["p@m"]["user"].is_null());
+    }
+
+    /// Claude Code may instead leave the key present with an empty list.
+    #[test]
+    fn emptying_a_plugin_entry_list_also_tombstones_per_context() {
+        let baseline = normalize_installed_plugins(&json!({
+            "plugins": { "p@m": [{ "scope": "user", "version": "1.0" }] }
+        }));
+        let after = normalize_installed_plugins(&json!({ "plugins": { "p@m": [] } }));
+        let patch = diff_documents(SyncDoc::InstalledPlugins, &baseline, &after);
+
+        let canonical = normalize_installed_plugins(&json!({
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/peer", "version": "2.0" }
+            ]}
+        }));
+        let merged = apply_merge_patch(&canonical, &patch);
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/peer"]["version"],
+            json!("2.0"),
+            "an emptied entry list must not wipe a peer's context"
+        );
+    }
+
+    #[test]
+    fn diff_documents_is_the_plain_diff_for_other_documents() {
+        let old = json!({ "a": 1, "b": 2 });
+        let new = json!({ "a": 1 });
+        assert_eq!(
+            diff_documents(SyncDoc::ClaudeJson, &old, &new),
+            diff_merge_patch(&old, &new)
+        );
+        assert_eq!(
+            diff_documents(SyncDoc::KnownMarketplaces, &old, &new),
+            diff_merge_patch(&old, &new)
+        );
     }
 }

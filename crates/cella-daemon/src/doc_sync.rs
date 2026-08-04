@@ -53,6 +53,10 @@ pub struct DocSyncState {
     /// SHA-256 of the raw bytes last written to / observed on the host file, so
     /// the daemon's own watcher event can be recognised and dropped.
     last_hash: String,
+    /// Set when a host write failed after canonical had already moved. Without
+    /// it the host stays stale indefinitely: `last_hash` still names the
+    /// unchanged file, so nothing schedules a retry.
+    host_dirty: bool,
 }
 
 impl DocSyncState {
@@ -75,6 +79,7 @@ impl DocSyncState {
             host_snapshot: canonical.clone(),
             canonical,
             last_hash,
+            host_dirty: false,
         }
     }
 
@@ -98,66 +103,97 @@ impl DocSyncState {
     }
 }
 
+/// Apply `mutate` to the canonical document and, in the *same* critical section,
+/// write the host file and record its hash and snapshot.
+///
+/// One transaction per document. With the mutation and the write in separate
+/// sections, two agents patching concurrently can serialize their canonical
+/// updates one way and their host writes the other: the older output lands last,
+/// leaving the host behind canonical while `last_hash` names the older bytes —
+/// which then suppresses the watcher event that would have repaired it, so the
+/// newer change is lost on the next daemon restart. Nothing here awaits, so
+/// holding the guard costs one file write.
+///
+/// Returns the canonical document for the wire, and whether it changed.
+async fn transact(
+    state: &Arc<Mutex<DocSyncState>>,
+    host_path: Option<&Path>,
+    mutate: impl FnOnce(&mut DocSyncState) -> bool,
+) -> (String, bool) {
+    let mut st = state.lock().await;
+    let changed = mutate(&mut st);
+    // `host_dirty` carries a previously failed write: canonical had already
+    // moved, so without it a transient error would leave the host stale forever
+    // — `last_hash` still names the unchanged file, so `ingest_host` returns
+    // early and nothing ever schedules the rewrite.
+    if let Some(path) = host_path
+        && (st.canonical != st.host_snapshot || st.host_dirty)
+    {
+        write_host(&mut st, path);
+    }
+    (st.wire_string(), changed)
+}
+
+/// Write the canonical document to the host file, recording its hash only on a
+/// successful write.
+///
+/// The recorded hash lets the self-triggered watcher event be recognised as the
+/// daemon's own write and dropped. Recording it only on success means a failed
+/// write never leaves the daemon believing stale content is on disk; the failure
+/// sets `host_dirty` so the next transaction retries.
+fn write_host(st: &mut DocSyncState, path: &Path) {
+    let out = st.on_disk_string();
+    match cella_filesync::atomic_write(path, out.as_bytes(), 0o600) {
+        Ok(()) => {
+            st.last_hash = cella_filesync::sha256_hex(out.as_bytes());
+            // The host file now equals `out`; record it as the host snapshot so a
+            // later host edit diffs against what's actually on disk.
+            st.host_snapshot = cella_env::claude_code::to_canonical(st.doc, &out, None)
+                .unwrap_or_else(|| serde_json::json!({}));
+            st.host_dirty = false;
+        }
+        Err(e) => {
+            warn!("doc sync: failed to write host {}: {e}", path.display());
+            st.host_dirty = true;
+        }
+    }
+}
+
 /// Handle a host-side change to a synced document detected by the watcher.
 ///
-/// Reads the file, drops the event if it is the daemon's own write, then diffs
-/// the host content against `host_snapshot` to derive a merge patch (including
-/// deletions) and applies it to the canonical document. Writes the merged result
-/// back when the host file is missing container-only keys, and broadcasts the
-/// new canonical to opted-in agents when it actually changed.
+/// Folds the host file into the canonical document and broadcasts the result to
+/// opted-in agents when it actually changed. The host file is rewritten in the
+/// same transaction when canonical still holds container-only keys it lacks.
 pub async fn on_host_change(
     state: &Arc<Mutex<DocSyncState>>,
     handles: &Handles,
     host_path: &Path,
     doc: SyncDoc,
 ) {
-    let Some((on_disk, wire, host_needs_update, canonical_changed)) =
-        ingest_host(state, host_path, doc).await
-    else {
-        return;
-    };
-
-    if host_needs_update {
-        write_host_guarded(state, host_path, &on_disk).await;
-    }
-
-    if canonical_changed {
+    let (wire, changed) =
+        transact(state, Some(host_path), |st| ingest_host(st, host_path, doc)).await;
+    if changed {
         broadcast(handles, doc, &wire).await;
     }
 }
 
-/// Fold whatever the host file currently holds into the canonical document.
+/// Fold whatever the host file currently holds into the canonical document,
+/// returning whether canonical changed.
 ///
-/// Shared by the host watcher and by [`on_agent_change`], which calls it first
-/// so an agent patch can never be written on top of a host edit the watcher has
-/// not debounced yet: that write would advance `last_hash` and the coalesced
-/// watcher event would then be discarded as the daemon's own write, silently
-/// dropping the host edit.
-///
-/// Returns `None` when there is nothing to do — the file is unreadable, its
-/// bytes are the daemon's own last write, or it is not valid JSON.
-async fn ingest_host(
-    state: &Arc<Mutex<DocSyncState>>,
-    host_path: &Path,
-    doc: SyncDoc,
-) -> Option<(String, String, bool, bool)> {
-    // The whole transaction — read, hash, parse, snapshot — runs under one
-    // guard, and the read happens *inside* it. The watcher and an agent can both
-    // reach this concurrently: with the read outside, one caller could pick up an
-    // older revision, lose the race to a caller holding a newer one, and then
-    // reacquire the lock and diff the snapshot back down to its stale version —
-    // which `last_hash` would then mask, because it already names the newer file.
-    // Nothing here awaits, so holding the guard costs a file read.
-    let mut st = state.lock().await;
-
+/// Called under the transaction guard, and also by [`on_agent_change`] before it
+/// applies a patch — so an agent patch is never written on top of a host edit
+/// the watcher has not debounced yet. That write would advance `last_hash`, and
+/// the coalesced watcher event would then be discarded as the daemon's own,
+/// silently dropping the host edit.
+fn ingest_host(st: &mut DocSyncState, host_path: &Path, doc: SyncDoc) -> bool {
     let Ok(raw) = std::fs::read(host_path) else {
         debug!("doc sync: host file unreadable (mid-rename?); waiting for next event");
-        return None;
+        return false;
     };
 
     let incoming_hash = cella_filesync::sha256_hex(&raw);
     if incoming_hash == st.last_hash {
-        return None; // our own write, or already processed
+        return false; // our own write, or already processed
     }
     st.last_hash = incoming_hash;
 
@@ -168,45 +204,15 @@ async fn ingest_host(
         // `last_hash` still advanced, so the same invalid bytes are not
         // re-parsed on every subsequent event.
         warn!("doc sync: host {doc:?} is not valid JSON; skipping");
-        return None;
+        return false;
     };
 
-    let patch = cella_env::claude_code::diff_merge_patch(&st.host_snapshot, &incoming);
+    let patch = cella_env::claude_code::diff_documents(doc, &st.host_snapshot, &incoming);
     let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
-    let canonical_changed = merged != st.canonical;
+    let changed = merged != st.canonical;
     st.canonical = merged;
-    // Canonical may still hold container-only keys the host file lacks; write
-    // them back so the host file converges to the union.
-    let host_needs_update = st.canonical != incoming;
     st.host_snapshot = incoming;
-    Some((
-        st.on_disk_string(),
-        st.wire_string(),
-        host_needs_update,
-        canonical_changed,
-    ))
-}
-
-/// Write `out` to the host file, recording its hash as `last_hash` only on a
-/// successful write. The recorded hash lets the self-triggered watcher event be
-/// recognised as the daemon's own write and dropped; the watcher debounce is far
-/// longer than a write+hash, so the hash is in place before the event arrives.
-/// Recording it only on success means a failed write never leaves the daemon
-/// believing stale content is on disk. Both write sites share this helper.
-async fn write_host_guarded(state: &Arc<Mutex<DocSyncState>>, path: &Path, out: &str) {
-    match cella_filesync::atomic_write(path, out.as_bytes(), 0o600) {
-        Ok(()) => {
-            let hash = cella_filesync::sha256_hex(out.as_bytes());
-            let mut st = state.lock().await;
-            let written = cella_env::claude_code::to_canonical(st.doc, out, None)
-                .unwrap_or_else(|| serde_json::json!({}));
-            st.last_hash = hash;
-            // The host file now equals `out`; record it as the host snapshot so a
-            // later host edit diffs against what's actually on disk.
-            st.host_snapshot = written;
-        }
-        Err(e) => warn!("doc sync: failed to write host {}: {e}", path.display()),
-    }
+    changed
 }
 
 /// Apply an agent's merge patch to the canonical document.
@@ -233,43 +239,22 @@ pub async fn on_agent_change(
         return;
     };
 
-    // Fold in any host edit the watcher has not debounced yet, so this patch is
-    // applied on top of the host's real current state rather than a stale
-    // in-memory canonical that would then be written over it.
-    //
-    // Its outcome must be carried forward, not dropped: `ingest_host` advances
-    // `last_hash`, which suppresses the watcher event that would otherwise have
-    // delivered that host edit. If this patch turns out to be a no-op, the host
-    // edit would then reach neither the peers nor the host file.
-    let ingested = match host_path {
-        Some(path) => ingest_host(state, path, doc).await,
-        None => None,
-    };
-    let host_rewrite_pending = ingested.as_ref().is_some_and(|(_, _, needs, _)| *needs);
-    let host_changed = ingested.is_some_and(|(_, _, _, changed)| changed);
-
-    let (on_disk, wire, patch_changed) = {
-        let mut st = state.lock().await;
+    let (wire, changed) = transact(state, host_path, |st| {
+        // Fold in any host edit the watcher has not debounced yet, so this patch
+        // lands on the host's real current state rather than a stale canonical.
+        let host_changed = host_path.is_some_and(|path| ingest_host(st, path, doc));
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
-        let changed = merged != st.canonical;
+        let patch_changed = merged != st.canonical;
         st.canonical = merged;
-        (st.on_disk_string(), st.wire_string(), changed)
-    };
+        host_changed || patch_changed
+    })
+    .await;
 
-    if !patch_changed && !host_changed {
-        // Nothing new for the peers, but the host file may still owe the
-        // canonical union, and the sender still gets canonical: its patch may
-        // have been empty because it is *behind*, not in sync.
-        if host_rewrite_pending && let Some(path) = host_path {
-            write_host_guarded(state, path, &on_disk).await;
-        }
+    if !changed {
+        // Nothing new for the peers, but the sender still gets canonical: its
+        // patch may have been empty because it is *behind*, not in sync.
         send_to(handles, sender, doc, &wire).await;
         return;
-    }
-    if let Some(path) = host_path
-        && (patch_changed || host_rewrite_pending)
-    {
-        write_host_guarded(state, path, &on_disk).await;
     }
     // Broadcast includes the sender — its own content hash drops the echo, and
     // the reply is what advances that agent's baseline.
@@ -334,6 +319,7 @@ mod tests {
             host_snapshot: json.clone(),
             canonical: json,
             last_hash: cella_filesync::sha256_hex(&bytes),
+            host_dirty: false,
         }))
     }
 
@@ -453,36 +439,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_host_guarded_keeps_hash_when_write_fails() {
+    async fn write_host_keeps_hash_and_marks_dirty_when_write_fails() {
         // On a write failure the hash must NOT advance — otherwise the daemon
         // believes the (never-written) content is the host's on-disk state, and
-        // a restart would re-seed from a stale file.
+        // a restart would re-seed from a stale file. `host_dirty` is what makes
+        // the next transaction retry instead of leaving the host stale forever.
         let state = state_from(json!({ "a": 1 }), SyncDoc::ClaudeJson);
         let before = state.lock().await.last_hash.clone();
         // A path whose parent directory does not exist makes atomic_write fail.
         let bad = Path::new("/nonexistent-cella-xyz/.claude.json");
-        write_host_guarded(&state, bad, r#"{"a":2}"#).await;
+        write_host(&mut *state.lock().await, bad);
+        let (last_hash, dirty) = {
+            let st = state.lock().await;
+            (st.last_hash.clone(), st.host_dirty)
+        };
         assert_eq!(
-            state.lock().await.last_hash,
-            before,
+            last_hash, before,
             "a failed host write must not advance last_hash"
         );
+        assert!(dirty, "a failed write must be marked for retry");
     }
 
     #[tokio::test]
-    async fn write_host_guarded_advances_hash_on_success() {
+    async fn write_host_advances_hash_on_success() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = dir.path().join(".claude.json");
         let state = state_from(json!({ "a": 1 }), SyncDoc::ClaudeJson);
-        write_host_guarded(&state, &host, r#"{"a":2}"#).await;
-        assert_eq!(
-            state.lock().await.last_hash,
-            cella_filesync::sha256_hex(br#"{"a":2}"#)
-        );
-        assert_eq!(
-            std::fs::read_to_string(&host).expect("read host"),
-            r#"{"a":2}"#
-        );
+        let expected = state.lock().await.on_disk_string();
+        write_host(&mut *state.lock().await, &host);
+        let (last_hash, dirty) = {
+            let st = state.lock().await;
+            (st.last_hash.clone(), st.host_dirty)
+        };
+        assert_eq!(last_hash, cella_filesync::sha256_hex(expected.as_bytes()));
+        assert!(!dirty);
+        assert_eq!(std::fs::read_to_string(&host).expect("read host"), expected);
+    }
+
+    /// A transient write failure must not strand the host file: canonical has
+    /// already moved, and `last_hash` still names the unchanged file, so nothing
+    /// else would ever schedule the rewrite.
+    #[tokio::test]
+    async fn a_failed_host_write_is_retried_on_the_next_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        let state = state_from(json!({}), SyncDoc::KnownMarketplaces);
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+
+        // First patch: the parent directory does not exist yet, so the write fails.
+        let missing = dir.path().join("gone").join("known_marketplaces.json");
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&missing),
+            SyncDoc::KnownMarketplaces,
+            r#"{"a":{"lastUpdated":"1"}}"#,
+            "cella-a",
+        )
+        .await;
+        assert!(state.lock().await.host_dirty, "precondition: write failed");
+
+        // A later transaction against a writable path must flush it.
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            "{}",
+            "cella-a",
+        )
+        .await;
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&host).expect("read host")).expect("valid json");
+        assert_eq!(written["a"]["lastUpdated"], json!("1"));
+        assert!(!state.lock().await.host_dirty);
     }
 
     #[tokio::test]
