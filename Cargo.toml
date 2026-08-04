@@ -206,6 +206,13 @@ strip = true
 lto = true
 codegen-units = 1
 
+# Release codegen with symbols kept, for `perf record` and valgrind. Separate
+# from `release` so the shipped binary stays stripped.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
