@@ -196,22 +196,31 @@ Container paths are computed from the remote user: `/home/<user>` for regular us
 
 Instead, cella **uploads the host file into the container as a regular file** at create time (`upload_files`, chowned to the remote user, mode 0600). A regular file cannot ghost on host replace. `~/.claude.json` is seeded only if absent, since its ongoing updates are owned by the live-sync layer below; `~/.tmux.conf` is seeded once at create (read-mostly).
 
-#### `~/.claude.json` Bidirectional Live Sync
+#### Claude Code Document Live Sync
 
-For a *running* container, `~/.claude.json` stays in sync between host and every opted-in container via the cella daemon (opt-in mirrors `forward_config`; the orchestrator sets `CELLA_SYNC_CLAUDE_CONFIG=1` and pins `CELLA_CLAUDE_JSON_PATH` at create time):
+For a *running* container, three documents stay in sync between the host and every opted-in container via the cella daemon: `~/.claude.json` and the two plugin manifests, `~/.claude/plugins/installed_plugins.json` and `known_marketplaces.json`. One opt-in covers all three (it mirrors `forward_config`; the orchestrator sets `CELLA_SYNC_CLAUDE_CONFIG=1` and pins `CELLA_CLAUDE_JSON_PATH`, `CELLA_PLUGINS_DIR`, `CELLA_HOST_HOME`, `CELLA_CONTAINER_WORKSPACE`, and `CELLA_HOST_WORKSPACE` at create time).
 
-- The daemon (host-native) holds a canonical JSON value plus a per-source snapshot of the last content seen from the host and each container, watches the host `~/.claude.json`, and broadcasts changes to opted-in agents.
-- Each agent watches its container `~/.claude.json` and reports changes back; the daemon diffs each change against that source's snapshot to derive a merge-patch (capturing deletions), applies it to the canonical, writes the host file, and re-broadcasts to the *other* containers.
+- The daemon (host-native) runs **one merge hub per document**. Each hub holds the canonical value, a snapshot of what the host file last held, and a content hash. The daemon watches all three host files and is their **sole writer** — agents never write the host mount, so N containers can't race on one file.
+- Each agent watches its container copies. On a change it converts the file to canonical form, diffs that against a **baseline persisted in the container** (`/tmp/.cella/doc-sync/`), and sends only the resulting RFC 7386 merge patch. A key the container never touched is absent from the patch, so a container holding a stale copy cannot revert a peer's change.
+- The daemon applies the patch to canonical, writes the host file, and broadcasts canonical to every opted-in agent. Each agent converts canonical back to its own on-disk form and applies it atomically.
+- The baseline lives with the container rather than in the daemon precisely so it survives a daemon restart or a cella upgrade — the case the earlier daemon-side snapshot map could not handle.
 - Loop suppression: each side records the SHA-256 of the bytes it last wrote/observed and drops watcher events that match. Watchers watch the *parent directory* (filtered to the filename) so they survive atomic-replace, and all writes are atomic (temp + rename).
-- On (re)connect an agent re-announces its current config *before* it starts processing pushes; the daemon merges it and pushes the canonical back only when that agent is missing keys. This converges a reconnecting or briefly-disconnected container without a stale push clobbering local edits, and replaces the old unconditional push-on-connect.
-- Opt-in is enforced on **both** directions: the daemon only broadcasts to agents that advertised sync, and it only *ingests* a container's `ClaudeConfigChanged` if that container opted in. A container without config forwarding can neither read pushes nor write the host/peer config.
+- On (re)connect an agent re-announces one patch per document *before* it starts processing pushes; the daemon merges them and always replies with canonical, which is how a container that changed nothing while disconnected learns what it missed.
+- Opt-in is enforced on **both** directions: the daemon only broadcasts to agents that advertised sync, and it only *ingests* a container's `ConfigDocPatch` if that container opted in. A container without config forwarding can neither read pushes nor write any host document nor reach peers.
 
-**Merge semantics (RFC 7386).** Each change is diffed against the daemon's last-seen snapshot of that source into a JSON Merge Patch — an added or changed key carries its new value, a removed key becomes an explicit `null` — which is applied to the canonical config: objects merge key-by-key, `null` deletes, and a shared scalar is last-writer-wins. The `projects` map is path-namespaced — host keys (`/Users/...`) and container keys (`/workspaces/...`) are disjoint — so unrelated entries are preserved rather than thrashed by a whole-file overwrite.
+**Merge semantics (RFC 7386).** An agent's patch is applied to canonical directly; a host-side change (which has no agent to derive a patch) is diffed against the hub's host snapshot first. Objects merge key-by-key, `null` deletes, and a shared scalar is last-writer-wins. The host snapshot is deliberately distinct from canonical: canonical is the merged union and carries keys only some container ever had, so diffing a host edit against it would fabricate a deletion for each of them.
+
+**Path translation.** Claude Code string-prefix-matches `installPath` / `installLocation`, so each side's copy must carry paths literally correct for it. The agent rewrites `installPath`, `installLocation`, and `projectPath` on the *parsed value* — never the raw text, so a matching prefix inside an unrelated string can't be corrupted — using two bidirectional pairs (`{container_home}/.claude ↔ {host_home}/.claude` and `{container_workspace} ↔ {host_workspace}`), longest prefix first. Canonical is always host-shaped. `~/.claude.json` needs no translation: host `projects` keys (`/Users/…`) and container keys (`/workspaces/…`) are disjoint and merge additively.
+
+**Entry-array normalization.** RFC 7386 replaces arrays wholesale, so `installed_plugins.json` entry arrays are normalized in memory and on the wire into an object keyed by install context (`user`, `project:/path`, `local:/path`), making each context independently mergeable. The on-disk schema is unchanged — entries are denormalized back to a sorted array before every write.
 
 **Behavior & accepted trade-offs:**
 - **Propagation is effectively between `claude` runs, not mid-session.** Claude Code holds `~/.claude.json` in memory and rewrites it wholesale on change, so a sync write landing while a `claude` session is live is overwritten by that session's next save. (This was equally true of the old shared bind mount — not a regression.)
-- **Deletions propagate.** Removing a key (e.g. disabling an MCP server) on the host or in a container removes it from the canonical config and from every other container. The only thing a merge-patch can't represent is setting a key to an explicit JSON `null` (RFC 7386), which `~/.claude.json` does not use. One edge: the daemon's snapshots are in-memory, so after a daemon restart a container that reconnects still holding a key the host deleted during the downtime re-adds it (its re-announce diffs against an empty snapshot) — bounded by the same restart-loses-state limitation.
-- **`projects` accumulates** across the host and every container (keys are unioned), so the map grows with each environment's paths. Because every push carries the full canonical, any container can in principle delete another's `projects` entry — acceptable for the "one synced file" model.
+- **Deletions propagate.** Removing a key (e.g. disabling an MCP server) on the host or in a container removes it from the canonical document and from every other container. The only thing a merge-patch can't represent is setting a key to an explicit JSON `null` (RFC 7386), which none of these documents use.
+- **`projects` accumulates** across the host and every container (keys are unioned), so the map grows with each environment's paths.
+- **Concurrent edits to the *same* key are last-writer-wins.** Two containers refreshing the same marketplace within one debounce window resolve to whichever patch the daemon applies second; edits to *different* keys always merge.
+- **Edits made while the daemon is unreachable land only on reconnect.** The agent buffers rather than writing the host file directly — a direct-write fallback would reinstate the whole-file overwrite in a narrower window.
+- **A lost container baseline degrades safely.** If `/tmp/.cella/doc-sync/` is wiped mid-life (e.g. a base image mounting `/tmp` as tmpfs), the agent falls back to the file's current content. A merge patch only emits `null` for a key present in its base, so the worst case is a local edit that fails to propagate — never a peer's state being reverted.
 - **Container→host is unrestricted (accepted risk).** A container can write any key — including executable config (`mcpServers`, `hooks`, `apiKeyHelper`, `env`) — and it is merged into the host `~/.claude.json` and executed on the host the next time Claude Code starts. This is the intended feature (configure once, sync everywhere) under the assumption that you trust what runs in your own containers. Note that `postCreateCommand`, build scripts, and dependencies also execute in a container, so a not-fully-trusted workspace can reach the host this way; no key allowlist is applied.
 - **Legacy containers** created before this change keep the old (potentially ghosting) single-file mount; daemon pushes to them are best-effort no-ops until they are rebuilt. Migration is out of scope.
 
@@ -235,9 +244,9 @@ Claude Code has additional forwarding logic beyond the basic bind mount:
 **Plugin manifest handling**: The host `~/.claude/plugins/` directory receives special treatment:
 1. A hidden bind mount at `/tmp/.cella/host-plugins/` provides access to the host plugins directory.
 2. A tmpfs overlay shadows the `plugins/` subdirectory within the main `~/.claude/` bind mount.
-3. Plugin data directories (`cache/`, `data/`, `marketplaces/`) are symlinked from the tmpfs to the hidden host mount.
-4. Manifest files (`installed_plugins.json`, `known_marketplaces.json`) are copied with path rewriting -- a regex-based `sed` rewrites home paths from any previous container user to the current container user's path.
-5. At container creation, `CELLA_PLUGINS_DIR` and `CELLA_HOST_HOME` pin the rewrite paths. The agent watches both manifests and writes changes back to the host with container paths rewritten to the host home.
+3. Plugin data directories (`cache/`, `data/`, `marketplaces/`) are symlinked from the tmpfs to the hidden host mount — they stay live and shared.
+4. Manifest files (`installed_plugins.json`, `known_marketplaces.json`) are *seeded* at create time with a `sed` path rewrite, then kept live by the sync hub described under [Claude Code Document Live Sync](#claude-code-document-live-sync). They are the only entries that are copies rather than symlinks, because their absolute paths differ per container.
+5. `CELLA_PLUGINS_DIR`, `CELLA_HOST_HOME`, `CELLA_CONTAINER_WORKSPACE`, and `CELLA_HOST_WORKSPACE` pin the translation at create time (env is immutable afterwards). The agent sends merge patches; the daemon owns the host files.
 
 ### Custom Config Paths
 
@@ -459,9 +468,12 @@ Tool installation failures are non-fatal to `cella up` -- other tools and the co
 
 When a host config directory is absent and pre-creation fails, cella emits a warning diagnostic identifying the missing path and which tool is affected. The mount spec is omitted (the tool uses container-local defaults), but the user is informed rather than left guessing.
 
-## Robust Plugin Manifest Rewriting
+## Plugin Manifest Path Rewriting
 
-Plugin manifest path rewriting uses the container's actual home directory (resolved from `/etc/passwd` or `$HOME`) instead of heuristic regex patterns. The rewriter reads the source manifest, identifies home directory references, and substitutes the resolved container home path.
+Two mechanisms, at different points in a container's life:
+
+- **Create-time seed** — a regex `sed` normalizes any previous writer's home path (`/home/*/.claude`, `/Users/*/.claude`, `/root/.claude`) to this container's, so a manifest written by a container with a different remote user still resolves.
+- **Live sync** — once the agent is running, rewriting is field-targeted on the parsed JSON (`installPath`, `installLocation`, `projectPath`) using the pinned container/host path pairs, in both directions. This cannot corrupt an unrelated string the way a blanket text substitution can, and it is what keeps `projectPath` from leaking container paths onto the host.
 
 ### Custom Tool Definitions
 

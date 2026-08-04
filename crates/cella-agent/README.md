@@ -51,7 +51,7 @@ cella-agent credential <operation>           # Handle git credential request (ge
 | `cli` | CLI mode for in-container `cella` commands (when agent binary is symlinked as `cella`) |
 | `forward_proxy` | Forward proxy for localhost-bound applications |
 | `mitm` | MITM proxy for HTTPS interception and path-level blocking |
-| `plugin_sync` | Claude Code plugin manifest write-back and path rewriting |
+| `doc_sync` | Claude Code document sync — watches `~/.claude.json` and both plugin manifests, sends merge patches to the daemon, applies canonical pushes back |
 | `proxy_config` | Network proxy configuration parsing and rule matching |
 | `clipboard` | Bidirectional clipboard forwarding — intercepts xsel/xclip calls and relays copy/paste/clear to the host daemon |
 | `tunnel` | Reverse tunnel handler — responds to daemon `TunnelRequest` messages by connecting back and relaying to local services |
@@ -61,7 +61,7 @@ cella-agent credential <operation>           # Handle git credential request (ge
 
 ## Crate Dependencies
 
-**Depends on:** [cella-network](../cella-network), [cella-port](../cella-port), [cella-protocol](../cella-protocol)
+**Depends on:** [cella-env](../cella-env), [cella-filesync](../cella-filesync), [cella-network](../cella-network), [cella-port](../cella-port), [cella-protocol](../cella-protocol)
 
 **Depended on by:** none (standalone binary uploaded into containers)
 
@@ -80,9 +80,14 @@ The agent connects to the host daemon using environment variables set during con
 - `CELLA_DAEMON_TOKEN` — authentication token
 - `CELLA_CONTAINER_NAME` — container identifier
 
-Claude Code plugin manifest sync uses two additional create-time variables:
-- `CELLA_PLUGINS_DIR` — remote user's Claude Code plugin directory watched for manifest changes
-- `CELLA_HOST_HOME` — host home used when reverse-rewriting manifest paths
+Claude Code document sync uses these additional create-time variables:
+- `CELLA_SYNC_CLAUDE_CONFIG` — set to `1` to opt this container into sync (gates all three documents)
+- `CELLA_CLAUDE_JSON_PATH` — remote user's `~/.claude.json`, pinned because the agent daemon runs as root
+- `CELLA_PLUGINS_DIR` — remote user's Claude Code plugin directory holding both manifests
+- `CELLA_HOST_HOME` — host home, one half of the `.claude` path mapping
+- `CELLA_CONTAINER_WORKSPACE` / `CELLA_HOST_WORKSPACE` — the workspace pair used to translate `projectPath`; both must be present or neither is used
+
+Per-document baselines are persisted under `/tmp/.cella/doc-sync/` so a patch is derived against what this container last synced, not against an empty document.
 
 Log level is controlled via `CELLA_AGENT_LOG` (or `RUST_LOG`).
 
