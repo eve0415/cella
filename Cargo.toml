@@ -92,6 +92,7 @@ olpc-cjson = "=0.1.4"
 
 # Stream processing
 futures-util = "=0.3.33"
+bytes = "=1.12.1"
 
 # Terminal
 crossterm = { version = "=0.29.0", default-features = false }

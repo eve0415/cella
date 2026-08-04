@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
 cella-filesync.workspace = true
 cella-network.workspace = true
 cella-port.workspace = true
@@ -35,7 +36,12 @@ uuid.workspace = true
 tokio-stream.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "frame_payload"
+harness = false
 
 [lints]
 workspace = true
