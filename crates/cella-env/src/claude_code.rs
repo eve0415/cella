@@ -133,6 +133,94 @@ pub fn diff_merge_patch(old: &serde_json::Value, new: &serde_json::Value) -> ser
     serde_json::Value::Object(patch)
 }
 
+/// Manifest fields carrying an absolute filesystem path.
+///
+/// Rewriting is restricted to these rather than applied to the raw document text
+/// so a prefix appearing inside an unrelated string can never be corrupted.
+const PATH_FIELDS: &[&str] = &["installPath", "installLocation", "projectPath"];
+
+/// Bidirectional path mapping between one container's view and the host's.
+///
+/// Claude Code string-prefix-matches `installPath` / `installLocation`, so the
+/// manifest each side reads must carry paths literally correct for that side.
+/// `workspace` is `None` when the container's workspace is not bind-mounted from
+/// a host directory, in which case `projectPath` passes through.
+#[derive(Debug, Clone)]
+pub struct PathMap {
+    /// `({container_home}/.claude, {host_home}/.claude)`
+    pub claude: (String, String),
+    /// `({container_workspace}, {host_workspace})`
+    pub workspace: Option<(String, String)>,
+}
+
+/// Which way a rewrite runs.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    ToHost,
+    ToContainer,
+}
+
+impl PathMap {
+    /// Container-shaped document → host-shaped.
+    #[must_use]
+    pub fn to_host(&self, doc: &serde_json::Value) -> serde_json::Value {
+        self.rewritten(doc, Direction::ToHost)
+    }
+
+    /// Host-shaped document → container-shaped.
+    #[must_use]
+    pub fn to_container(&self, doc: &serde_json::Value) -> serde_json::Value {
+        self.rewritten(doc, Direction::ToContainer)
+    }
+
+    /// Apply the first matching prefix substitution to every [`PATH_FIELDS`]
+    /// value.
+    ///
+    /// Pairs are tried **longest prefix first**. The two mappings are disjoint on
+    /// a typical layout, but nothing guarantees it — a workspace living under the
+    /// `.claude` directory would otherwise match the shorter `.claude` pair and
+    /// be mangled, and the mangling is not symmetric, so
+    /// `to_container(to_host(x)) != x`. Longest-first makes the more specific
+    /// mapping win in both directions, which restores the inverse property.
+    fn rewritten(&self, doc: &serde_json::Value, direction: Direction) -> serde_json::Value {
+        let mut subs: Vec<(&str, &str)> = std::iter::once(&self.claude)
+            .chain(self.workspace.iter())
+            .map(|(container, host)| match direction {
+                Direction::ToHost => (container.as_str(), host.as_str()),
+                Direction::ToContainer => (host.as_str(), container.as_str()),
+            })
+            .collect();
+        subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let mut out = doc.clone();
+        rewrite_path_fields(&mut out, &subs);
+        out
+    }
+}
+
+/// Walk `value`, replacing a leading `from` with `to` in every path field.
+fn rewrite_path_fields(value: &mut serde_json::Value, subs: &[(&str, &str)]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if PATH_FIELDS.contains(&key.as_str())
+                    && let Some(text) = child.as_str()
+                    && let Some((from, to)) = subs.iter().find(|(from, _)| text.starts_with(from))
+                {
+                    *child = serde_json::Value::String(text.replacen(from, to, 1));
+                    continue;
+                }
+                rewrite_path_fields(child, subs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_path_fields(item, subs);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Key an `installed_plugins.json` entry by its install context.
 ///
 /// `scope` alone is ambiguous once a plugin is installed for more than one
@@ -142,10 +230,10 @@ fn entry_context_key(entry: &serde_json::Value) -> String {
         .get("scope")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("user");
-    match entry.get("projectPath").and_then(serde_json::Value::as_str) {
-        Some(path) => format!("{scope}:{path}"),
-        None => scope.to_string(),
-    }
+    entry
+        .get("projectPath")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| scope.to_string(), |path| format!("{scope}:{path}"))
 }
 
 /// Rewrite each `plugins[key]` entry array into an object keyed by install
@@ -461,5 +549,88 @@ mod tests {
     fn normalize_leaves_unexpected_shapes_untouched() {
         let doc = json!({ "version": 2, "plugins": { "p@m": "not-an-array" } });
         assert_eq!(normalize_installed_plugins(&doc), doc);
+    }
+
+    // ── PathMap ─────────────────────────────────────────────────────────────
+
+    fn test_map() -> PathMap {
+        PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: Some(("/workspaces/cella".into(), "/Users/alice/src/cella".into())),
+        }
+    }
+
+    #[test]
+    fn to_host_rewrites_install_and_project_paths() {
+        let doc = json!({ "plugins": { "p@m": [{
+            "installPath": "/home/vscode/.claude/plugins/cache/p",
+            "projectPath": "/workspaces/cella",
+            "version": "1.0"
+        }]}});
+        let out = test_map().to_host(&doc);
+        let e = &out["plugins"]["p@m"][0];
+        assert_eq!(
+            e["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(e["projectPath"], json!("/Users/alice/src/cella"));
+        assert_eq!(e["version"], json!("1.0"));
+    }
+
+    #[test]
+    fn to_container_is_the_inverse() {
+        let container =
+            json!({ "m": { "installLocation": "/home/vscode/.claude/plugins/marketplaces/m" }});
+        let host =
+            json!({ "m": { "installLocation": "/Users/alice/.claude/plugins/marketplaces/m" }});
+        let map = test_map();
+        assert_eq!(map.to_host(&container), host);
+        assert_eq!(map.to_container(&host), container);
+    }
+
+    /// A non-path field that happens to contain a matching substring must not be
+    /// rewritten — the reason this targets fields rather than raw text.
+    #[test]
+    fn non_path_fields_are_untouched() {
+        let doc = json!({ "note": "installed under /home/vscode/.claude/plugins" });
+        assert_eq!(test_map().to_host(&doc), doc);
+    }
+
+    /// Nothing guarantees the two mappings are disjoint. When the workspace sits
+    /// under the claude directory, the shorter `.claude` prefix must not win —
+    /// its rewrite is not symmetric, so first-match-wins would break the inverse.
+    #[test]
+    fn nested_workspace_still_roundtrips() {
+        let map = PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: Some((
+                "/home/vscode/.claude/work".into(),
+                "/Users/alice/.claude/work".into(),
+            )),
+        };
+        let doc = json!({ "p": [{
+            "projectPath": "/home/vscode/.claude/work/cella",
+            "installPath": "/home/vscode/.claude/plugins/cache/p"
+        }]});
+        let hosted = map.to_host(&doc);
+        assert_eq!(
+            hosted["p"][0]["projectPath"],
+            json!("/Users/alice/.claude/work/cella")
+        );
+        assert_eq!(
+            hosted["p"][0]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(map.to_container(&hosted), doc);
+    }
+
+    #[test]
+    fn unmapped_workspace_leaves_project_path_alone() {
+        let map = PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: None,
+        };
+        let doc = json!({ "p": [{ "projectPath": "/workspaces/other" }] });
+        assert_eq!(map.to_host(&doc), doc);
     }
 }
