@@ -40,6 +40,12 @@ use tracing::{debug, warn};
 use crate::reconnecting_client::ReconnectingClient;
 
 /// Debounce for coalescing rapid editor writes.
+///
+/// Shared by all three documents. The plugin manifests previously used 5s to
+/// limit whole-file pushes to the host; with patches there is nothing to limit —
+/// an unchanged document yields an empty patch that is never sent, and the
+/// content hash absorbs the agent's own writes — so one short interval keeps
+/// propagation prompt for every document.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Where each document's last successfully-synced baseline is persisted.
@@ -641,6 +647,56 @@ mod tests {
             None,
         );
         assert_eq!(*st.baseline.lock().await, json!({"a":{"lastUpdated":"1"}}));
+    }
+
+    /// A `projectPath` belonging to a *different* container's workspace matches
+    /// neither mapping. It must pass through untouched in both directions —
+    /// corrupting it would be worse than leaving it inert — and, crucially, an
+    /// entry this container never edits must not appear in its patch at all.
+    #[tokio::test]
+    async fn foreign_workspace_project_path_passes_through_and_is_not_pushed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = tmp.path().join("installed_plugins.json");
+        let seeded = r#"{"version":2,"plugins":{"p@m":[
+            {"scope":"project","projectPath":"/workspaces/other-repo","version":"1.0"},
+            {"scope":"user","version":"1.0"}
+        ]}}"#;
+        std::fs::write(&manifest, seeded).expect("seed");
+        let map = PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some((
+                "/workspaces/cella".to_string(),
+                "/Users/alice/src/cella".to_string(),
+            )),
+        };
+        let st = DocState::new(
+            SyncDoc::InstalledPlugins,
+            manifest.clone(),
+            Some(map.clone()),
+            &tmp.path().join("baselines"),
+        );
+
+        // The seed is the baseline, so a subsequent edit to the *user* entry
+        // alone must not carry the foreign project entry along.
+        std::fs::write(
+            &manifest,
+            r#"{"version":2,"plugins":{"p@m":[
+                {"scope":"project","projectPath":"/workspaces/other-repo","version":"1.0"},
+                {"scope":"user","version":"2.0"}
+            ]}}"#,
+        )
+        .expect("edit");
+        let patch = derive_patch(st.doc, &st.path, &*st.baseline.lock().await, Some(&map))
+            .await
+            .expect("patch derived");
+        assert_eq!(
+            patch,
+            json!({"plugins":{"p@m":{"user":{"version":"2.0"}}}}),
+            "an untouched foreign-workspace entry must not be pushed: {patch}"
+        );
     }
 
     #[tokio::test]
