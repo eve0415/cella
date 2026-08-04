@@ -184,7 +184,7 @@ async fn main() {
     // /dev/null. Without this call, every MITM'd HTTPS request silently
     // aborts. Install ring explicitly so the behaviour is deterministic
     // regardless of what other workspace crates enable.
-    if rustls::crypto::ring::default_provider()
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
     {
