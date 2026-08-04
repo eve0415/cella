@@ -8,10 +8,12 @@ license.workspace = true
 cella-backend.workspace = true
 cella-config.workspace = true
 cella-env.workspace = true
+cella-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

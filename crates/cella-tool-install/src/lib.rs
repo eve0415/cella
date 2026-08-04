@@ -15,6 +15,7 @@ use cella_backend::progress::{PhaseChildHandle, ProgressSender};
 use cella_backend::{
     BackendError, ContainerBackend, ExecOptions, ExecResult, FileToUpload, MountSpec,
 };
+use cella_protocol::SyncDoc;
 use tracing::{debug, warn};
 
 /// Probed user environment (e.g. from `userEnvProbe`).
@@ -776,14 +777,18 @@ pub async fn create_claude_home_symlink(
 
 /// Populate the tmpfs-backed `~/.claude/plugins/` directory.
 ///
-/// Creates symlinks for plugin content (cache/, data/, marketplaces/) pointing
-/// to the hidden host mount at `/tmp/.cella/host-plugins/`, and copies
-/// `installed_plugins.json` and `known_marketplaces.json` with path rewriting.
+/// Plugin content (`cache/`, `data/`, `marketplaces/`) is symlinked to the
+/// hidden host mount at `/tmp/.cella/host-plugins/` and stays shared. The two
+/// manifests cannot be symlinked — their absolute paths differ per container —
+/// so they are *computed on the host* through the same codec the live sync uses
+/// and uploaded.
 ///
-/// Uses regex-based sed to match ANY home path + `/.claude` (Linux, macOS, root)
-/// and replace with the container user's path. This handles files written by
-/// previous containers with different users (e.g. `/home/node/.claude` ->
-/// `/home/vscode/.claude`).
+/// Computing them here rather than rewriting them in-container with `sed` is
+/// what makes the seed and the agent agree. A raw substitution rewrites any
+/// matching substring, so a workspace of `/src/app` also mangles a foreign
+/// entry for `/src/application` — which `PathMap` then rejects at the component
+/// boundary, letting the normalized diff push a spurious change to the host
+/// manifest — and it breaks outright on a path containing `&` or `|`.
 pub async fn setup_plugin_manifests(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -791,52 +796,24 @@ pub async fn setup_plugin_manifests(
 ) {
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
-    let host_plugins = "/tmp/.cella/host-plugins";
-    let target_claude = format!("{container_home}/.claude");
+    let host_plugins_mount = "/tmp/.cella/host-plugins";
 
-    // Regex sed: rewrite /home/USER/.claude, /Users/USER/.claude, /root/.claude
-    // to the container user's path. Handles any previous writer.
-    let sed_expr = format!(
-        concat!(
-            "s|/home/[^/\"]*/.claude|{t}|g; ",
-            "s|/Users/[^/\"]*/.claude|{t}|g; ",
-            "s|/root/.claude|{t}|g",
-        ),
-        t = target_claude,
-    );
-
-    // Symlink all items except the 2 manifest JSONs (which get copied + rewritten).
-    //
-    // The workspace substitution is read from the container's own environment
-    // rather than passed in, so the seed and the agent's `PathMap` are the same
-    // mapping by construction — and it is simply absent when the workspace has
-    // no host bind behind it. It covers `projectPath`, which no `.claude`
-    // pattern reaches; this seed runs *after* the agent starts, so a stale
-    // `projectPath` here would survive silently (canonicalizing it equals the
-    // host-shaped baseline, so no patch and no corrective reply is produced).
+    // Symlink everything except the two manifests.
     let script = format!(
         concat!(
             "[ -d \"{host}\" ] || exit 0; ",
-            "base='{sed}'; ws=''; ",
-            "if [ -n \"$CELLA_HOST_WORKSPACE\" ] && [ -n \"$CELLA_CONTAINER_WORKSPACE\" ]; then ",
-            "  ws=\"; s|$CELLA_HOST_WORKSPACE|$CELLA_CONTAINER_WORKSPACE|g\"; ",
-            "fi; ",
             "for item in \"{host}\"/* \"{host}\"/.*; do ",
             "  [ -e \"$item\" ] || continue; ",
             "  name=$(basename \"$item\"); ",
             "  case \"$name\" in ",
-            "    .|..) continue ;; ",
-            "    installed_plugins.json|known_marketplaces.json) ",
-            "      [ -f \"$item\" ] && sed -E \"$base$ws\" \"$item\" > \"{dir}/$name\" ;; ",
+            "    .|..|installed_plugins.json|known_marketplaces.json) continue ;; ",
             "    *) ln -sfn \"$item\" \"{dir}/$name\" ;; ",
             "  esac; ",
             "done",
         ),
-        host = host_plugins,
+        host = host_plugins_mount,
         dir = plugins_dir,
-        sed = sed_expr,
     );
-
     let _ = client
         .exec_command(
             container_id,
@@ -849,7 +826,94 @@ pub async fn setup_plugin_manifests(
         )
         .await;
 
+    upload_seeded_manifests(client, container_id, remote_user, &plugins_dir).await;
     chown_in_container(client, container_id, remote_user, &plugins_dir).await;
+}
+
+/// Compute both manifests for this container and upload them.
+async fn upload_seeded_manifests(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    plugins_dir: &str,
+) {
+    let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() else {
+        return;
+    };
+    let Some(host_claude) = cella_env::claude_code::host_claude_dir() else {
+        return;
+    };
+    let map = cella_env::claude_code::PathMap {
+        claude: (
+            cella_env::claude_code::claude_dir_for_user(remote_user),
+            host_claude.to_string_lossy().into_owned(),
+        ),
+        workspace: pinned_workspace_pair(client, container_id).await,
+    };
+
+    let files: Vec<FileToUpload> = [SyncDoc::InstalledPlugins, SyncDoc::KnownMarketplaces]
+        .into_iter()
+        .filter_map(|doc| {
+            let content = seeded_manifest(doc, &host_plugins, &map)?;
+            Some(FileToUpload {
+                path: format!("{plugins_dir}/{}", doc.file_name()),
+                content: content.into_bytes(),
+                mode: 0o600,
+            })
+        })
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    if let Err(e) = client.upload_files(container_id, &files).await {
+        warn!("Failed to seed plugin manifests: {e}");
+    }
+}
+
+/// One manifest, host file → this container's on-disk form.
+fn seeded_manifest(
+    doc: SyncDoc,
+    host_plugins: &std::path::Path,
+    map: &cella_env::claude_code::PathMap,
+) -> Option<String> {
+    let raw = std::fs::read_to_string(host_plugins.join(doc.file_name())).ok()?;
+    let canonical = cella_env::claude_code::to_canonical(doc, &raw, None)?;
+    // A manifest last written by a container running as a different user still
+    // carries that user's home; repair it to the host's before localizing.
+    let repaired = cella_env::claude_code::repair_claude_home(&canonical, &map.claude.1);
+    Some(cella_env::claude_code::to_local(doc, &repaired, Some(map)))
+}
+
+/// The workspace pair pinned into the container's environment at create time.
+///
+/// Read back from the container rather than recomputed, so the seed and the
+/// agent's `PathMap` are provably the same mapping. Absent when the workspace
+/// has no host bind behind it, in which case `projectPath` is left alone.
+async fn pinned_workspace_pair(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+) -> Option<(String, String)> {
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '%s\\n%s\\n' \"$CELLA_CONTAINER_WORKSPACE\" \"$CELLA_HOST_WORKSPACE\""
+                        .into(),
+                ],
+                user: None,
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()?;
+    let mut lines = result.stdout.lines();
+    let container = lines.next()?.trim();
+    let host = lines.next()?.trim();
+    (!container.is_empty() && !host.is_empty()).then(|| (container.to_string(), host.to_string()))
 }
 
 // ── Tool config path pre-creation ────────────────────────────────────────────
@@ -3312,5 +3376,106 @@ mod tests {
         let backend = MockBackend::new(vec![]);
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &[]).await;
         assert!(backend.calls().is_empty());
+    }
+
+    // ── Plugin manifest seeding ────────────────────────────────────────────
+
+    fn seed_map() -> cella_env::claude_code::PathMap {
+        cella_env::claude_code::PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some((
+                "/workspaces/cella".to_string(),
+                "/Users/alice/src/cella".to_string(),
+            )),
+        }
+    }
+
+    /// The seed is now computed through the same codec the live sync uses, so a
+    /// container's copy carries paths literally correct for it — including
+    /// `projectPath`, which the old `sed` never touched.
+    #[test]
+    fn seeded_manifest_localizes_both_path_kinds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("installed_plugins.json"),
+            r#"{"version":2,"plugins":{"p@m":[
+                {"scope":"project","projectPath":"/Users/alice/src/cella",
+                 "installPath":"/Users/alice/.claude/plugins/cache/p"}
+            ]}}"#,
+        )
+        .expect("seed host");
+
+        let out = seeded_manifest(SyncDoc::InstalledPlugins, dir.path(), &seed_map())
+            .expect("manifest computed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let entry = &parsed["plugins"]["p@m"][0];
+        assert_eq!(
+            entry["installPath"],
+            serde_json::json!("/home/vscode/.claude/plugins/cache/p")
+        );
+        assert_eq!(
+            entry["projectPath"],
+            serde_json::json!("/workspaces/cella"),
+            "projectPath must be localized too"
+        );
+        assert!(
+            parsed["plugins"]["p@m"].is_array(),
+            "the on-disk entry-array schema must be preserved"
+        );
+    }
+
+    /// A workspace sharing a prefix with another must not be captured — the
+    /// concrete corruption the raw `sed` allowed.
+    #[test]
+    fn seeded_manifest_does_not_capture_a_sibling_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("installed_plugins.json"),
+            r#"{"version":2,"plugins":{"p@m":[
+                {"scope":"project","projectPath":"/Users/alice/src/cella-extra"}
+            ]}}"#,
+        )
+        .expect("seed host");
+
+        let out = seeded_manifest(SyncDoc::InstalledPlugins, dir.path(), &seed_map())
+            .expect("manifest computed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(
+            parsed["plugins"]["p@m"][0]["projectPath"],
+            serde_json::json!("/Users/alice/src/cella-extra"),
+            "a sibling workspace must be left alone"
+        );
+    }
+
+    /// A manifest last written by a container running as a different user must
+    /// be repaired to this host's home before being localized — what the old
+    /// `sed`'s `/home/*/.claude` pattern did.
+    #[test]
+    fn seeded_manifest_repairs_a_foreign_writers_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("known_marketplaces.json"),
+            r#"{"m":{"installLocation":"/home/node/.claude/plugins/marketplaces/m"}}"#,
+        )
+        .expect("seed host");
+
+        let out = seeded_manifest(SyncDoc::KnownMarketplaces, dir.path(), &seed_map())
+            .expect("manifest computed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(
+            parsed["m"]["installLocation"],
+            serde_json::json!("/home/vscode/.claude/plugins/marketplaces/m")
+        );
+    }
+
+    #[test]
+    fn seeded_manifest_skips_an_absent_or_invalid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(seeded_manifest(SyncDoc::InstalledPlugins, dir.path(), &seed_map()).is_none());
+        std::fs::write(dir.path().join("installed_plugins.json"), "{not json").expect("write");
+        assert!(seeded_manifest(SyncDoc::InstalledPlugins, dir.path(), &seed_map()).is_none());
     }
 }

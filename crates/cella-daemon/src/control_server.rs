@@ -47,6 +47,25 @@ pub(crate) struct ControlContext {
     pub doc_sync: HashMap<SyncDoc, DocSyncHub>,
 }
 
+/// The host `~/.claude/plugins` directory, creating it when `~/.claude` exists.
+///
+/// Returns `None` when the host has no `~/.claude` at all (Claude Code was never
+/// run there) or the directory cannot be created — in both cases there is
+/// nothing to sync and no hub is built.
+fn ensure_host_plugins_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = cella_env::claude_code::host_plugins_dir() {
+        return Some(dir);
+    }
+    let dir = cella_env::claude_code::host_claude_dir()?.join("plugins");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            warn!("doc sync: cannot create {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
 /// One document's merge hub plus the host file it owns.
 #[derive(Clone)]
 pub struct DocSyncHub {
@@ -56,12 +75,17 @@ pub struct DocSyncHub {
 
 /// Build the per-document hubs from the host paths that resolve.
 ///
-/// The plugin hubs exist only when `host_plugins_dir()` does — the same
-/// condition that gates the hidden host mount and the create-time env vars, so
-/// hubs, mounts, and env never disagree.
+/// The plugin hubs need `~/.claude/plugins` to exist, because the manifest
+/// watchers watch that directory. It is created here when the host has
+/// `~/.claude` but not yet the subdirectory: hubs are built once, at startup, so
+/// a daemon that started before the directory appeared would otherwise drop
+/// every manifest patch — with no host watcher — until it was restarted.
+///
+/// Creating it also keeps hubs, the hidden host mount and the create-time env
+/// vars in agreement, since all three key off `host_plugins_dir()`.
 #[must_use]
 pub fn build_doc_sync_hubs() -> HashMap<SyncDoc, DocSyncHub> {
-    let plugins = cella_env::claude_code::host_plugins_dir();
+    let plugins = ensure_host_plugins_dir();
     let paths = [
         (
             SyncDoc::ClaudeJson,

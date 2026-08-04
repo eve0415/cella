@@ -213,27 +213,61 @@ fn is_path_prefix(text: &str, prefix: &str) -> bool {
 
 /// Walk `value`, replacing a leading `from` with `to` in every path field.
 fn rewrite_path_fields(value: &mut serde_json::Value, subs: &[(&str, &str)]) {
+    map_path_fields(value, &|text| {
+        subs.iter()
+            .find(|(from, _)| is_path_prefix(text, from))
+            .map(|(from, to)| text.replacen(from, to, 1))
+    });
+}
+
+/// Walk `value`, applying `f` to every [`PATH_FIELDS`] string and replacing it
+/// when `f` returns `Some`.
+fn map_path_fields(value: &mut serde_json::Value, f: &impl Fn(&str) -> Option<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 if PATH_FIELDS.contains(&key.as_str())
                     && let Some(text) = child.as_str()
-                    && let Some((from, to)) =
-                        subs.iter().find(|(from, _)| is_path_prefix(text, from))
+                    && let Some(replacement) = f(text)
                 {
-                    *child = serde_json::Value::String(text.replacen(from, to, 1));
+                    *child = serde_json::Value::String(replacement);
                     continue;
                 }
-                rewrite_path_fields(child, subs);
+                map_path_fields(child, f);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                rewrite_path_fields(item, subs);
+                map_path_fields(item, f);
             }
         }
         _ => {}
     }
+}
+
+/// Rewrite *any* writer's `<home>/.claude` prefix in the path fields to
+/// `host_claude`.
+///
+/// The create-time seed used to do this with a `sed` matching `/home/*/.claude`,
+/// `/Users/*/.claude` and `/root/.claude`, because a manifest could have been
+/// written by a container running as a different user. Doing it on the parsed
+/// value instead is component-aware and cannot corrupt an unrelated string —
+/// and it belongs on the host side, where it repairs the canonical document
+/// rather than only the copy handed to one container.
+#[must_use]
+pub fn repair_claude_home(doc: &serde_json::Value, host_claude: &str) -> serde_json::Value {
+    let mut out = doc.clone();
+    map_path_fields(&mut out, &|text| {
+        let idx = text.find("/.claude")?;
+        let rest = &text[idx + "/.claude".len()..];
+        // Only a whole `.claude` component counts — never `.claude-backup`.
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return None;
+        }
+        let repaired = format!("{host_claude}{rest}");
+        (repaired != text).then_some(repaired)
+    });
+    out
 }
 
 /// Key an `installed_plugins.json` entry by its install context.
@@ -869,5 +903,45 @@ mod tests {
         assert_eq!(trim_trailing_slash("/"), "/");
         assert_eq!(trim_trailing_slash("/a/"), "/a");
         assert_eq!(trim_trailing_slash("/a"), "/a");
+    }
+
+    /// A manifest written by a container running as a different user carries
+    /// that user's home; the host copy must be repaired to the host's own.
+    #[test]
+    fn repair_rewrites_any_writers_claude_home() {
+        let doc = json!({ "plugins": { "p@m": [
+            { "installPath": "/home/node/.claude/plugins/cache/p" },
+            { "installPath": "/root/.claude/plugins/cache/q" },
+            { "installPath": "/Users/bob/.claude/plugins/cache/r" }
+        ]}});
+        let out = repair_claude_home(&doc, "/Users/alice/.claude");
+        let e = &out["plugins"]["p@m"];
+        assert_eq!(
+            e[0]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(
+            e[1]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/q")
+        );
+        assert_eq!(
+            e[2]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/r")
+        );
+    }
+
+    #[test]
+    fn repair_leaves_non_claude_and_partial_matches_alone() {
+        let doc = json!({ "p": [
+            { "projectPath": "/workspaces/cella" },
+            { "installPath": "/home/node/.claude-backup/x" }
+        ]});
+        assert_eq!(repair_claude_home(&doc, "/Users/alice/.claude"), doc);
+    }
+
+    #[test]
+    fn repair_is_a_noop_for_already_host_shaped_paths() {
+        let doc = json!({ "p": [{ "installPath": "/Users/alice/.claude/plugins/cache/p" }] });
+        assert_eq!(repair_claude_home(&doc, "/Users/alice/.claude"), doc);
     }
 }

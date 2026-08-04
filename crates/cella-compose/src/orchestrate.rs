@@ -1396,13 +1396,21 @@ async fn build_override_and_start(
     // be baked into the compose override here (mirrors the single-container
     // `apply_env_and_mounts` injection).
     // Compose ignores `workspaceMount` — the service's own volumes define the
-    // mapping — so the pair is taken from the project's workspace folder and
-    // root. A service that mounts the workspace somewhere else gets a pair that
-    // doesn't match, and `projectPath` translation is wrong for it.
+    // mapping — so the pair is resolved from the primary service's binds rather
+    // than assumed to be `(workspace_folder, workspace_root)`. A volume-backed
+    // workspace yields no pair, and `projectPath` is left untranslated.
+    let workspace_bind = crate::parse::workspace_bind_for_service(
+        &project.compose_files,
+        &project.primary_service,
+        &project.workspace_folder,
+    )
+    .unwrap_or_default();
     extra_env.extend(cella_tool_install::tool_config_env_vars(
         &settings,
         remote_user,
-        Some((project.workspace_folder.as_str(), cfg.workspace_root)),
+        workspace_bind
+            .as_ref()
+            .map(|(target, source)| (target.as_str(), Path::new(source.as_str()))),
     ));
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
