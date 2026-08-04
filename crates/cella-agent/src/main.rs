@@ -10,18 +10,17 @@
 //! worktree management commands that delegate to the host daemon.
 
 mod browser;
-mod claude_config_sync;
 mod cli;
 mod clipboard;
 mod control;
 mod credential;
 mod credential_mux;
 mod credential_tunnel;
+mod doc_sync;
 mod forward_proxy;
 #[cfg(test)]
 mod integration_tests;
 mod mitm;
-mod plugin_sync;
 mod port_proxy;
 mod port_watcher;
 mod proxy_config;
@@ -314,11 +313,12 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     };
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
-    // `~/.claude.json` bidirectional sync (opt-in via CELLA_SYNC_CLAUDE_CONFIG).
-    // The apply channel must exist before connecting so the control reader can
-    // forward daemon-pushed config to the writer task spawned below.
-    let (claude_apply_tx, claude_apply_rx) = if claude_config_sync::sync_enabled() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+    // Claude Code document sync (opt-in via CELLA_SYNC_CLAUDE_CONFIG): covers
+    // `~/.claude.json` and both plugin manifests. The apply channel must exist
+    // before connecting so the control reader can forward daemon-pushed
+    // documents to the writer task spawned below.
+    let (claude_apply_tx, claude_apply_rx) = if doc_sync::sync_enabled() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<doc_sync::ApplyMessage>(8);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -341,7 +341,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
 
     if let Some(apply_rx) = claude_apply_rx {
-        claude_config_sync::spawn(control.clone(), apply_rx);
+        doc_sync::spawn(&control, apply_rx);
     }
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = std::time::Instant::now();
@@ -375,9 +375,6 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
             }
         });
     }
-
-    // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
-    tokio::spawn(plugin_sync::run());
 
     // Spawn health reporter
     let ctrl = control.clone();
