@@ -9,7 +9,7 @@
 //!   `{ "<id>": { publishedTags, digest, version } }` for published features,
 //!   `{ "<id>": {} }` for features whose exact version was already present.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -203,7 +203,7 @@ async fn publish_one_feature(
     let archive_path = output_folder.join(&archive_name);
     let tgz_bytes = fs::read(&archive_path)?;
 
-    let mut layer_annotations = HashMap::new();
+    let mut layer_annotations = BTreeMap::new();
     layer_annotations.insert(
         "org.opencontainers.image.title".to_owned(),
         archive_name.clone(),
@@ -249,7 +249,7 @@ async fn publish_collection_index(
     let collection_path = output_folder.join("devcontainer-collection.json");
     let collection_bytes = fs::read(&collection_path)?;
 
-    let mut layer_annotations = HashMap::new();
+    let mut layer_annotations = BTreeMap::new();
     layer_annotations.insert(
         "org.opencontainers.image.title".to_owned(),
         "devcontainer-collection.json".to_owned(),
@@ -261,7 +261,7 @@ async fn publish_collection_index(
         annotations: Some(layer_annotations),
     };
 
-    let mut manifest_annotations = HashMap::new();
+    let mut manifest_annotations = BTreeMap::new();
 
     // The `dev.containers.metadata` annotation carries the full collection JSON
     // string so consumers (VS Code, other tooling) can read it from the manifest
@@ -368,8 +368,11 @@ fn is_new_global_max(version: &Version, existing_tags: &[String]) -> bool {
 // Annotation helpers
 // ---------------------------------------------------------------------------
 
-fn build_feature_annotations(feature: &PackagedFeature, registry: &str) -> HashMap<String, String> {
-    let mut annotations = HashMap::new();
+fn build_feature_annotations(
+    feature: &PackagedFeature,
+    registry: &str,
+) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::new();
 
     // `dev.containers.metadata` carries the full feature manifest JSON.
     let meta = Value::Object(feature.raw.clone());

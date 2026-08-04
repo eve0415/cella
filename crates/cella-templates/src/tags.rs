@@ -4,8 +4,8 @@
 //! (e.g. `4.0.6-22-trixie`) rather than using the template's default
 //! tag pattern.
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol};
 use tracing::debug;
 
 use crate::cache::TemplateCache;
@@ -198,7 +198,7 @@ pub async fn fetch_image_tags(
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     };
-    let client = oci_distribution::Client::new(config);
+    let client = oci_client::Client::new(config);
 
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
     let auth = build_registry_auth(&registry);

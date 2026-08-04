@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use oci_distribution::manifest::OciImageManifest;
+use oci_client::manifest::OciImageManifest;
 use sha2::{Digest, Sha256};
 
 /// On-disk feature cache rooted at a platform-appropriate location.
@@ -553,7 +553,7 @@ mod tests {
 
     /// Build a minimal `OciImageManifest` for testing.
     fn make_test_manifest() -> OciImageManifest {
-        use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
+        use oci_client::manifest::{OciDescriptor, OciImageManifest};
         OciImageManifest {
             schema_version: 2,
             media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),

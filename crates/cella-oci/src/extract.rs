@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use oci_distribution::manifest::{
+use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
 use thiserror::Error;
@@ -337,7 +337,7 @@ mod tests {
 
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use oci_distribution::manifest::IMAGE_LAYER_MEDIA_TYPE;
+    use oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE;
     use tempfile::TempDir;
 
     use super::*;

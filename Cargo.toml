@@ -120,7 +120,9 @@ fs4 = "=1.1.0"
 flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] }
 
 # OCI registry
-oci-distribution = { version = "=0.11.0", default-features = false, features = ["rustls-tls"] }
+# Renamed successor of oci-distribution (oras-project/rust-oci-client).
+# default-features would also pull in `test-registry`, which is test scaffolding.
+oci-client = { version = "=0.17.0", default-features = false, features = ["rustls-tls"] }
 
 # Shell word splitting (POSIX-style; mirrors the official CLI's shellQuote.parse
 # when reading a compose service entrypoint/command given as a string)

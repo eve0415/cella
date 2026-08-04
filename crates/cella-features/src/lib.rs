@@ -142,7 +142,7 @@ struct FeatureEntry {
     oci: Option<OciLockInfo>,
     /// The full OCI image manifest, present only for OCI-fetched features.
     /// Retained for `read-configuration --include-features-configuration`.
-    oci_manifest: Option<oci_distribution::manifest::OciImageManifest>,
+    oci_manifest: Option<oci_client::manifest::OciImageManifest>,
 }
 
 /// Build the unique install identity for a feature instance.
@@ -483,7 +483,7 @@ impl FetchResult {
     /// The full OCI image manifest, if this fetch came from an OCI registry —
     /// retained for `read-configuration --include-features-configuration`
     /// (`featureSets[].sourceInformation.manifest`).
-    fn oci_manifest(&self) -> Option<oci_distribution::manifest::OciImageManifest> {
+    fn oci_manifest(&self) -> Option<oci_client::manifest::OciImageManifest> {
         match self {
             Self::Oci(r) => Some(r.manifest.clone()),
             Self::Other(_) => None,

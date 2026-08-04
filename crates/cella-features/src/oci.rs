@@ -6,9 +6,9 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::secrets::RegistryAuth;
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol};
+use oci_client::secrets::RegistryAuth;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -41,12 +41,12 @@ pub trait FeatureFetcher: Send + Sync {
 
 /// Fetches devcontainer features from OCI registries.
 ///
-/// Wraps [`oci_distribution::Client`] and implements the [`FeatureFetcher`]
+/// Wraps [`oci_client::Client`] and implements the [`FeatureFetcher`]
 /// trait.  Handles authentication, manifest resolution (both OCI and Docker
 /// manifest media types), layer download, gzip extraction, and atomic cache
 /// commits.
 pub struct OciFetcher {
-    client: oci_distribution::Client,
+    client: oci_client::Client,
 }
 
 impl OciFetcher {
@@ -57,7 +57,7 @@ impl OciFetcher {
             ..ClientConfig::default()
         };
         Self {
-            client: oci_distribution::Client::new(config),
+            client: oci_client::Client::new(config),
         }
     }
 }
@@ -86,16 +86,16 @@ pub struct OciFetchResult {
     /// `manifest-<hash>.json` sidecar written during the original fetch; on a
     /// miss it is stored there immediately after pulling.  If the sidecar is
     /// absent (pre-existing cache entry), the manifest is re-pulled once.
-    pub manifest: oci_distribution::manifest::OciImageManifest,
+    pub manifest: oci_client::manifest::OciImageManifest,
 }
 
 /// Find the first extractable layer in a manifest, or return an error listing available types.
 fn find_feature_layer<'a>(
-    manifest: &'a oci_distribution::manifest::OciImageManifest,
+    manifest: &'a oci_client::manifest::OciImageManifest,
     registry: &str,
     repository: &str,
     tag: &str,
-) -> Result<&'a oci_distribution::manifest::OciDescriptor, FeatureError> {
+) -> Result<&'a oci_client::manifest::OciDescriptor, FeatureError> {
     manifest
         .layers
         .iter()
@@ -179,7 +179,7 @@ impl OciFetcher {
         registry: &str,
         repository: &str,
         tag: &str,
-    ) -> Result<(oci_distribution::manifest::OciImageManifest, String), FeatureError> {
+    ) -> Result<(oci_client::manifest::OciImageManifest, String), FeatureError> {
         let (manifest, digest) = self
             .client
             .pull_image_manifest(oci_ref, auth)
@@ -200,7 +200,7 @@ impl OciFetcher {
     async fn pull_layer_blob(
         &self,
         oci_ref: &Reference,
-        layer: &oci_distribution::manifest::OciDescriptor,
+        layer: &oci_client::manifest::OciDescriptor,
         registry: &str,
     ) -> Result<Vec<u8>, FeatureError> {
         // Reject oversized blobs before downloading.

@@ -4,7 +4,7 @@
 //! `dev.containers.metadata` annotation, which contains the template's JSON
 //! metadata as a string-escaped JSON value.
 
-use oci_distribution::manifest::OciManifest;
+use oci_client::manifest::OciManifest;
 use tracing::debug;
 
 use crate::error::TemplateError;
@@ -89,7 +89,7 @@ fn extract_metadata_annotation(manifest: &OciManifest) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use oci_distribution::manifest::{OciImageManifest, OciManifest};
+    use oci_client::manifest::{OciImageManifest, OciManifest};
 
     use super::*;
 

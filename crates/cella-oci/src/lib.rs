@@ -15,7 +15,7 @@ pub use limits::{
 };
 pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
 
-use oci_distribution::secrets::RegistryAuth;
+use oci_client::secrets::RegistryAuth;
 use tracing::debug;
 
 /// Build [`RegistryAuth`] from Docker credential store for the given registry.
