@@ -354,8 +354,16 @@ impl EnsureUpContext<'_> {
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
-            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
-                .await;
+            crate::tool_install::setup_plugin_manifests(
+                self.client,
+                container_id,
+                remote_user,
+                Some((
+                    self.workspace_folder_str(),
+                    &self.config.resolved.workspace_root,
+                )),
+            )
+            .await;
         }
 
         let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
@@ -1433,8 +1441,16 @@ impl EnsureUpContext<'_> {
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
-            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
-                .await;
+            crate::tool_install::setup_plugin_manifests(
+                self.client,
+                container_id,
+                remote_user,
+                Some((
+                    self.workspace_folder_str(),
+                    &self.config.resolved.workspace_root,
+                )),
+            )
+            .await;
         }
 
         // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular

@@ -111,44 +111,10 @@ pub async fn on_host_change(
     host_path: &Path,
     doc: SyncDoc,
 ) {
-    let Ok(raw) = std::fs::read(host_path) else {
-        debug!("doc sync: host file unreadable (mid-rename?); waiting for next event");
-        return;
-    };
-
-    let incoming_hash = cella_filesync::sha256_hex(&raw);
-    {
-        let mut st = state.lock().await;
-        if incoming_hash == st.last_hash {
-            return; // our own write, or already processed
-        }
-        st.last_hash = incoming_hash;
-    }
-
-    let Some(incoming) = std::str::from_utf8(&raw)
-        .ok()
-        .and_then(|s| cella_env::claude_code::to_canonical(doc, s, None))
+    let Some((on_disk, wire, host_needs_update, canonical_changed)) =
+        ingest_host(state, host_path, doc).await
     else {
-        warn!("doc sync: host {doc:?} is not valid JSON; skipping");
         return;
-    };
-
-    let (on_disk, wire, host_needs_update, canonical_changed) = {
-        let mut st = state.lock().await;
-        let patch = cella_env::claude_code::diff_merge_patch(&st.host_snapshot, &incoming);
-        let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
-        let canonical_changed = merged != st.canonical;
-        st.canonical = merged;
-        // Canonical may still hold container-only keys the host file lacks; write
-        // them back so the host file converges to the union.
-        let host_needs_update = st.canonical != incoming;
-        st.host_snapshot = incoming;
-        (
-            st.on_disk_string(),
-            st.wire_string(),
-            host_needs_update,
-            canonical_changed,
-        )
     };
 
     if host_needs_update {
@@ -158,6 +124,60 @@ pub async fn on_host_change(
     if canonical_changed {
         broadcast(handles, doc, &wire).await;
     }
+}
+
+/// Fold whatever the host file currently holds into the canonical document.
+///
+/// Shared by the host watcher and by [`on_agent_change`], which calls it first
+/// so an agent patch can never be written on top of a host edit the watcher has
+/// not debounced yet: that write would advance `last_hash` and the coalesced
+/// watcher event would then be discarded as the daemon's own write, silently
+/// dropping the host edit.
+///
+/// Returns `None` when there is nothing to do — the file is unreadable, its
+/// bytes are the daemon's own last write, or it is not valid JSON.
+async fn ingest_host(
+    state: &Arc<Mutex<DocSyncState>>,
+    host_path: &Path,
+    doc: SyncDoc,
+) -> Option<(String, String, bool, bool)> {
+    let Ok(raw) = std::fs::read(host_path) else {
+        debug!("doc sync: host file unreadable (mid-rename?); waiting for next event");
+        return None;
+    };
+
+    let incoming_hash = cella_filesync::sha256_hex(&raw);
+    {
+        let mut st = state.lock().await;
+        if incoming_hash == st.last_hash {
+            return None; // our own write, or already processed
+        }
+        st.last_hash = incoming_hash;
+    }
+
+    let Some(incoming) = std::str::from_utf8(&raw)
+        .ok()
+        .and_then(|s| cella_env::claude_code::to_canonical(doc, s, None))
+    else {
+        warn!("doc sync: host {doc:?} is not valid JSON; skipping");
+        return None;
+    };
+
+    let mut st = state.lock().await;
+    let patch = cella_env::claude_code::diff_merge_patch(&st.host_snapshot, &incoming);
+    let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
+    let canonical_changed = merged != st.canonical;
+    st.canonical = merged;
+    // Canonical may still hold container-only keys the host file lacks; write
+    // them back so the host file converges to the union.
+    let host_needs_update = st.canonical != incoming;
+    st.host_snapshot = incoming;
+    Some((
+        st.on_disk_string(),
+        st.wire_string(),
+        host_needs_update,
+        canonical_changed,
+    ))
 }
 
 /// Write `out` to the host file, recording its hash as `last_hash` only on a
@@ -205,6 +225,13 @@ pub async fn on_agent_change(
         warn!("doc sync: container {sender} sent an invalid {doc:?} patch; skipping");
         return;
     };
+
+    // Fold in any host edit the watcher has not debounced yet, so this patch is
+    // applied on top of the host's real current state rather than a stale
+    // in-memory canonical that would then be written over it.
+    if let Some(path) = host_path {
+        ingest_host(state, path, doc).await;
+    }
 
     let (on_disk, wire, changed) = {
         let mut st = state.lock().await;

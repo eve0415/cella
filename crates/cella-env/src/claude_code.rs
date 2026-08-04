@@ -258,7 +258,10 @@ pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value
         return out;
     };
     for value in plugins.values_mut() {
-        let Some(entries) = value.as_array() else {
+        let Some(entries) = value.as_array().filter(|e| !e.is_empty()) else {
+            // An empty array normalizes to `{}`, which denormalization cannot
+            // tell from an unrecognised empty object — leaving it alone keeps
+            // the on-disk schema stable, and there is nothing in it to merge.
             continue;
         };
         let mut keyed = serde_json::Map::new();
@@ -791,6 +794,18 @@ mod tests {
         assert_eq!(
             out["p"][2]["projectPath"],
             json!("/Users/alice/src/app/sub")
+        );
+    }
+
+    /// An empty entry array must survive the round trip as an array: normalized
+    /// it would be `{}`, indistinguishable from an unrecognised empty object.
+    #[test]
+    fn empty_entry_arrays_survive_the_round_trip() {
+        let doc = json!({ "version": 2, "plugins": { "p@m": [] } });
+        assert_eq!(normalize_installed_plugins(&doc), doc);
+        assert_eq!(
+            denormalize_installed_plugins(&normalize_installed_plugins(&doc)),
+            doc
         );
     }
 

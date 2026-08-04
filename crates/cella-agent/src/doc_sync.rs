@@ -330,29 +330,55 @@ async fn run_writer(mut apply_rx: mpsc::Receiver<ApplyMessage>) {
 }
 
 /// Write one inbound canonical document, converted to this container's form.
+///
+/// A local edit made inside the watcher's debounce window has not been sent yet,
+/// and a plain overwrite would destroy it *and* hide it: the write advances
+/// `last_hash`, so the coalesced watcher event is then dropped as the agent's
+/// own write. The pending local patch is therefore folded on top of the inbound
+/// document before writing.
+///
+/// When something was folded in, `last_hash` is deliberately left stale so the
+/// watcher still fires on the write and forwards that patch, and the baseline is
+/// set to the *daemon's* view rather than the merged result — the difference
+/// between them is exactly what still needs sending.
 async fn apply_canonical(st: &DocState, content: &str) {
-    let Ok(canonical) = serde_json::from_str::<serde_json::Value>(content) else {
+    let Ok(incoming) = serde_json::from_str::<serde_json::Value>(content) else {
         warn!(
             "doc sync: daemon sent invalid JSON for {:?}; skipping",
             st.doc
         );
         return;
     };
-    let local = to_local(st.doc, &canonical, st.map.as_ref());
+    let pending = pending_local_patch(st).await;
+    let has_pending = !pending.as_object().is_some_and(serde_json::Map::is_empty);
+    let effective = if has_pending {
+        cella_env::claude_code::apply_merge_patch(&incoming, &pending)
+    } else {
+        incoming.clone()
+    };
+
+    let local = to_local(st.doc, &effective, st.map.as_ref());
     let hash = cella_filesync::sha256_hex(local.as_bytes());
     if *st.last_hash.lock().await == hash {
         // Already have this content — but still record the baseline, so a later
         // local edit is diffed against what the daemon believes we hold.
-        st.set_baseline(canonical).await;
+        st.set_baseline(incoming).await;
         return;
     }
     match cella_filesync::atomic_write(&st.path, local.as_bytes(), 0o600) {
         Ok(()) => {
             restore_owner(&st.path);
-            // Record the hash only after a successful write so a transient
-            // failure doesn't suppress the retry of identical content.
-            *st.last_hash.lock().await = hash;
-            st.set_baseline(canonical).await;
+            if has_pending {
+                debug!(
+                    "doc sync: kept a pending local {:?} edit across a daemon push",
+                    st.doc
+                );
+            } else {
+                // Record the hash only after a successful write so a transient
+                // failure doesn't suppress the retry of identical content.
+                *st.last_hash.lock().await = hash;
+            }
+            st.set_baseline(incoming).await;
             debug!(
                 "doc sync: applied daemon {:?} to {}",
                 st.doc,
@@ -361,6 +387,17 @@ async fn apply_canonical(st: &DocState, content: &str) {
         }
         Err(e) => warn!("doc sync: failed to write {}: {e}", st.path.display()),
     }
+}
+
+/// The patch this container has made locally but not yet had acknowledged.
+///
+/// An empty object when the file matches the baseline, is unreadable, or is not
+/// valid JSON — in every one of those cases there is nothing safe to preserve.
+async fn pending_local_patch(st: &DocState) -> serde_json::Value {
+    let baseline = st.baseline.lock().await.clone();
+    derive_patch(st.doc, &st.path, &baseline, st.map.as_ref())
+        .await
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 /// Restore a file's ownership to whoever owns its parent directory.
@@ -692,6 +729,56 @@ mod tests {
             patch,
             json!({"plugins":{"p@m":{"user":{"version":"2.0"}}}}),
             "an untouched foreign-workspace entry must not be pushed: {patch}"
+        );
+    }
+
+    /// A peer push landing inside the watcher debounce must not swallow an
+    /// unsent local edit to a different key — a plain overwrite loses it
+    /// silently, because the write also advances the hash the watcher checks.
+    #[tokio::test]
+    async fn push_preserves_a_pending_local_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("known_marketplaces.json");
+        std::fs::write(&path, r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
+        let st = doc_state(
+            tmp.path(),
+            SyncDoc::KnownMarketplaces,
+            "known_marketplaces.json",
+            None,
+        );
+        // Baseline is the seed; the container then edits `a` (not yet sent).
+        std::fs::write(&path, r#"{"a":{"lastUpdated":"2"}}"#).expect("local edit");
+
+        // A peer's refresh of `b` arrives before the watcher fires.
+        apply_canonical(&st, r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"9"}}"#).await;
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("written"))
+                .expect("valid json");
+        assert_eq!(
+            on_disk["a"]["lastUpdated"],
+            json!("2"),
+            "the unsent local edit must survive the push"
+        );
+        assert_eq!(
+            on_disk["b"]["lastUpdated"],
+            json!("9"),
+            "the peer's change must also land"
+        );
+
+        // The baseline is the daemon's view, so the local edit is still pending
+        // and the watcher is not suppressed for it.
+        assert_eq!(
+            *st.baseline.lock().await,
+            json!({"a":{"lastUpdated":"1"},"b":{"lastUpdated":"9"}})
+        );
+        let still_pending = pending_local_patch(&st).await;
+        assert_eq!(still_pending, json!({"a":{"lastUpdated":"2"}}));
+        assert_ne!(
+            *st.last_hash.lock().await,
+            cella_filesync::sha256_hex(
+                to_local(SyncDoc::KnownMarketplaces, &json!({}), None).as_bytes()
+            ),
         );
     }
 

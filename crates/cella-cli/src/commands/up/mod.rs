@@ -1205,6 +1205,36 @@ impl UpContext {
         }
     }
 
+    /// Create the Claude home symlink and seed the tmpfs plugin manifests.
+    ///
+    /// The workspace pair is threaded through so the seed's path rewrite reaches
+    /// `projectPath`, which no `.claude` pattern matches — without it the seed
+    /// (which runs after the agent has started) can overwrite a correctly
+    /// localized manifest with host workspace paths that the sync layer then has
+    /// no way to notice.
+    async fn setup_claude_code(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+    ) {
+        if !settings.tools.claude_code.forward_config {
+            return;
+        }
+        create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
+        setup_plugin_manifests(
+            self.client.as_ref(),
+            container_id,
+            remote_user,
+            Some((
+                self.workspace_folder()
+                    .unwrap_or(&self.default_workspace_folder),
+                &self.resolved.workspace_root,
+            )),
+        )
+        .await;
+    }
+
     /// Run post-create setup: env injection, credentials, Claude Code, userEnvProbe.
     pub(crate) async fn post_create_setup(
         &self,
@@ -1284,11 +1314,8 @@ impl UpContext {
             )
             .await;
 
-        // Create home path symlink and populate plugin manifests
-        if settings.tools.claude_code.forward_config {
-            create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
-            setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
-        }
+        self.setup_claude_code(container_id, remote_user, settings)
+            .await;
 
         // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
         // files instead of single-file bind mounts (anti-ghost). Shared by the
@@ -2193,9 +2220,15 @@ async fn setup_plugin_manifests(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
+    workspace: Option<(&str, &Path)>,
 ) {
-    cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user)
-        .await;
+    cella_orchestrator::tool_install::setup_plugin_manifests(
+        client,
+        container_id,
+        remote_user,
+        workspace,
+    )
+    .await;
 }
 
 // ── Version skew helpers ─────────────────────────────────────────────────

@@ -788,6 +788,7 @@ pub async fn setup_plugin_manifests(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
+    workspace: Option<(&str, &std::path::Path)>,
 ) {
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
@@ -796,7 +797,14 @@ pub async fn setup_plugin_manifests(
 
     // Regex sed: rewrite /home/USER/.claude, /Users/USER/.claude, /root/.claude
     // to the container user's path. Handles any previous writer.
-    let sed_expr = format!(
+    //
+    // The workspace pair covers `projectPath`, which no `.claude` pattern
+    // reaches. This seed runs *after* the container (and its agent) starts, so
+    // it can overwrite an already-correctly-localized manifest; leaving
+    // `projectPath` host-shaped here is invisible to the sync layer, because
+    // canonicalizing the seed then equals the host-shaped baseline and produces
+    // no corrective patch.
+    let mut sed_expr = format!(
         concat!(
             "s|/home/[^/\"]*/.claude|{t}|g; ",
             "s|/Users/[^/\"]*/.claude|{t}|g; ",
@@ -804,6 +812,15 @@ pub async fn setup_plugin_manifests(
         ),
         t = target_claude,
     );
+    if let Some((container_workspace, host_workspace)) = workspace {
+        use std::fmt::Write as _;
+        let _ = write!(
+            sed_expr,
+            "; s|{host}|{container}|g",
+            host = host_workspace.display(),
+            container = container_workspace,
+        );
+    }
 
     // Symlink all items except the 2 manifest JSONs (which get copied + rewritten)
     let script = format!(
