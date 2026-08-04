@@ -15,6 +15,7 @@ use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOver
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
+pub use mounts::workspace_path_pair;
 use mounts::{map_additional_mounts, map_workspace_mount, parse_mount_string};
 use ports::map_port_bindings;
 

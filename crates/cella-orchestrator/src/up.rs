@@ -354,16 +354,8 @@ impl EnsureUpContext<'_> {
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
-            crate::tool_install::setup_plugin_manifests(
-                self.client,
-                container_id,
-                remote_user,
-                Some((
-                    self.workspace_folder_str(),
-                    &self.config.resolved.workspace_root,
-                )),
-            )
-            .await;
+            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
+                .await;
         }
 
         let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
@@ -1247,14 +1239,18 @@ impl EnsureUpContext<'_> {
         // Opt the container into Claude Code config sync (env is immutable
         // after create, so it must be set here at create time). The workspace
         // pair lets the agent translate `projectPath` in the plugin manifests.
-        let tool_env = crate::tool_install::tool_config_env_vars(
-            settings,
-            remote_user,
-            Some((
-                self.workspace_folder_str(),
-                &self.config.resolved.workspace_root,
-            )),
-        );
+        // Derived from the effective workspace mount, not from
+        // `(workspace_folder, workspace_root)`: a custom or disabled
+        // `workspaceMount`, or a volume-backed workspace, makes that pair wrong
+        // or nonexistent, and a wrong pair rewrites `projectPath` under a host
+        // path that isn't there.
+        let workspace_pair = create_opts
+            .workspace_mount
+            .as_ref()
+            .filter(|m| m.mount_type == "bind")
+            .map(|m| (m.target.as_str(), std::path::Path::new(m.source.as_str())));
+        let tool_env =
+            crate::tool_install::tool_config_env_vars(settings, remote_user, workspace_pair);
         if !tool_env.is_empty() {
             if create_opts.env.is_empty() {
                 create_opts.env = image_env.to_vec();
@@ -1441,16 +1437,8 @@ impl EnsureUpContext<'_> {
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
-            crate::tool_install::setup_plugin_manifests(
-                self.client,
-                container_id,
-                remote_user,
-                Some((
-                    self.workspace_folder_str(),
-                    &self.config.resolved.workspace_root,
-                )),
-            )
-            .await;
+            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
+                .await;
         }
 
         // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular

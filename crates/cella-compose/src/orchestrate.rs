@@ -1395,6 +1395,10 @@ async fn build_override_and_start(
     // Container env is immutable after create, so the config sync opt-in must
     // be baked into the compose override here (mirrors the single-container
     // `apply_env_and_mounts` injection).
+    // Compose ignores `workspaceMount` — the service's own volumes define the
+    // mapping — so the pair is taken from the project's workspace folder and
+    // root. A service that mounts the workspace somewhere else gets a pair that
+    // doesn't match, and `projectPath` translation is wrong for it.
     extra_env.extend(cella_tool_install::tool_config_env_vars(
         &settings,
         remote_user,

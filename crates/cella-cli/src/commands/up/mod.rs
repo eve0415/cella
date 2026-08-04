@@ -1207,11 +1207,9 @@ impl UpContext {
 
     /// Create the Claude home symlink and seed the tmpfs plugin manifests.
     ///
-    /// The workspace pair is threaded through so the seed's path rewrite reaches
-    /// `projectPath`, which no `.claude` pattern matches — without it the seed
-    /// (which runs after the agent has started) can overwrite a correctly
-    /// localized manifest with host workspace paths that the sync layer then has
-    /// no way to notice.
+    /// The seed's path rewrite reads the pinned workspace pair from the
+    /// container's own environment, so it and the agent's `PathMap` are the same
+    /// mapping by construction.
     async fn setup_claude_code(
         &self,
         container_id: &str,
@@ -1222,17 +1220,7 @@ impl UpContext {
             return;
         }
         create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
-        setup_plugin_manifests(
-            self.client.as_ref(),
-            container_id,
-            remote_user,
-            Some((
-                self.workspace_folder()
-                    .unwrap_or(&self.default_workspace_folder),
-                &self.resolved.workspace_root,
-            )),
-        )
-        .await;
+        setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
     }
 
     /// Run post-create setup: env injection, credentials, Claude Code, userEnvProbe.
@@ -2220,15 +2208,9 @@ async fn setup_plugin_manifests(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    workspace: Option<(&str, &Path)>,
 ) {
-    cella_orchestrator::tool_install::setup_plugin_manifests(
-        client,
-        container_id,
-        remote_user,
-        workspace,
-    )
-    .await;
+    cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user)
+        .await;
 }
 
 // ── Version skew helpers ─────────────────────────────────────────────────

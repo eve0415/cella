@@ -229,11 +229,19 @@ pub async fn on_agent_change(
     // Fold in any host edit the watcher has not debounced yet, so this patch is
     // applied on top of the host's real current state rather than a stale
     // in-memory canonical that would then be written over it.
-    if let Some(path) = host_path {
-        ingest_host(state, path, doc).await;
-    }
+    //
+    // Its outcome must be carried forward, not dropped: `ingest_host` advances
+    // `last_hash`, which suppresses the watcher event that would otherwise have
+    // delivered that host edit. If this patch turns out to be a no-op, the host
+    // edit would then reach neither the peers nor the host file.
+    let ingested = match host_path {
+        Some(path) => ingest_host(state, path, doc).await,
+        None => None,
+    };
+    let host_rewrite_pending = ingested.as_ref().is_some_and(|(_, _, needs, _)| *needs);
+    let host_changed = ingested.is_some_and(|(_, _, _, changed)| changed);
 
-    let (on_disk, wire, changed) = {
+    let (on_disk, wire, patch_changed) = {
         let mut st = state.lock().await;
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
         let changed = merged != st.canonical;
@@ -241,13 +249,19 @@ pub async fn on_agent_change(
         (st.on_disk_string(), st.wire_string(), changed)
     };
 
-    if !changed {
-        // Nothing new for the peers, but the sender still gets canonical: its
-        // patch may have been empty because it is *behind*, not in sync.
+    if !patch_changed && !host_changed {
+        // Nothing new for the peers, but the host file may still owe the
+        // canonical union, and the sender still gets canonical: its patch may
+        // have been empty because it is *behind*, not in sync.
+        if host_rewrite_pending && let Some(path) = host_path {
+            write_host_guarded(state, path, &on_disk).await;
+        }
         send_to(handles, sender, doc, &wire).await;
         return;
     }
-    if let Some(path) = host_path {
+    if let Some(path) = host_path
+        && (patch_changed || host_rewrite_pending)
+    {
         write_host_guarded(state, path, &on_disk).await;
     }
     // Broadcast includes the sender — its own content hash drops the echo, and
@@ -681,6 +695,46 @@ mod tests {
             sent["plugins"]["p@m"]
         );
         assert_eq!(sent["plugins"]["p@m"]["user"]["version"], json!("2.0"));
+    }
+
+    /// A host edit swallowed by `ingest_host` during a no-op agent patch must
+    /// still reach the peers. `ingest_host` advances `last_hash`, so the watcher
+    /// event that would have delivered it is suppressed — dropping the result
+    /// here loses the edit entirely.
+    #[tokio::test]
+    async fn host_edit_consumed_by_a_noop_patch_still_broadcasts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = tmp.path().join("known_marketplaces.json");
+        std::fs::write(&host, r#"{"official":{"lastUpdated":"1"}}"#).expect("seed host");
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut peer = register_agent(&handles, "peer");
+
+        // The host is edited, but an agent's empty re-announce arrives first.
+        std::fs::write(&host, r#"{"official":{"lastUpdated":"2"}}"#).expect("host edit");
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            "{}",
+            "cella-a",
+        )
+        .await;
+
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            peer.try_recv().expect("peer must receive the host edit")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["official"]["lastUpdated"],
+            json!("2"),
+            "the host edit must reach peers even when the agent patch is a no-op"
+        );
     }
 
     /// The host file keeps its real entry-array schema; the normalized

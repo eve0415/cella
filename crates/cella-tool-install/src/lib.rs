@@ -788,7 +788,6 @@ pub async fn setup_plugin_manifests(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    workspace: Option<(&str, &std::path::Path)>,
 ) {
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
@@ -797,14 +796,7 @@ pub async fn setup_plugin_manifests(
 
     // Regex sed: rewrite /home/USER/.claude, /Users/USER/.claude, /root/.claude
     // to the container user's path. Handles any previous writer.
-    //
-    // The workspace pair covers `projectPath`, which no `.claude` pattern
-    // reaches. This seed runs *after* the container (and its agent) starts, so
-    // it can overwrite an already-correctly-localized manifest; leaving
-    // `projectPath` host-shaped here is invisible to the sync layer, because
-    // canonicalizing the seed then equals the host-shaped baseline and produces
-    // no corrective patch.
-    let mut sed_expr = format!(
+    let sed_expr = format!(
         concat!(
             "s|/home/[^/\"]*/.claude|{t}|g; ",
             "s|/Users/[^/\"]*/.claude|{t}|g; ",
@@ -812,27 +804,30 @@ pub async fn setup_plugin_manifests(
         ),
         t = target_claude,
     );
-    if let Some((container_workspace, host_workspace)) = workspace {
-        use std::fmt::Write as _;
-        let _ = write!(
-            sed_expr,
-            "; s|{host}|{container}|g",
-            host = host_workspace.display(),
-            container = container_workspace,
-        );
-    }
 
-    // Symlink all items except the 2 manifest JSONs (which get copied + rewritten)
+    // Symlink all items except the 2 manifest JSONs (which get copied + rewritten).
+    //
+    // The workspace substitution is read from the container's own environment
+    // rather than passed in, so the seed and the agent's `PathMap` are the same
+    // mapping by construction — and it is simply absent when the workspace has
+    // no host bind behind it. It covers `projectPath`, which no `.claude`
+    // pattern reaches; this seed runs *after* the agent starts, so a stale
+    // `projectPath` here would survive silently (canonicalizing it equals the
+    // host-shaped baseline, so no patch and no corrective reply is produced).
     let script = format!(
         concat!(
             "[ -d \"{host}\" ] || exit 0; ",
+            "base='{sed}'; ws=''; ",
+            "if [ -n \"$CELLA_HOST_WORKSPACE\" ] && [ -n \"$CELLA_CONTAINER_WORKSPACE\" ]; then ",
+            "  ws=\"; s|$CELLA_HOST_WORKSPACE|$CELLA_CONTAINER_WORKSPACE|g\"; ",
+            "fi; ",
             "for item in \"{host}\"/* \"{host}\"/.*; do ",
             "  [ -e \"$item\" ] || continue; ",
             "  name=$(basename \"$item\"); ",
             "  case \"$name\" in ",
             "    .|..) continue ;; ",
             "    installed_plugins.json|known_marketplaces.json) ",
-            "      [ -f \"$item\" ] && sed -E '{sed}' \"$item\" > \"{dir}/$name\" ;; ",
+            "      [ -f \"$item\" ] && sed -E \"$base$ws\" \"$item\" > \"{dir}/$name\" ;; ",
             "    *) ln -sfn \"$item\" \"{dir}/$name\" ;; ",
             "  esac; ",
             "done",
