@@ -57,6 +57,10 @@ pub struct DocSyncState {
     /// it the host stays stale indefinitely: `last_hash` still names the
     /// unchanged file, so nothing schedules a retry.
     host_dirty: bool,
+    /// This host's `~/.claude`, used to repair a previous writer's home out of
+    /// the host document. `None` when it cannot be resolved, which makes the
+    /// repair a no-op.
+    host_claude: Option<String>,
 }
 
 impl DocSyncState {
@@ -64,11 +68,13 @@ impl DocSyncState {
     /// empty object so merges still work.
     #[must_use]
     pub fn load(path: Option<&Path>, doc: SyncDoc) -> Self {
+        let host_claude =
+            cella_env::claude_code::host_claude_dir().map(|d| d.to_string_lossy().into_owned());
         let raw = path.and_then(|p| std::fs::read(p).ok());
         let canonical = raw
             .as_deref()
             .and_then(|b| std::str::from_utf8(b).ok())
-            .and_then(|s| cella_env::claude_code::to_canonical(doc, s, None))
+            .and_then(|s| host_canonical(doc, s, host_claude.as_deref()))
             .unwrap_or_else(|| serde_json::json!({}));
         let last_hash = raw
             .as_deref()
@@ -80,6 +86,7 @@ impl DocSyncState {
             canonical,
             last_hash,
             host_dirty: false,
+            host_claude,
         }
     }
 
@@ -101,6 +108,22 @@ impl DocSyncState {
     fn wire_string(&self) -> String {
         serde_json::to_string(&self.canonical).unwrap_or_else(|_| "{}".to_string())
     }
+}
+
+/// Parse a host document into canonical form, repairing any previous writer's
+/// `.claude` home to this host's.
+///
+/// Canonical is defined as host-shaped, and agents translate only the exact
+/// current host prefix. A manifest still carrying `/home/node/.claude/…` from a
+/// container that ran as another user would therefore survive a daemon push
+/// untranslated and overwrite the correctly repaired create-time seed, leaving
+/// the plugin unresolvable in the container.
+fn host_canonical(doc: SyncDoc, raw: &str, host_claude: Option<&str>) -> Option<serde_json::Value> {
+    let canonical = cella_env::claude_code::to_canonical(doc, raw, None)?;
+    Some(match host_claude {
+        Some(home) => cella_env::claude_code::repair_claude_home(&canonical, home),
+        None => canonical,
+    })
 }
 
 /// Apply `mutate` to the canonical document and, in the *same* critical section,
@@ -148,7 +171,7 @@ fn write_host(st: &mut DocSyncState, path: &Path) {
             st.last_hash = cella_filesync::sha256_hex(out.as_bytes());
             // The host file now equals `out`; record it as the host snapshot so a
             // later host edit diffs against what's actually on disk.
-            st.host_snapshot = cella_env::claude_code::to_canonical(st.doc, &out, None)
+            st.host_snapshot = host_canonical(st.doc, &out, st.host_claude.as_deref())
                 .unwrap_or_else(|| serde_json::json!({}));
             st.host_dirty = false;
         }
@@ -199,7 +222,7 @@ fn ingest_host(st: &mut DocSyncState, host_path: &Path, doc: SyncDoc) -> bool {
 
     let Some(incoming) = std::str::from_utf8(&raw)
         .ok()
-        .and_then(|s| cella_env::claude_code::to_canonical(doc, s, None))
+        .and_then(|s| host_canonical(doc, s, st.host_claude.as_deref()))
     else {
         // `last_hash` still advanced, so the same invalid bytes are not
         // re-parsed on every subsequent event.
@@ -320,6 +343,7 @@ mod tests {
             canonical: json,
             last_hash: cella_filesync::sha256_hex(&bytes),
             host_dirty: false,
+            host_claude: Some("/Users/alice/.claude".to_string()),
         }))
     }
 
@@ -771,6 +795,40 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["official"]["lastUpdated"],
             json!("2"),
             "the host edit must reach peers even when the agent patch is a no-op"
+        );
+    }
+
+    /// Canonical is defined as host-shaped. A manifest still carrying another
+    /// writer's home must be repaired on the way in, or a push would send that
+    /// path to every container — where nothing translates it.
+    #[tokio::test]
+    async fn a_foreign_writers_home_is_repaired_into_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        std::fs::write(
+            &host,
+            r#"{"m":{"installLocation":"/home/node/.claude/plugins/marketplaces/m"}}"#,
+        )
+        .expect("seed host");
+        let state = state_from(json!({}), SyncDoc::KnownMarketplaces);
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        on_host_change(&state, &handles, &host, SyncDoc::KnownMarketplaces).await;
+
+        assert_eq!(
+            state.lock().await.canonical["m"]["installLocation"],
+            json!("/Users/alice/.claude/plugins/marketplaces/m"),
+            "canonical must be host-shaped"
+        );
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            agent.try_recv().expect("agent must be notified")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["m"]["installLocation"],
+            json!("/Users/alice/.claude/plugins/marketplaces/m")
         );
     }
 

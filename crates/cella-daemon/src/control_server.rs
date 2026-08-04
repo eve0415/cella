@@ -56,7 +56,13 @@ fn ensure_host_plugins_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = cella_env::claude_code::host_plugins_dir() {
         return Some(dir);
     }
-    let dir = cella_env::claude_code::host_claude_dir()?.join("plugins");
+    // Built from the home directory rather than from an existing `~/.claude`:
+    // the compose path starts the daemon before `ensure_tool_config_paths`
+    // creates that directory, so requiring it would leave a fresh host with no
+    // plugin hubs for the daemon's whole lifetime — and hubs are built once.
+    let dir = cella_env::paths::home_dir()?
+        .join(".claude")
+        .join("plugins");
     match std::fs::create_dir_all(&dir) {
         Ok(()) => Some(dir),
         Err(e) => {

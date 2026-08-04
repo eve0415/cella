@@ -277,9 +277,18 @@ pub async fn reannounce_messages() -> Vec<AgentMessage> {
         // so passing `&*lock().await` inline would hold the mutex across
         // `derive_patch`'s own file read.
         let baseline = st.baseline.lock().await.clone();
-        let patch = derive_patch(st.doc, &st.path, &baseline, st.map.as_ref())
-            .await
-            .unwrap_or_else(|| serde_json::json!({}));
+        // An unreadable or mid-write document is *skipped*, not announced as an
+        // empty patch. An empty patch draws an unconditional canonical reply,
+        // and the same failed read would leave `pending_local_patch` empty too —
+        // so the push would overwrite the local content instead of preserving
+        // it. Nothing is lost by waiting: the next watcher event re-derives it.
+        let Some(patch) = derive_patch(st.doc, &st.path, &baseline, st.map.as_ref()).await else {
+            debug!(
+                "doc sync: {:?} unreadable at (re)connect; not announcing it",
+                st.doc
+            );
+            continue;
+        };
         out.push(AgentMessage::ConfigDocPatch {
             doc: st.doc,
             patch: patch.to_string(),
