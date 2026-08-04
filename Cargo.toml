@@ -204,6 +204,7 @@ cella-testing = { path = "crates/cella-testing" }
 [profile.release]
 strip = true
 lto = true
+codegen-units = 1
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
