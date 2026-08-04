@@ -10,6 +10,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use bytes::BytesMut;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -357,28 +358,47 @@ async fn reader_loop(
     loop {
         let (request_id, frame_type, payload_len) = read_frame_header(&mut reader).await?;
         let payload = read_payload(&mut reader, payload_len).await?;
-        dispatch_frame(request_id, frame_type, &payload, pending).await;
+        dispatch_frame(request_id, frame_type, payload, pending).await;
     }
 }
 
+/// Read one frame payload.
+///
+/// Returns `Bytes` rather than `Vec<u8>` so a response chunk can be handed to
+/// hyper without a second copy. `vec![0u8; len]` would also zero the whole
+/// buffer immediately before `read_exact` overwrites every byte of it —
+/// pointless at any size, and chunks run to `MAX_REQUEST_CHUNK` (16 MiB).
+/// `read_buf` fills spare capacity instead, so nothing is written twice.
 async fn read_payload<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     payload_len: u32,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Bytes> {
     let len = payload_len as usize;
-    let mut buf = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut buf).await?;
+    if len == 0 {
+        return Ok(Bytes::new());
     }
-    Ok(buf)
+
+    let mut buf = BytesMut::with_capacity(len);
+    // `with_capacity` may over-allocate, and `read_buf` fills to capacity —
+    // cap the reader so a long frame cannot steal the next frame's header.
+    let mut limited = reader.take(len as u64);
+    while buf.len() < len {
+        if limited.read_buf(&mut buf).await? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "frame payload ended early",
+            ));
+        }
+    }
+    Ok(buf.freeze())
 }
 
-async fn dispatch_frame(request_id: u32, frame_type: u8, payload: &[u8], pending: &PendingMap) {
+async fn dispatch_frame(request_id: u32, frame_type: u8, payload: Bytes, pending: &PendingMap) {
     match frame_type {
-        FRAME_RESPONSE_ENVELOPE => handle_response_envelope(request_id, payload, pending).await,
+        FRAME_RESPONSE_ENVELOPE => handle_response_envelope(request_id, &payload, pending).await,
         FRAME_RESPONSE_CHUNK => handle_response_chunk(request_id, payload, pending).await,
         FRAME_RESPONSE_END => handle_response_end(request_id, pending).await,
-        FRAME_ERROR => handle_error_frame(request_id, payload, pending).await,
+        FRAME_ERROR => handle_error_frame(request_id, &payload, pending).await,
         _ => {
             warn!("Unknown frame type {frame_type:#04x} for request {request_id}");
         }
@@ -418,17 +438,15 @@ async fn handle_response_envelope(request_id: u32, payload: &[u8], pending: &Pen
     }
 }
 
-async fn handle_response_chunk(request_id: u32, payload: &[u8], pending: &PendingMap) {
+async fn handle_response_chunk(request_id: u32, payload: Bytes, pending: &PendingMap) {
     let tx = {
         let map = pending.lock().await;
         map.get(&request_id).and_then(|f| f.body_tx.clone())
     };
     if let Some(tx) = tx {
-        let _ = tx
-            .send(Ok(hyper::body::Frame::data(Bytes::copy_from_slice(
-                payload,
-            ))))
-            .await;
+        // `payload` is already a `Bytes` owning the frame buffer, so handing it
+        // to hyper is a refcount bump rather than a copy of the chunk.
+        let _ = tx.send(Ok(hyper::body::Frame::data(payload))).await;
     }
 }
 
@@ -542,7 +560,7 @@ mod tests {
             assert_eq!(plen, 5);
 
             let payload = read_payload(&mut cursor, plen).await.unwrap();
-            assert_eq!(payload, b"hello");
+            assert_eq!(payload.as_ref(), b"hello");
         });
     }
 
@@ -668,12 +686,12 @@ mod tests {
             let (id, ft, plen) = read_frame_header(&mut cursor).await.unwrap();
             assert_eq!((id, ft), (1, FRAME_HANDSHAKE));
             let p = read_payload(&mut cursor, plen).await.unwrap();
-            assert_eq!(p, b"hs");
+            assert_eq!(p.as_ref(), b"hs");
 
             let (id, ft, plen) = read_frame_header(&mut cursor).await.unwrap();
             assert_eq!((id, ft), (1, FRAME_REQUEST_ENVELOPE));
             let p = read_payload(&mut cursor, plen).await.unwrap();
-            assert_eq!(p, b"env");
+            assert_eq!(p.as_ref(), b"env");
 
             let (id, ft, plen) = read_frame_header(&mut cursor).await.unwrap();
             assert_eq!((id, ft), (1, FRAME_REQUEST_END));

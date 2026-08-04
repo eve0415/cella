@@ -111,13 +111,24 @@ async fn handle_credential_proxy_inner(
     }
 
     let body = if req_envelope.body_len > 0 {
-        let mut buf = vec![0u8; req_envelope.body_len as usize];
-        reader
-            .read_exact(&mut buf)
+        // Fill spare capacity rather than zeroing body_len bytes that the read
+        // immediately overwrites — bodies are capped at MAX_BODY_LEN (256 MiB).
+        let expected = req_envelope.body_len as usize;
+        let mut buf = Vec::with_capacity(expected);
+        let read = (&mut reader)
+            .take(u64::from(req_envelope.body_len))
+            .read_to_end(&mut buf)
             .await
             .map_err(|e| crate::CellaDaemonError::Socket {
                 message: format!("credential proxy: read body: {e}"),
             })?;
+        if read != expected {
+            return Err(crate::CellaDaemonError::Socket {
+                message: format!(
+                    "credential proxy: read body: expected {expected} bytes, got {read}"
+                ),
+            });
+        }
         buf
     } else {
         Vec::new()

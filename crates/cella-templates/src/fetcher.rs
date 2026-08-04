@@ -144,9 +144,9 @@ pub fn read_template_metadata(
 // ---------------------------------------------------------------------------
 
 fn find_extractable_layer<'a>(
-    manifest: &'a oci_distribution::manifest::OciImageManifest,
+    manifest: &'a oci_client::manifest::OciImageManifest,
     template_ref: &str,
-) -> Result<&'a oci_distribution::manifest::OciDescriptor, TemplateError> {
+) -> Result<&'a oci_client::manifest::OciDescriptor, TemplateError> {
     manifest
         .layers
         .iter()
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn extractable_layer_detection() {
-        use oci_distribution::manifest::{
+        use oci_client::manifest::{
             IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
         };
         assert!(cella_oci::is_extractable_layer(IMAGE_LAYER_GZIP_MEDIA_TYPE));
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn extract_gzip_tarball() {
-        use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
+        use oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
 
         let dir = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();

@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use futures_util::StreamExt as _;
-use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
+use oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
 use tracing::debug;
 
 use crate::Platform;

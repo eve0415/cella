@@ -407,7 +407,7 @@ mod tests {
 
     fn manifest() -> ResolvedOciManifest {
         // Build the typed manifest via deserialization so the test needs no
-        // direct oci_distribution dependency (the field type is inferred).
+        // direct oci_client dependency (the field type is inferred).
         ResolvedOciManifest {
             registry: "ghcr.io".to_string(),
             repository: "devcontainers/features/node".to_string(),

@@ -5,12 +5,12 @@
 //! types, per-layer annotations, and manifest-level annotations; this module
 //! handles auth, the `oci-distribution` plumbing, and per-tag manifest PUT.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
-use oci_distribution::errors::{OciDistributionError, OciErrorCode};
-use oci_distribution::manifest::{OciImageManifest, OciManifest};
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
+use oci_client::errors::{OciDistributionError, OciErrorCode};
+use oci_client::manifest::{OciImageManifest, OciManifest};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -27,7 +27,7 @@ pub struct LayerSpec {
     /// OCI media type (e.g. `application/vnd.devcontainers.layer.v1+tar`).
     pub media_type: String,
     /// Per-layer annotations (`org.opencontainers.image.title`, etc.).
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// Result of a successful push operation.
@@ -127,13 +127,13 @@ pub async fn list_published_tags(
 ///
 /// Returns [`PushError`] if manifest serialization fails or if the registry
 /// rejects the blob or manifest upload for any tag.
-pub async fn push_artifact<S: std::hash::BuildHasher>(
+pub async fn push_artifact(
     registry: &str,
     repository: &str,
     tags: &[String],
     layers: Vec<LayerSpec>,
     config_media_type: &str,
-    manifest_annotations: Option<HashMap<String, String, S>>,
+    manifest_annotations: Option<BTreeMap<String, String>>,
 ) -> Result<Option<PushResult>, PushError> {
     if tags.is_empty() {
         return Ok(None);
@@ -150,10 +150,7 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
     // The config blob for devcontainer artifacts is always `{}`.
     let config = Config::new(b"{}".to_vec(), config_media_type.to_owned(), None);
 
-    // OciImageManifest::build requires the default hasher; collect into a plain HashMap.
-    let annotations_default: Option<HashMap<String, String>> =
-        manifest_annotations.map(|m| m.into_iter().collect());
-    let manifest = OciImageManifest::build(&image_layers, &config, annotations_default);
+    let manifest = OciImageManifest::build(&image_layers, &config, manifest_annotations);
 
     // Compute the manifest digest from the canonical JSON bytes that
     // oci-distribution will PUT to the registry.  The crate uses
@@ -219,8 +216,8 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn new_client() -> oci_distribution::Client {
-    oci_distribution::Client::new(ClientConfig {
+fn new_client() -> oci_client::Client {
+    oci_client::Client::new(ClientConfig {
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     })
@@ -284,7 +281,7 @@ mod tests {
                 &[],
                 Vec::new(),
                 "application/vnd.devcontainers",
-                None::<HashMap<String, String>>,
+                None::<BTreeMap<String, String>>,
             ))
             .unwrap();
         assert!(result.is_none(), "empty tags must yield None");

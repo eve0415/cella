@@ -579,7 +579,9 @@ impl Command {
             Self::Shell(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Exec(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Install(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Build(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Build(args) => Box::pin(args.execute(progress))
+                .await
+                .map_err(boxed_err_to_report),
             Self::List(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Logs(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Doctor(args) => args.execute().await.map_err(boxed_err_to_report),

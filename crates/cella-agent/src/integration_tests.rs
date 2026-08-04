@@ -329,7 +329,7 @@ static TEST_CA: OnceLock<TestCa> = OnceLock::new();
 
 fn test_ca() -> &'static TestCa {
     TEST_CA.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let key = KeyPair::generate().unwrap();
         let params = cella_network::ca::ca_certificate_params();

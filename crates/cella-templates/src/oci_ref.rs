@@ -1,7 +1,7 @@
 //! Shared OCI reference parsing and client construction for template fetchers.
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol};
 
 use cella_oci::build_registry_auth;
 
@@ -92,7 +92,7 @@ pub fn parse_template_ref(template_ref: &str) -> Result<TemplateRef, TemplateErr
     })
 }
 
-/// Build an OCI [`oci_distribution::Client`] and [`oci_distribution::Reference`]
+/// Build an OCI [`oci_client::Client`] and [`oci_client::Reference`]
 /// for the given parsed [`TemplateRef`].
 ///
 /// The reference is constructed by digest when the version is pinned, otherwise
@@ -102,15 +102,15 @@ pub fn parse_template_ref(template_ref: &str) -> Result<TemplateRef, TemplateErr
 pub fn build_oci_client(
     parsed: &TemplateRef,
 ) -> (
-    oci_distribution::Client,
+    oci_client::Client,
     Reference,
-    oci_distribution::secrets::RegistryAuth,
+    oci_client::secrets::RegistryAuth,
 ) {
     let config = ClientConfig {
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     };
-    let client = oci_distribution::Client::new(config);
+    let client = oci_client::Client::new(config);
     let registry = parsed.registry.clone();
     let repository = parsed.repository.clone();
     let oci_ref = match &parsed.version {

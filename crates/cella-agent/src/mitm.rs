@@ -531,7 +531,85 @@ mod tests {
     use super::*;
 
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    /// Installing the provider must actually succeed the first time, not just
+    /// be swallowed by the `let _ =` the production call sites use. A provider
+    /// that fails to install surfaces as a panic on the first handshake, from
+    /// inside a spawned task whose stderr the entrypoint discards.
+    #[test]
+    fn crypto_provider_installs() {
+        let installed = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_ok();
+        // Another test in this binary may have won the race; either way a
+        // provider must be present afterwards.
+        assert!(
+            installed || rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no default crypto provider after install_default"
+        );
+    }
+
+    /// End-to-end TLS over loopback using the MITM's own server config and an
+    /// rcgen-generated CA. The unit tests above only build configs; nothing
+    /// else in this crate completes a handshake without Docker, so without
+    /// this a broken crypto provider would reach CI unnoticed.
+    #[tokio::test]
+    async fn loopback_handshake_succeeds_with_installed_provider() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        install_crypto_provider();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_params = cella_network::ca::ca_certificate_params();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let json = serde_json::json!({
+            "listen_port": 0,
+            "mode": "denylist",
+            "rules": [],
+            "ca_cert_pem": ca_cert.pem(),
+            "ca_key_pem": ca_key.serialize_pem(),
+        })
+        .to_string();
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        let server_config = generate_server_config("example.com", &config).unwrap();
+
+        // Trust exactly the CA that signed the leaf the server will present.
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_cert.der().to_vec()))
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+            let mut tls = acceptor.accept(stream).await.expect("server handshake");
+            tls.write_all(b"pong").await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let domain = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        let mut tls = connector
+            .connect(domain, stream)
+            .await
+            .expect("client handshake");
+
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"pong");
+        server.await.unwrap();
     }
 
     #[test]

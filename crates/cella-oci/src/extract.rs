@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use oci_distribution::manifest::{
+use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
 use thiserror::Error;
@@ -152,10 +152,15 @@ fn unpack_archive<R: Read>(
     for entry in archive.entries()? {
         let mut entry = entry?;
         validate_entry(&entry, dest)?;
-        let path = entry_path_string(&entry);
         let unpacked = entry.unpack_in(dest)?;
         if !unpacked {
-            return Err(ExtractionError::EntrySkipped { path });
+            // Built only here, not once per entry: the string is pure error
+            // material, and a fat layer has thousands of entries. `unpack_in`
+            // leaves the header (and any GNU long-name) intact, so the path is
+            // still readable after the call.
+            return Err(ExtractionError::EntrySkipped {
+                path: entry_path_string(&entry),
+            });
         }
     }
     Ok(())
@@ -223,21 +228,17 @@ fn validate_link_target<R: Read>(
         return Ok(());
     }
 
-    let link_target = match entry.link_name().map_err(ExtractionError::Io)? {
-        Some(t) => t.into_owned(),
-        None => return Ok(()),
+    // Borrowed, not owned: the target is only read here, and link-heavy layers
+    // (`bin/` trees) hit this path thousands of times.
+    let Some(link_target) = entry.link_name().map_err(ExtractionError::Io)? else {
+        return Ok(());
     };
 
     let entry_path = entry.path().map_err(ExtractionError::Io)?;
-    let entry_name = entry_path.display().to_string();
-    let target_display = link_target.display().to_string();
 
     // Absolute link targets always escape the destination.
     if link_target.is_absolute() {
-        return Err(ExtractionError::UnsafeLinkTarget {
-            entry: entry_name,
-            target: target_display,
-        });
+        return Err(unsafe_link_target(&entry_path, &link_target));
     }
 
     // Resolve the relative target against its correct base inside dest.
@@ -245,21 +246,31 @@ fn validate_link_target<R: Read>(
     // link's own directory, while hardlink targets are relative to the archive
     // root (dest). Using the entry parent for both would under-validate
     // hardlinks (e.g. `a/b/link -> ../../etc/passwd` would look contained).
-    let base = if kind.is_hard_link() {
+    let mut candidate = if kind.is_hard_link() {
         dest.to_path_buf()
     } else {
         entry_path
             .parent()
             .map_or_else(|| dest.to_path_buf(), |p| dest.join(p))
     };
-    if escapes_dest(&base.join(&link_target), dest) {
-        return Err(ExtractionError::UnsafeLinkTarget {
-            entry: entry_name,
-            target: target_display,
-        });
+    candidate.push(&link_target);
+    if escapes_dest(&candidate, dest) {
+        return Err(unsafe_link_target(&entry_path, &link_target));
     }
 
     Ok(())
+}
+
+/// Build the [`ExtractionError::UnsafeLinkTarget`] error for a rejected link.
+///
+/// Outlined and `#[cold]` so the two `String`s it needs are built only for
+/// links that actually escape — not for every safe link the archive contains.
+#[cold]
+fn unsafe_link_target(entry_path: &Path, link_target: &Path) -> ExtractionError {
+    ExtractionError::UnsafeLinkTarget {
+        entry: entry_path.display().to_string(),
+        target: link_target.display().to_string(),
+    }
 }
 
 /// Returns `true` when the normalised form of `candidate` escapes `dest`.
@@ -326,7 +337,7 @@ mod tests {
 
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use oci_distribution::manifest::IMAGE_LAYER_MEDIA_TYPE;
+    use oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE;
     use tempfile::TempDir;
 
     use super::*;
@@ -572,6 +583,41 @@ mod tests {
             std::fs::read_to_string(dest.path().join("readme.txt")).unwrap(),
             "ok"
         );
+    }
+
+    /// `EntrySkipped` builds its path string *after* `unpack_in` runs, so the
+    /// error message is only correct if the entry still knows its own path at
+    /// that point. Pin that invariant directly — the skip branch itself is
+    /// unreachable for archives our own validation lets through, so this is
+    /// the part that can actually regress.
+    #[test]
+    fn entry_path_readable_after_unpack() {
+        let tar = build_safe_tar(&[("subdir/hello.txt", None, b"world")]);
+        let dest = dest_dir();
+        let mut archive = tar::Archive::new(&tar[..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        assert!(entry.unpack_in(dest.path()).unwrap());
+        assert_eq!(entry_path_string(&entry), "subdir/hello.txt");
+    }
+
+    /// The same invariant for a path too long for the 100-byte tar name field.
+    /// GNU long names live in a preceding `././@LongLink` entry rather than the
+    /// header, so this is where reading the path after `unpack_in` would break
+    /// if the long name were consumed by unpacking.
+    #[test]
+    fn long_entry_path_readable_after_unpack() {
+        let long_dir = "d".repeat(60);
+        let path = format!("{long_dir}/{long_dir}/file.txt");
+        assert!(path.len() > 100, "path must exceed the tar name field");
+
+        let tar = build_safe_tar(&[(path.as_str(), None, b"world")]);
+        let dest = dest_dir();
+        let mut archive = tar::Archive::new(&tar[..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        assert!(entry.unpack_in(dest.path()).unwrap());
+        assert_eq!(entry_path_string(&entry), path);
     }
 
     #[test]

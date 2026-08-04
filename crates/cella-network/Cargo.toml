@@ -14,8 +14,13 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+[[bench]]
+name = "rules"
+harness = false
 
 [lints]
 workspace = true

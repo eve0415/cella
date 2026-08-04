@@ -210,7 +210,9 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match self.run(progress).await {
+        // Boxed like `Code`: the build future is ~16KB, and moving it around
+        // the dispatch chain by value costs more than the one allocation.
+        match Box::pin(self.run(progress)).await {
             Ok(()) => Ok(()),
             // Mirror the official: a build failure prints the error envelope to
             // stdout (`{outcome:'error', …}`) and exits 1 — consistent with

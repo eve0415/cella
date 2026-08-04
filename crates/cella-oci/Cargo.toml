@@ -10,7 +10,7 @@ dirs.workspace = true
 flate2.workspace = true
 hex.workspace = true
 miette.workspace = true
-oci-distribution.workspace = true
+oci-client.workspace = true
 olpc-cjson.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,8 +21,13 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "extract"
+harness = false
 
 [lints]
 workspace = true

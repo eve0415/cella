@@ -47,7 +47,7 @@ pub struct ResolvedOciManifest {
     /// e.g. `"sha256:abc…"`).
     pub digest: String,
     /// The manifest blob (`sourceInformation.manifest`).
-    pub manifest: oci_distribution::manifest::OciImageManifest,
+    pub manifest: oci_client::manifest::OciImageManifest,
 }
 
 /// Parsed devcontainer-feature.json.

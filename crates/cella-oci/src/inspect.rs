@@ -1,11 +1,11 @@
 //! OCI manifest inspection helpers.
 //!
-//! Provides a thin wrapper around `oci_distribution` to fetch a manifest
+//! Provides a thin wrapper around `oci_client` to fetch a manifest
 //! and return it as a raw JSON value together with the resolved sha256 digest.
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::errors::OciDistributionError;
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol};
+use oci_client::errors::OciDistributionError;
 use tracing::debug;
 
 use crate::build_registry_auth;
@@ -34,7 +34,7 @@ pub async fn fetch_manifest_with_digest(
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     };
-    let client = oci_distribution::Client::new(config);
+    let client = oci_client::Client::new(config);
 
     let oci_ref = match &version {
         ReferenceVersion::Tag(tag) => {
@@ -75,14 +75,14 @@ pub async fn fetch_manifest_with_digest(
 ///
 /// ## Pagination contract
 ///
-/// `oci_distribution`'s `list_tags(ref, auth, n, last)` maps to the OCI
+/// `oci_client`'s `list_tags(ref, auth, n, last)` maps to the OCI
 /// Distribution Spec's `GET /v2/<name>/tags/list?n=<n>&last=<last>` endpoint.
 /// `TagResponse` has no cursor field — pagination is driven by passing the
 /// last tag name from the previous page as the `last` parameter on the next
 /// call.
 ///
 /// Some registries (e.g. GHCR) return `{"tags": null}` on the final page
-/// instead of an empty array, which causes `oci_distribution`'s
+/// instead of an empty array, which causes `oci_client`'s
 /// `TagResponse { tags: Vec<String> }` to produce a deserialization error.
 /// We avoid triggering that path by stopping as soon as a page returns fewer
 /// tags than [`TAG_PAGE_SIZE`] — a partial page always means end-of-list.
@@ -98,7 +98,7 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     };
-    let client = oci_distribution::Client::new(config);
+    let client = oci_client::Client::new(config);
 
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
     let auth = build_registry_auth(&registry);

@@ -12,7 +12,7 @@ futures-util.workspace = true
 glob.workspace = true
 hex.workspace = true
 miette.workspace = true
-oci-distribution.workspace = true
+oci-client.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -20,7 +20,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 
 cella-oci.workspace = true
@@ -30,6 +29,8 @@ semver.workspace = true
 cella-testing.workspace = true
 filetime.workspace = true
 tempfile.workspace = true
+# Not referenced by name in this crate — the `runtime_test` macro expands to it.
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -16,7 +16,7 @@
 //! - Collection index published as `devcontainer-collection.json` artifact.
 //! - Stdout JSON: `{"<id>": {"digest": "…", "publishedTags": […], "version": "…"}}`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -284,7 +284,7 @@ async fn publish_collection_index(
         data: collection_bytes,
         media_type: "application/vnd.devcontainers.collection.layer.v1+json".to_owned(),
         annotations: Some({
-            let mut m = HashMap::new();
+            let mut m = BTreeMap::new();
             m.insert(
                 "org.opencontainers.image.title".to_owned(),
                 "devcontainer-collection.json".to_owned(),
@@ -296,7 +296,7 @@ async fn publish_collection_index(
     // ghcr.io reads this for package-type UI presentation. The official CLI sets
     // only this annotation on the collection manifest (no `dev.containers.metadata`).
     let manifest_annotations = if registry == "ghcr.io" {
-        let mut m = HashMap::new();
+        let mut m = BTreeMap::new();
         m.insert(
             "com.github.package.type".to_owned(),
             "devcontainer_collection".to_owned(),
@@ -426,7 +426,7 @@ async fn package_and_push_template(
             id: id.to_owned(),
             reason: e.to_string(),
         })?;
-    let mut manifest_annotations = HashMap::new();
+    let mut manifest_annotations = BTreeMap::new();
     manifest_annotations.insert("dev.containers.metadata".to_owned(), annotation_json);
     // ghcr.io reads this for package-type UI presentation, matching the official CLI.
     if target.registry == "ghcr.io" {
@@ -445,7 +445,7 @@ async fn package_and_push_template(
         data: tgz_bytes,
         media_type: "application/vnd.devcontainers.layer.v1+tar".to_owned(),
         annotations: Some({
-            let mut m = HashMap::new();
+            let mut m = BTreeMap::new();
             m.insert(
                 "org.opencontainers.image.title".to_owned(),
                 format!("devcontainer-template-{id}.tgz"),

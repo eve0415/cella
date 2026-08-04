@@ -295,13 +295,23 @@ async fn read_payload<R: AsyncRead + Unpin>(
         return Ok(Vec::new());
     }
     let size = usize::try_from(len).unwrap_or(usize::MAX);
-    let mut buf = vec![0u8; size];
-    reader
-        .read_exact(&mut buf)
+    // `vec![0u8; size]` would zero every byte immediately before `read_exact`
+    // overwrote all of them. `read_to_end` fills spare capacity instead, and
+    // `take` bounds it to exactly this frame so it cannot consume the next
+    // frame's header. Chunk frames run to MAX_REQUEST_CHUNK (16 MiB).
+    let mut buf = Vec::with_capacity(size);
+    let read = reader
+        .take(u64::from(len))
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("credential mux: read payload: {e}"),
         })?;
+    if read != size {
+        return Err(CellaDaemonError::Socket {
+            message: format!("credential mux: read payload: expected {size} bytes, got {read}"),
+        });
+    }
     Ok(buf)
 }
 
@@ -990,6 +1000,39 @@ fn abort_in_flight(requests: &mut HashMap<u32, RequestState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Payload reads --
+
+    #[tokio::test]
+    async fn read_payload_reads_exactly_and_stops() {
+        // Trailing bytes stand in for the next frame's header: `read_payload`
+        // must not consume them.
+        let mut cursor = io::Cursor::new(b"abcdeXYZ".to_vec());
+        let payload = read_payload(&mut cursor, 5).await.unwrap();
+        assert_eq!(payload, b"abcde");
+
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"XYZ", "must leave the next frame untouched");
+    }
+
+    #[tokio::test]
+    async fn read_payload_rejects_truncated_frame() {
+        // `read_exact` used to surface this as UnexpectedEof; the capacity-fill
+        // read returns short instead, so the length check has to catch it.
+        let mut cursor = io::Cursor::new(b"abc".to_vec());
+        let err = read_payload(&mut cursor, 10).await.unwrap_err();
+        assert!(
+            matches!(err, CellaDaemonError::Socket { .. }),
+            "truncated payload must error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_payload_zero_length_is_empty() {
+        let mut cursor = io::Cursor::new(b"abc".to_vec());
+        assert!(read_payload(&mut cursor, 0).await.unwrap().is_empty());
+    }
 
     // -- Frame header roundtrip --
 

@@ -4,8 +4,8 @@
 //! or features available in a registry namespace.  It is published as an
 //! OCI artifact with a specific media type.
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
+use oci_client::Reference;
+use oci_client::client::{ClientConfig, ClientProtocol};
 use tracing::debug;
 
 use crate::cache::TemplateCache;
@@ -124,7 +124,7 @@ async fn fetch_collection_json(collection_ref: &str) -> Result<String, TemplateE
         protocol: ClientProtocol::Https,
         ..ClientConfig::default()
     };
-    let client = oci_distribution::Client::new(config);
+    let client = oci_client::Client::new(config);
 
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
     let auth = build_registry_auth(&registry);
