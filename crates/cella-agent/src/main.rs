@@ -177,13 +177,12 @@ async fn main() {
         .compact()
         .init();
 
-    // rustls 0.23 refuses to pick a default crypto provider when both `ring`
-    // and `aws-lc-rs` end up in the dependency graph — it panics on first use
-    // (acceptor.accept, connector.connect) from inside a spawned task where
-    // the panic goes only to stderr, which the entrypoint redirects to
-    // /dev/null. Without this call, every MITM'd HTTPS request silently
-    // aborts. Install ring explicitly so the behaviour is deterministic
-    // regardless of what other workspace crates enable.
+    // Install the provider explicitly rather than relying on rustls picking
+    // one. If it ever fails to resolve, rustls panics on first use
+    // (acceptor.accept, connector.connect) from inside a spawned task whose
+    // stderr the entrypoint sends to /dev/null — every MITM'd HTTPS request
+    // would abort silently. aws-lc-rs is currently the only provider in the
+    // graph; naming it keeps the behaviour deterministic if that changes.
     if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
