@@ -280,14 +280,14 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
 pub async fn reannounce_messages() -> Vec<AgentMessage> {
     let mut out = Vec::new();
     for st in states() {
-        let patch = derive_patch(
-            st.doc,
-            &st.path,
-            &*st.baseline.lock().await,
-            st.map.as_ref(),
-        )
-        .await
-        .unwrap_or_else(|| serde_json::json!({}));
+        // Clone the baseline and drop the guard before the await: a temporary
+        // guard in argument position lives to the end of the `let` statement,
+        // so passing `&*lock().await` inline would hold the mutex across
+        // `derive_patch`'s own file read.
+        let baseline = st.baseline.lock().await.clone();
+        let patch = derive_patch(st.doc, &st.path, &baseline, st.map.as_ref())
+            .await
+            .unwrap_or_else(|| serde_json::json!({}));
         out.push(AgentMessage::ConfigDocPatch {
             doc: st.doc,
             patch: patch.to_string(),
