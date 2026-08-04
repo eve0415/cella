@@ -86,7 +86,7 @@ impl DocState {
     /// a deletion. The worst case of a lost baseline is a local edit that fails
     /// to propagate — never a peer's state being reverted.
     fn new(doc: SyncDoc, path: PathBuf, map: Option<PathMap>, baseline_dir: &Path) -> Self {
-        let baseline_path = baseline_dir.join(format!("{}.json", slug(doc)));
+        let baseline_path = baseline_dir.join(format!("{}.json", doc.as_str()));
         let baseline = load_baseline(&baseline_path)
             .or_else(|| read_canonical(doc, &path, map.as_ref()))
             .unwrap_or_else(|| serde_json::json!({}));
@@ -115,15 +115,6 @@ impl DocState {
             );
         }
         *self.baseline.lock().await = canonical;
-    }
-}
-
-/// Stable on-disk name for a document's baseline file.
-const fn slug(doc: SyncDoc) -> &'static str {
-    match doc {
-        SyncDoc::ClaudeJson => "claude_json",
-        SyncDoc::InstalledPlugins => "installed_plugins",
-        SyncDoc::KnownMarketplaces => "known_marketplaces",
     }
 }
 
@@ -239,27 +230,28 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
         debug!("doc sync: plugin manifests not configured, skipping");
         return Vec::new();
     }
-    let dir = PathBuf::from(plugins_dir.clone().unwrap_or_default());
+    let dir = plugins_dir.clone().map(PathBuf::from);
     match resolve_path_map(
         plugins_dir,
         host_home,
         env_value("CELLA_CONTAINER_WORKSPACE"),
         env_value("CELLA_HOST_WORKSPACE"),
     ) {
-        Ok(map) => [
-            (SyncDoc::InstalledPlugins, "installed_plugins.json"),
-            (SyncDoc::KnownMarketplaces, "known_marketplaces.json"),
-        ]
-        .into_iter()
-        .map(|(doc, file)| {
-            Arc::new(DocState::new(
-                doc,
-                dir.join(file),
-                Some(map.clone()),
-                baseline_dir,
-            ))
-        })
-        .collect(),
+        // `dir` is `Some` whenever `resolve_path_map` succeeded — it is built from
+        // the same `CELLA_PLUGINS_DIR` that call requires.
+        Ok(map) => dir.map_or_else(Vec::new, |dir| {
+            [SyncDoc::InstalledPlugins, SyncDoc::KnownMarketplaces]
+                .into_iter()
+                .map(|doc| {
+                    Arc::new(DocState::new(
+                        doc,
+                        dir.join(doc.file_name()),
+                        Some(map.clone()),
+                        baseline_dir,
+                    ))
+                })
+                .collect()
+        }),
         Err(missing) => {
             warn!(
                 "doc sync: {missing} is unset; not falling back to $HOME because the agent daemon \

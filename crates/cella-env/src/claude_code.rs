@@ -682,4 +682,52 @@ mod tests {
     fn invalid_json_yields_none_rather_than_a_default() {
         assert!(to_canonical(SyncDoc::KnownMarketplaces, "{not json", None).is_none());
     }
+
+    /// The property the two codec `match` arms must jointly satisfy: for every
+    /// document, `to_local` then `to_canonical` is the identity on canonical
+    /// values. Exhaustive matching forces a new `SyncDoc` variant to be handled
+    /// in both arms, but nothing else checks that the two agree.
+    ///
+    /// Stated canonical-first rather than disk-first on purpose:
+    /// `denormalize_installed_plugins` emits entries in sorted context-key
+    /// order, so the disk-first direction only holds for an already-sorted
+    /// input, while this direction holds unconditionally.
+    #[test]
+    fn codec_roundtrips_canonical_for_every_document() {
+        let cases = [
+            (
+                SyncDoc::ClaudeJson,
+                json!({ "projects": { "/Users/alice/p": { "k": 1 } } }),
+            ),
+            (
+                SyncDoc::KnownMarketplaces,
+                json!({ "m": { "installLocation": "/Users/alice/.claude/plugins/marketplaces/m" } }),
+            ),
+            (
+                SyncDoc::InstalledPlugins,
+                json!({ "version": 2, "plugins": { "p@m": {
+                    "project:/Users/alice/src/cella": {
+                        "scope": "project",
+                        "projectPath": "/Users/alice/src/cella",
+                        "installPath": "/Users/alice/.claude/plugins/cache/p"
+                    },
+                    "user": {
+                        "scope": "user",
+                        "installPath": "/Users/alice/.claude/plugins/cache/p"
+                    }
+                }}}),
+            ),
+        ];
+        for (doc, canonical) in cases {
+            for map in [None, Some(test_map())] {
+                let local = to_local(doc, &canonical, map.as_ref());
+                assert_eq!(
+                    to_canonical(doc, &local, map.as_ref()).expect("codec output must reparse"),
+                    canonical,
+                    "{doc:?} roundtrip failed (map: {})",
+                    map.is_some()
+                );
+            }
+        }
+    }
 }

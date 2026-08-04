@@ -139,7 +139,7 @@ pub async fn on_host_change(
     }
 
     if canonical_changed {
-        broadcast(handles, doc, &out, None).await;
+        broadcast(handles, doc, &out).await;
     }
 }
 
@@ -197,39 +197,47 @@ pub async fn on_agent_change(
         (st.on_disk_string(), changed)
     };
 
-    send_to(handles, sender, doc, &out).await;
-
     if !changed {
+        // Nothing new for the peers, but the sender still gets canonical: its
+        // patch may have been empty because it is *behind*, not in sync.
+        send_to(handles, sender, doc, &out).await;
         return;
     }
     if let Some(path) = host_path {
         write_host_guarded(state, path, &out).await;
     }
-    broadcast(handles, doc, &out, Some(sender)).await;
+    // Broadcast includes the sender — its own content hash drops the echo, so a
+    // separate reply would be a duplicate.
+    broadcast(handles, doc, &out).await;
+}
+
+/// Send one canonical document to a connected agent.
+async fn push(tx: &tokio::sync::mpsc::Sender<DaemonMessage>, doc: SyncDoc, content: &str) {
+    let _ = tx
+        .send(DaemonMessage::SyncConfigDoc {
+            doc,
+            content: content.to_string(),
+        })
+        .await;
 }
 
 /// Send `content` as a `SyncConfigDoc` to every opted-in connected agent,
-/// optionally excluding one container (the origin of an inbound change, which
-/// gets its reply via [`send_to`] instead).
-async fn broadcast(handles: &Handles, doc: SyncDoc, content: &str, exclude: Option<&str>) {
+/// including the origin of an inbound change — its own content hash drops the
+/// echo, so excluding it would only cost a branch.
+async fn broadcast(handles: &Handles, doc: SyncDoc, content: &str) {
     // Clone the senders under the lock, then send after releasing it — never
     // hold the registry mutex across an await.
     let senders: Vec<tokio::sync::mpsc::Sender<DaemonMessage>> = {
         let registry = handles.lock().await;
         registry
             .iter()
-            .filter(|(name, h)| h.claude_config_sync && exclude != Some(name.as_str()))
+            .filter(|(_, h)| h.claude_config_sync)
             .filter_map(|(_, h)| h.agent_tx.clone())
             .collect()
     };
 
     for tx in senders {
-        let _ = tx
-            .send(DaemonMessage::SyncConfigDoc {
-                doc,
-                content: content.to_string(),
-            })
-            .await;
+        push(&tx, doc, content).await;
     }
 }
 
@@ -244,12 +252,7 @@ async fn send_to(handles: &Handles, name: &str, doc: SyncDoc, content: &str) {
             .and_then(|h| h.agent_tx.clone())
     };
     if let Some(tx) = tx {
-        let _ = tx
-            .send(DaemonMessage::SyncConfigDoc {
-                doc,
-                content: content.to_string(),
-            })
-            .await;
+        push(&tx, doc, content).await;
     }
 }
 

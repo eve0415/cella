@@ -69,11 +69,15 @@ pub fn build_doc_sync_hubs() -> HashMap<SyncDoc, DocSyncHub> {
         ),
         (
             SyncDoc::InstalledPlugins,
-            plugins.as_ref().map(|d| d.join("installed_plugins.json")),
+            plugins
+                .as_ref()
+                .map(|d| d.join(SyncDoc::InstalledPlugins.file_name())),
         ),
         (
             SyncDoc::KnownMarketplaces,
-            plugins.as_ref().map(|d| d.join("known_marketplaces.json")),
+            plugins
+                .as_ref()
+                .map(|d| d.join(SyncDoc::KnownMarketplaces.file_name())),
         ),
     ];
     paths

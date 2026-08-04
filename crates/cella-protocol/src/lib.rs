@@ -27,6 +27,33 @@ pub enum SyncDoc {
     KnownMarketplaces,
 }
 
+impl SyncDoc {
+    /// The document's on-disk basename, so the daemon and the agent cannot
+    /// disagree about which file a variant refers to.
+    #[must_use]
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::ClaudeJson => ".claude.json",
+            Self::InstalledPlugins => "installed_plugins.json",
+            Self::KnownMarketplaces => "known_marketplaces.json",
+        }
+    }
+
+    /// Stable identifier for this document, matching its serde tag.
+    ///
+    /// Callers that need a name for a file or a log line use this rather than
+    /// hand-rolling a second mapping; `sync_doc_str_matches_serde_tag` pins the
+    /// two together so a new variant cannot drift.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeJson => "claude_json",
+            Self::InstalledPlugins => "installed_plugins",
+            Self::KnownMarketplaces => "known_marketplaces",
+        }
+    }
+}
+
 /// Sent by an agent on a new TCP connection to identify it as a reverse tunnel
 /// for an active port-forward. Discriminated from [`AgentHello`] by the
 /// `connection_id` field.
@@ -1413,6 +1440,21 @@ mod tests {
             assert!(hostname_proxy.is_none());
         } else {
             panic!("Expected Status");
+        }
+    }
+
+    #[test]
+    fn sync_doc_str_matches_serde_tag() {
+        for doc in [
+            SyncDoc::ClaudeJson,
+            SyncDoc::InstalledPlugins,
+            SyncDoc::KnownMarketplaces,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&doc).expect("encode"),
+                format!("\"{}\"", doc.as_str()),
+                "as_str must not drift from the serde tag"
+            );
         }
     }
 
