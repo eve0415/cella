@@ -9,6 +9,7 @@ cli = ["dep:clap"]
 
 [dependencies]
 cella-network.workspace = true
+cella-protocol.workspace = true
 clap = { workspace = true, optional = true }
 miette.workspace = true
 serde_json.workspace = true

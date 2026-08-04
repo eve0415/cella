@@ -11,6 +11,22 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version for the agent↔daemon handshake.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Which forwarded Claude Code document a sync message or codec call refers to.
+///
+/// All three are gated by the single `AgentHello.claude_config_sync` opt-in:
+/// they are all Claude Code configuration forwarded under the same setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncDoc {
+    /// `~/.claude.json` — no path translation and no normalization: host and
+    /// container `projects` keys are disjoint and merge additively.
+    ClaudeJson,
+    /// `~/.claude/plugins/installed_plugins.json`.
+    InstalledPlugins,
+    /// `~/.claude/plugins/known_marketplaces.json`.
+    KnownMarketplaces,
+}
+
 /// Sent by an agent on a new TCP connection to identify it as a reverse tunnel
 /// for an active port-forward. Discriminated from [`AgentHello`] by the
 /// `connection_id` field.
