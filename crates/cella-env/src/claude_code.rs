@@ -133,6 +133,84 @@ pub fn diff_merge_patch(old: &serde_json::Value, new: &serde_json::Value) -> ser
     serde_json::Value::Object(patch)
 }
 
+/// Key an `installed_plugins.json` entry by its install context.
+///
+/// `scope` alone is ambiguous once a plugin is installed for more than one
+/// project, so a non-user scope is qualified by its `projectPath`.
+fn entry_context_key(entry: &serde_json::Value) -> String {
+    let scope = entry
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("user");
+    match entry.get("projectPath").and_then(serde_json::Value::as_str) {
+        Some(path) => format!("{scope}:{path}"),
+        None => scope.to_string(),
+    }
+}
+
+/// Rewrite each `plugins[key]` entry array into an object keyed by install
+/// context.
+///
+/// RFC 7386 replaces arrays wholesale, so leaving the entry lists as arrays
+/// would make two containers editing different scopes of the same plugin
+/// clobber each other. This form exists only in memory and on the wire —
+/// [`denormalize_installed_plugins`] restores the on-disk schema before any
+/// write.
+///
+/// A `plugins` value that is not an array is passed through unchanged rather
+/// than dropped: an unrecognised shape from a newer Claude Code must survive a
+/// round trip, not be silently deleted.
+#[must_use]
+pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value {
+    let mut out = doc.clone();
+    let Some(plugins) = out
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return out;
+    };
+    for value in plugins.values_mut() {
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
+        let mut keyed = serde_json::Map::new();
+        for entry in entries {
+            keyed.insert(entry_context_key(entry), entry.clone());
+        }
+        *value = serde_json::Value::Object(keyed);
+    }
+    out
+}
+
+/// Restore the on-disk entry-array schema from the normalized form.
+///
+/// Entries are emitted in sorted context-key order so the output is byte-stable:
+/// loop suppression hashes raw bytes, and an unstable order would read as a
+/// change on every write.
+#[must_use]
+pub fn denormalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value {
+    let mut out = doc.clone();
+    let Some(plugins) = out
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return out;
+    };
+    for value in plugins.values_mut() {
+        let Some(keyed) = value.as_object() else {
+            continue;
+        };
+        let mut keys: Vec<&String> = keyed.keys().collect();
+        keys.sort();
+        let entries: Vec<serde_json::Value> = keys
+            .into_iter()
+            .filter_map(|k| keyed.get(k).cloned())
+            .collect();
+        *value = serde_json::Value::Array(entries);
+    }
+    out
+}
+
 use crate::paths::home_dir;
 
 #[cfg(test)]
@@ -308,5 +386,80 @@ mod tests {
                 "roundtrip failed for old={old} new={new}"
             );
         }
+    }
+
+    // ── installed_plugins.json normalization ────────────────────────────────
+
+    #[test]
+    fn normalize_keys_entries_by_scope_and_project() {
+        let doc = json!({
+            "version": 2,
+            "plugins": {
+                "p@m": [
+                    { "scope": "user", "installPath": "/h/.claude/plugins/cache/p" },
+                    { "scope": "project", "projectPath": "/w/a", "installPath": "/h/.claude/plugins/cache/p" }
+                ]
+            }
+        });
+        let n = normalize_installed_plugins(&doc);
+        assert_eq!(n["version"], json!(2));
+        let entries = &n["plugins"]["p@m"];
+        assert!(entries.get("user").is_some());
+        assert!(entries.get("project:/w/a").is_some());
+        assert_eq!(
+            entries["user"]["installPath"],
+            json!("/h/.claude/plugins/cache/p")
+        );
+    }
+
+    /// The merge granularity this normalization exists for: two sources editing
+    /// different install contexts of the same plugin must not clobber each other,
+    /// which a wholesale-replaced array cannot express.
+    #[test]
+    fn normalized_form_merges_per_context() {
+        let base = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        let theirs = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "2.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        let patch = diff_merge_patch(&base, &theirs);
+        let merged = apply_merge_patch(&base, &patch);
+        assert_eq!(merged["plugins"]["p@m"]["user"]["version"], json!("2.0"));
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/a"]["version"],
+            json!("1.0")
+        );
+    }
+
+    #[test]
+    fn denormalize_roundtrips_with_sorted_entries() {
+        let doc = json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        });
+        let back = denormalize_installed_plugins(&normalize_installed_plugins(&doc));
+        let entries = back["plugins"]["p@m"].as_array().expect("array restored");
+        assert_eq!(entries.len(), 2);
+        // Sorted by context key: "project:/w/a" < "user".
+        assert_eq!(entries[0]["scope"], json!("project"));
+        assert_eq!(entries[1]["scope"], json!("user"));
+    }
+
+    #[test]
+    fn normalize_leaves_unexpected_shapes_untouched() {
+        let doc = json!({ "version": 2, "plugins": { "p@m": "not-an-array" } });
+        assert_eq!(normalize_installed_plugins(&doc), doc);
     }
 }
