@@ -561,6 +561,36 @@ mod tests {
         );
     }
 
+    /// Wiring guard for the two new hubs: a host-side plugin manifest edit must
+    /// reach opted-in agents tagged with the right document, the direction that
+    /// did not exist at all before (the old sync was container -> host only).
+    #[tokio::test]
+    async fn host_edit_to_a_plugin_manifest_broadcasts_to_agents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        std::fs::write(&host, r#"{"official":{"lastUpdated":"1"}}"#).expect("seed host");
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        std::fs::write(&host, r#"{"official":{"lastUpdated":"2"}}"#).expect("host edit");
+        on_host_change(&state, &handles, &host, SyncDoc::KnownMarketplaces).await;
+
+        let DaemonMessage::SyncConfigDoc { doc, content } =
+            agent.try_recv().expect("agent must be notified")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        assert_eq!(doc, SyncDoc::KnownMarketplaces);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["official"]["lastUpdated"],
+            json!("2")
+        );
+    }
+
     /// The host file keeps its real entry-array schema; the normalized
     /// context-keyed form is in-memory and on-the-wire only.
     #[tokio::test]
