@@ -102,12 +102,7 @@ pub(crate) async fn run_management_server(
             phantom_registry: ctx.phantom_registry.clone(),
             is_orbstack: ctx.is_orbstack,
             hostname_route_table: ctx.hostname_route_table.clone(),
-            claude_sync: Arc::new(Mutex::new(
-                crate::claude_config_sync::ClaudeSyncState::load(
-                    cella_env::claude_code::host_claude_json_path().as_deref(),
-                ),
-            )),
-            claude_json_path: cella_env::claude_code::host_claude_json_target(),
+            doc_sync: crate::control_server::build_doc_sync_hubs(),
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(

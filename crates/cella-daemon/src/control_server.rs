@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cella_protocol::{
-    AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol,
+    AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol, SyncDoc,
     TunnelHandshake,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -40,11 +40,53 @@ pub(crate) struct ControlContext {
     pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
     pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
-    /// Canonical `~/.claude.json` state for bidirectional sync.
-    pub claude_sync: Arc<Mutex<crate::claude_config_sync::ClaudeSyncState>>,
-    /// Host-side `~/.claude.json` path to watch and write (target path; the
-    /// file need not exist yet). `None` if the host home can't be resolved.
-    pub claude_json_path: Option<std::path::PathBuf>,
+    /// One merge hub per synced document, each with its own lock so a plugin
+    /// manifest write never blocks a `~/.claude.json` write. Keyed by document,
+    /// with the host path to watch and write (target path; the file need not
+    /// exist yet). A document whose host path can't be resolved is absent.
+    pub doc_sync: HashMap<SyncDoc, DocSyncHub>,
+}
+
+/// One document's merge hub plus the host file it owns.
+#[derive(Clone)]
+pub struct DocSyncHub {
+    pub state: Arc<Mutex<crate::doc_sync::DocSyncState>>,
+    pub host_path: std::path::PathBuf,
+}
+
+/// Build the per-document hubs from the host paths that resolve.
+///
+/// The plugin hubs exist only when `host_plugins_dir()` does — the same
+/// condition that gates the hidden host mount and the create-time env vars, so
+/// hubs, mounts, and env never disagree.
+#[must_use]
+pub fn build_doc_sync_hubs() -> HashMap<SyncDoc, DocSyncHub> {
+    let plugins = cella_env::claude_code::host_plugins_dir();
+    let paths = [
+        (
+            SyncDoc::ClaudeJson,
+            cella_env::claude_code::host_claude_json_target(),
+        ),
+        (
+            SyncDoc::InstalledPlugins,
+            plugins.as_ref().map(|d| d.join("installed_plugins.json")),
+        ),
+        (
+            SyncDoc::KnownMarketplaces,
+            plugins.as_ref().map(|d| d.join("known_marketplaces.json")),
+        ),
+    ];
+    paths
+        .into_iter()
+        .filter_map(|(doc, path)| {
+            let host_path = path?;
+            let state = Arc::new(Mutex::new(crate::doc_sync::DocSyncState::load(
+                host_path.is_file().then_some(host_path.as_path()),
+                doc,
+            )));
+            Some((doc, DocSyncHub { state, host_path }))
+        })
+        .collect()
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -87,9 +129,9 @@ pub struct ContainerHandle {
     pub docker_host: Option<String>,
     /// Channel for sending daemon-initiated messages to the connected agent.
     pub agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
-    /// Whether the connected agent opted into `~/.claude.json` sync
+    /// Whether the connected agent opted into Claude Code config sync
     /// (advertised via `AgentHello.claude_config_sync`). The daemon only
-    /// broadcasts config updates to handles where this is true.
+    /// broadcasts document updates to handles where this is true.
     pub claude_config_sync: bool,
     pub(crate) agent_tx_generation: u64,
 }
@@ -268,19 +310,21 @@ pub(crate) async fn run_control_server(
 ) {
     let ctx = Arc::new(ctx);
 
-    // Watch the host `~/.claude.json` and propagate edits to opted-in agents.
-    if let Some(path) = ctx.claude_json_path.clone() {
-        let state = ctx.claude_sync.clone();
+    // Watch each host document and propagate edits to opted-in agents. The
+    // watcher tracks the parent directory, so a manifest that Claude Code has
+    // not written yet is fine as long as its directory exists.
+    for (doc, hub) in ctx.doc_sync.clone() {
         let handles = ctx.container_handles.clone();
         tokio::spawn(async move {
-            match cella_filesync::watch_file(&path, std::time::Duration::from_millis(300)) {
+            let DocSyncHub { state, host_path } = hub;
+            match cella_filesync::watch_file(&host_path, std::time::Duration::from_millis(300)) {
                 Ok(mut handle) => {
-                    debug!("claude sync: watching host {}", path.display());
+                    debug!("doc sync: watching host {}", host_path.display());
                     while handle.changes.recv().await.is_some() {
-                        crate::claude_config_sync::on_host_change(&state, &handles, &path).await;
+                        crate::doc_sync::on_host_change(&state, &handles, &host_path, doc).await;
                     }
                 }
-                Err(e) => warn!("claude sync: cannot watch host ~/.claude.json: {e}"),
+                Err(e) => warn!("doc sync: cannot watch host {}: {e}", host_path.display()),
             }
         });
     }
@@ -326,10 +370,10 @@ struct HandshakeResult {
     workspace_path: Option<String>,
     /// Host-side parent repo root (set for worktree containers).
     parent_repo: Option<String>,
-    /// Whether the agent opted into `~/.claude.json` sync. Gates both the
-    /// canonical push on connect and — crucially — ingest of inbound
-    /// `ClaudeConfigChanged`, so a non-opted-in container cannot write the host
-    /// config or poison peers.
+    /// Whether the agent opted into Claude Code config sync. Gates both the
+    /// canonical push and — crucially — ingest of inbound `ConfigDocPatch` for
+    /// all three documents, so a non-opted-in container cannot write any host
+    /// document or poison peers.
     claude_config_sync: bool,
     transient: bool,
 }
@@ -446,26 +490,35 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
     hs: &HandshakeResult,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // `~/.claude.json` sync: diff into a merge-patch, apply to the canonical
-    // config, write the host file, re-broadcast to the other agents, and push
-    // back to the sender if it is missing keys.
+    // Config document sync: apply the agent's merge patch to the canonical
+    // document, write the host file, re-broadcast to the other agents, and reply
+    // to the sender with canonical so a reconnecting container converges.
     //
     // Ingest is gated on the sender's opt-in (symmetric with the broadcast
     // gate): a container that wasn't granted config forwarding must not be able
-    // to write the host `~/.claude.json` or poison peer containers.
-    if let AgentMessage::ClaudeConfigChanged { content } = &msg {
+    // to write any host document or poison peer containers. The single gate
+    // covers all three documents, matching the single `claude_config_sync` flag.
+    if let AgentMessage::ConfigDocPatch { doc, patch } = &msg {
         if !hs.claude_config_sync {
             warn!(
-                "Dropping ClaudeConfigChanged from {} (did not opt into config sync)",
+                "Dropping ConfigDocPatch from {} (did not opt into config sync)",
                 hs.container_name
             );
             return Ok(());
         }
-        crate::claude_config_sync::on_agent_change(
-            &ctx.claude_sync,
+        let Some(hub) = ctx.doc_sync.get(doc) else {
+            warn!(
+                "Dropping {doc:?} patch from {}: no hub for that document",
+                hs.container_name
+            );
+            return Ok(());
+        };
+        crate::doc_sync::on_agent_change(
+            &hub.state,
             &ctx.container_handles,
-            ctx.claude_json_path.as_deref(),
-            content,
+            Some(hub.host_path.as_path()),
+            *doc,
+            patch,
             &hs.container_name,
         )
         .await;
@@ -937,7 +990,7 @@ pub(crate) async fn handle_agent_message(
 
         // Handled upstream in the message loop (needs the canonical sync state
         // and broadcast access); never reaches this catch-all in practice.
-        AgentMessage::ClaudeConfigChanged { .. } => None,
+        AgentMessage::ConfigDocPatch { .. } => None,
 
         // Worktree/exec/task operations are handled in the message loop via
         // handle_worktree_message() which has writer access for streaming.
@@ -3202,10 +3255,7 @@ mod tests {
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
-            claude_sync: Arc::new(Mutex::new(
-                crate::claude_config_sync::ClaudeSyncState::load(None),
-            )),
-            claude_json_path: None,
+            doc_sync: HashMap::new(),
         }
     }
 
@@ -3391,23 +3441,35 @@ mod tests {
         }
     }
 
+    /// Install a `ClaudeJson` hub over `host` in a test context.
+    fn with_claude_json_hub(ctx: &mut ControlContext, host: &std::path::Path) {
+        ctx.doc_sync = HashMap::from([(
+            SyncDoc::ClaudeJson,
+            DocSyncHub {
+                state: Arc::new(Mutex::new(crate::doc_sync::DocSyncState::load(
+                    Some(host),
+                    SyncDoc::ClaudeJson,
+                ))),
+                host_path: host.to_path_buf(),
+            },
+        )]);
+    }
+
     /// Regression: a container that did NOT opt into config sync must not be
-    /// able to write the host `~/.claude.json` via `ClaudeConfigChanged`.
+    /// able to write the host `~/.claude.json` via `ConfigDocPatch`.
     #[tokio::test]
-    async fn claude_config_changed_ingest_gated_on_opt_in() {
+    async fn config_doc_patch_ingest_gated_on_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let host = dir.path().join(".claude.json");
         std::fs::write(&host, b"{}").unwrap();
 
         let handles = Arc::new(Mutex::new(HashMap::new()));
         let mut ctx = test_control_context(handles, "tok");
-        ctx.claude_json_path = Some(host.clone());
-        ctx.claude_sync = Arc::new(Mutex::new(
-            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
-        ));
+        with_claude_json_hub(&mut ctx, &host);
 
-        let msg = AgentMessage::ClaudeConfigChanged {
-            content: r#"{"projects":{"/evil":{}}}"#.to_string(),
+        let msg = AgentMessage::ConfigDocPatch {
+            doc: SyncDoc::ClaudeJson,
+            patch: r#"{"projects":{"/evil":{}}}"#.to_string(),
         };
         let (_d, agent_side) = tokio::io::duplex(4096);
         let (_r, mut w) = tokio::io::split(agent_side);
@@ -3425,20 +3487,18 @@ mod tests {
 
     /// Counterpart: an opted-in container's change is applied to the host file.
     #[tokio::test]
-    async fn claude_config_changed_applied_when_opted_in() {
+    async fn config_doc_patch_applied_when_opted_in() {
         let dir = tempfile::tempdir().unwrap();
         let host = dir.path().join(".claude.json");
         std::fs::write(&host, b"{}").unwrap();
 
         let handles = Arc::new(Mutex::new(HashMap::new()));
         let mut ctx = test_control_context(handles, "tok");
-        ctx.claude_json_path = Some(host.clone());
-        ctx.claude_sync = Arc::new(Mutex::new(
-            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
-        ));
+        with_claude_json_hub(&mut ctx, &host);
 
-        let msg = AgentMessage::ClaudeConfigChanged {
-            content: r#"{"projects":{"/workspaces/p":{}}}"#.to_string(),
+        let msg = AgentMessage::ConfigDocPatch {
+            doc: SyncDoc::ClaudeJson,
+            patch: r#"{"projects":{"/workspaces/p":{}}}"#.to_string(),
         };
         let (_d, agent_side) = tokio::io::duplex(4096);
         let (_r, mut w) = tokio::io::split(agent_side);
@@ -3454,12 +3514,12 @@ mod tests {
         );
     }
 
-    /// Reconnect/catch-up wiring: an opted-in container that re-announces a config
-    /// missing a key the canonical holds must get a push-back carrying it, routed
+    /// Reconnect/catch-up wiring: an opted-in container that re-announces an
+    /// empty patch must still get canonical back, routed
     /// `dispatch_agent_message` -> `on_agent_change` -> the handle's `agent_tx`.
     /// Covers the daemon half of the (re)connect reconcile end to end.
     #[tokio::test]
-    async fn claude_config_changed_pushes_back_missing_keys() {
+    async fn config_doc_patch_replies_with_canonical() {
         let dir = tempfile::tempdir().unwrap();
         let host = dir.path().join(".claude.json");
         // Canonical (seeded from the host) holds a project the agent won't send.
@@ -3482,14 +3542,12 @@ mod tests {
         );
         let handles = Arc::new(Mutex::new(map));
         let mut ctx = test_control_context(handles, "tok");
-        ctx.claude_json_path = Some(host.clone());
-        ctx.claude_sync = Arc::new(Mutex::new(
-            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
-        ));
+        with_claude_json_hub(&mut ctx, &host);
 
-        // Agent re-announces a config lacking the canonical's project key.
-        let msg = AgentMessage::ClaudeConfigChanged {
-            content: r#"{"keep":true}"#.to_string(),
+        // Agent re-announces with nothing of its own to contribute.
+        let msg = AgentMessage::ConfigDocPatch {
+            doc: SyncDoc::ClaudeJson,
+            patch: "{}".to_string(),
         };
         let (_d, agent_side) = tokio::io::duplex(4096);
         let (_r, mut w) = tokio::io::split(agent_side);
@@ -3497,10 +3555,10 @@ mod tests {
             .await
             .unwrap();
 
-        let DaemonMessage::SyncClaudeConfig { content } =
-            rx.try_recv().expect("agent must receive a push-back")
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            rx.try_recv().expect("agent must receive canonical")
         else {
-            panic!("expected SyncClaudeConfig");
+            panic!("expected SyncConfigDoc");
         };
         let pushed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
