@@ -92,6 +92,43 @@ fn extract_into(blob: &[u8], media_type: &str, dest: &Path) {
     extract_layer(divan::black_box(blob), media_type, dest).expect("extraction succeeds");
 }
 
+/// Payload with realistic entropy. The layer fixture repeats one short line,
+/// which compresses ~100:1 and would make any inflate backend look free —
+/// real feature tarballs carry scripts and binaries that do not.
+fn mixed_entropy_payload(bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    while out.len() < bytes {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // Half incompressible bytes, half repeated text, so the ratio lands in
+        // the same range as a real layer rather than at either extreme.
+        if state & 1 == 0 {
+            out.extend_from_slice(&state.to_le_bytes());
+        } else {
+            out.extend_from_slice(b"export PATH=\"/usr/local/bin:$PATH\"\n");
+        }
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// Gzip decompression on its own, isolated from tar walking and filesystem
+/// work. This is the bench that actually says something about the inflate
+/// backend (`flate2`'s `zlib-rs` vs `miniz_oxide`) — in a full extraction the
+/// per-entry syscalls dominate and hide it.
+#[divan::bench(args = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024])]
+fn gzip_decompress(bencher: divan::Bencher, bytes: usize) {
+    let compressed = gzip(&mixed_entropy_payload(bytes));
+    bencher.bench(|| {
+        let mut out = Vec::with_capacity(bytes);
+        let mut decoder = flate2::read::GzDecoder::new(divan::black_box(&compressed[..]));
+        std::io::Read::read_to_end(&mut decoder, &mut out).expect("inflate");
+        divan::black_box(out)
+    });
+}
+
 /// Plain-tar layers: the devcontainer feature media type, where per-entry
 /// validation is the dominant CPU cost (no decompression to hide behind).
 #[divan::bench(args = ENTRY_COUNTS)]
