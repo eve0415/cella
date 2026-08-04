@@ -299,7 +299,46 @@ pub fn denormalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Val
     out
 }
 
+/// On-disk content → canonical (host-shaped, normalized) form.
+///
+/// `map` is `None` on the host, where the on-disk form is already host-shaped.
+/// It is also ignored for [`SyncDoc::ClaudeJson`], whose codec is the identity:
+/// host and container `projects` keys are disjoint and merge additively, so that
+/// document is never path-translated regardless of what the caller passes.
+///
+/// Returns `None` for unparseable input so the caller can skip the event rather
+/// than merge a fabricated empty document over real state.
+#[must_use]
+pub fn to_canonical(doc: SyncDoc, raw: &str, map: Option<&PathMap>) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    Some(match doc {
+        SyncDoc::ClaudeJson => parsed,
+        SyncDoc::KnownMarketplaces => map.map_or_else(|| parsed.clone(), |m| m.to_host(&parsed)),
+        SyncDoc::InstalledPlugins => {
+            let hosted = map.map_or_else(|| parsed.clone(), |m| m.to_host(&parsed));
+            normalize_installed_plugins(&hosted)
+        }
+    })
+}
+
+/// Canonical form → on-disk content for whichever side `map` describes.
+#[must_use]
+pub fn to_local(doc: SyncDoc, canonical: &serde_json::Value, map: Option<&PathMap>) -> String {
+    let localized = match doc {
+        SyncDoc::ClaudeJson => canonical.clone(),
+        SyncDoc::KnownMarketplaces => {
+            map.map_or_else(|| canonical.clone(), |m| m.to_container(canonical))
+        }
+        SyncDoc::InstalledPlugins => {
+            let denormalized = denormalize_installed_plugins(canonical);
+            map.map_or_else(|| denormalized.clone(), |m| m.to_container(&denormalized))
+        }
+    };
+    serde_json::to_string_pretty(&localized).unwrap_or_else(|_| "{}".to_string())
+}
+
 use crate::paths::home_dir;
+use cella_protocol::SyncDoc;
 
 #[cfg(test)]
 mod tests {
@@ -632,5 +671,57 @@ mod tests {
         };
         let doc = json!({ "p": [{ "projectPath": "/workspaces/other" }] });
         assert_eq!(map.to_host(&doc), doc);
+    }
+
+    // ── document codec ──────────────────────────────────────────────────────
+
+    #[test]
+    fn claude_json_codec_is_identity() {
+        let raw = r#"{"projects":{"/workspaces/x":{}}}"#;
+        let canon = to_canonical(SyncDoc::ClaudeJson, raw, None).expect("parses");
+        assert_eq!(
+            canon,
+            serde_json::from_str::<serde_json::Value>(raw).expect("valid json")
+        );
+    }
+
+    /// `~/.claude.json` never gets path translation: host and container
+    /// `projects` keys are disjoint and merge additively, so a map passed by a
+    /// caller that syncs all three documents must be ignored for this one.
+    #[test]
+    fn claude_json_codec_ignores_the_path_map() {
+        let raw = r#"{"projects":{"/workspaces/x":{"projectPath":"/workspaces/cella"}}}"#;
+        let canon = to_canonical(SyncDoc::ClaudeJson, raw, Some(&test_map())).expect("parses");
+        assert_eq!(
+            canon,
+            serde_json::from_str::<serde_json::Value>(raw).expect("valid json")
+        );
+        assert_eq!(
+            to_local(SyncDoc::ClaudeJson, &canon, Some(&test_map())),
+            serde_json::to_string_pretty(&canon).expect("serializes")
+        );
+    }
+
+    #[test]
+    fn installed_plugins_codec_roundtrips_through_container_form() {
+        let on_disk = r#"{"version":2,"plugins":{"p@m":[{"scope":"user","installPath":"/home/vscode/.claude/plugins/cache/p"}]}}"#;
+        let map = test_map();
+        let canon = to_canonical(SyncDoc::InstalledPlugins, on_disk, Some(&map)).expect("parses");
+        // Canonical is host-shaped and normalized.
+        assert_eq!(
+            canon["plugins"]["p@m"]["user"]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        let local = to_local(SyncDoc::InstalledPlugins, &canon, Some(&map));
+        let reparsed: serde_json::Value = serde_json::from_str(&local).expect("valid json");
+        assert_eq!(
+            reparsed,
+            serde_json::from_str::<serde_json::Value>(on_disk).expect("valid json")
+        );
+    }
+
+    #[test]
+    fn invalid_json_yields_none_rather_than_a_default() {
+        assert!(to_canonical(SyncDoc::KnownMarketplaces, "{not json", None).is_none());
     }
 }
