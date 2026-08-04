@@ -38,7 +38,11 @@ pub struct RuleVerdict {
     /// Whether the request is allowed.
     pub allowed: bool,
     /// Human-readable explanation (e.g., "blocked by rule: *.prod.internal").
-    pub reason: String,
+    ///
+    /// Borrowed when no rule matched — the common case for every allowed
+    /// request — so the proxy's per-request path does not allocate just to
+    /// carry a constant string.
+    pub reason: Cow<'static, str>,
     /// The original rule pattern that matched, if any.
     pub matched_rule: Option<String>,
     /// Source of the matching rule (e.g., "cella.toml" or "devcontainer.json").
@@ -107,7 +111,8 @@ impl RuleMatcher {
                         "{} by rule: {}",
                         if allowed { "allowed" } else { "blocked" },
                         rule.pattern_display,
-                    ),
+                    )
+                    .into(),
                     matched_rule: Some(rule.pattern_display.clone()),
                     source: Some(rule.source.clone()),
                 };
@@ -118,13 +123,13 @@ impl RuleMatcher {
         match self.mode {
             NetworkMode::Denylist => RuleVerdict {
                 allowed: true,
-                reason: "allowed (no matching deny rule)".to_string(),
+                reason: Cow::Borrowed("allowed (no matching deny rule)"),
                 matched_rule: None,
                 source: None,
             },
             NetworkMode::Allowlist => RuleVerdict {
                 allowed: false,
-                reason: "blocked (no matching allow rule)".to_string(),
+                reason: Cow::Borrowed("blocked (no matching allow rule)"),
                 matched_rule: None,
                 source: None,
             },
@@ -154,7 +159,8 @@ impl RuleMatcher {
                     "{} by rule: {}",
                     if allowed { "allowed" } else { "blocked" },
                     rule.pattern_display,
-                ),
+                )
+                .into(),
                 matched_rule: Some(rule.pattern_display.clone()),
                 source: Some(rule.source.clone()),
             };
@@ -163,13 +169,13 @@ impl RuleMatcher {
         match self.mode {
             NetworkMode::Denylist => RuleVerdict {
                 allowed: true,
-                reason: "allowed (no matching deny rule)".to_string(),
+                reason: Cow::Borrowed("allowed (no matching deny rule)"),
                 matched_rule: None,
                 source: None,
             },
             NetworkMode::Allowlist => RuleVerdict {
                 allowed: false,
-                reason: "blocked (no matching allow rule)".to_string(),
+                reason: Cow::Borrowed("blocked (no matching allow rule)"),
                 matched_rule: None,
                 source: None,
             },
