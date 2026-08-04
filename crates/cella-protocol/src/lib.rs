@@ -79,10 +79,12 @@ pub struct AgentHello {
     pub container_name: String,
     /// Auth token for validating the connection.
     pub auth_token: String,
-    /// Whether this agent participates in `~/.claude.json` bidirectional sync
-    /// (set from `CELLA_SYNC_CLAUDE_CONFIG`). The daemon only broadcasts config
-    /// updates to agents that advertise this. Defaults to false for older
-    /// agents that don't send the field.
+    /// Whether this agent participates in Claude Code config sync (set from
+    /// `CELLA_SYNC_CLAUDE_CONFIG`). Gates all three [`SyncDoc`] documents —
+    /// `~/.claude.json` and both plugin manifests — since they are all Claude
+    /// Code configuration forwarded under the same setting. The daemon only
+    /// broadcasts to agents that advertise this, and only ingests patches from
+    /// them. Defaults to false for older agents that don't send the field.
     #[serde(default)]
     pub claude_config_sync: bool,
     /// One-shot connections (browser-open, credential, clipboard) set this so
@@ -157,9 +159,10 @@ pub enum AgentMessage {
         uptime_secs: u64,
         ports_detected: usize,
     },
-    /// The container's `~/.claude.json` changed; carries its full content for
-    /// the daemon to deep-merge into the canonical config and propagate.
-    ClaudeConfigChanged { content: String },
+    /// An RFC 7386 merge patch describing what changed in `doc` since the agent's
+    /// last successfully-synced baseline. A patch rather than the full document so
+    /// a container holding a stale copy cannot assert it over a peer's newer state.
+    ConfigDocPatch { doc: SyncDoc, patch: String },
 
     // -- Worktree operations (in-container CLI → daemon) --------------------
     /// Request to create a worktree-backed branch and its container.
@@ -532,10 +535,11 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_host: Option<String>,
     },
-    /// Push the canonical `~/.claude.json` content to the agent so it can write
-    /// it into the container. Only sent to agents that advertised
-    /// `claude_config_sync` in their `AgentHello`.
-    SyncClaudeConfig { content: String },
+    /// The daemon's canonical `doc`, broadcast after any change. Canonical form is
+    /// host-shaped and, for `InstalledPlugins`, normalized — the receiving agent
+    /// converts to its own on-disk form before writing. Only sent to agents that
+    /// advertised `claude_config_sync` in their `AgentHello`.
+    SyncConfigDoc { doc: SyncDoc, content: String },
 
     // -- Worktree operation responses (daemon → in-container agent) ---------
     /// Progress update for a long-running operation (branch creation, etc.).
@@ -1413,28 +1417,31 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_claude_config_changed() {
-        let msg = AgentMessage::ClaudeConfigChanged {
-            content: r#"{"numStartups":3}"#.to_string(),
+    fn config_doc_patch_roundtrip() {
+        let msg = AgentMessage::ConfigDocPatch {
+            doc: SyncDoc::KnownMarketplaces,
+            patch: r#"{"m":{"lastUpdated":"2026-08-04T07:08:16.499Z"}}"#.to_string(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"claude_config_changed\""));
-        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        let encoded = serde_json::to_string(&msg).expect("encode");
+        assert!(encoded.contains("\"type\":\"config_doc_patch\""));
+        assert!(encoded.contains("\"doc\":\"known_marketplaces\""));
+        let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
         assert!(
-            matches!(decoded, AgentMessage::ClaudeConfigChanged { content } if content == r#"{"numStartups":3}"#)
+            matches!(decoded, AgentMessage::ConfigDocPatch { doc, .. } if doc == SyncDoc::KnownMarketplaces)
         );
     }
 
     #[test]
-    fn roundtrip_sync_claude_config() {
-        let msg = DaemonMessage::SyncClaudeConfig {
-            content: r#"{"mcpServers":{}}"#.to_string(),
+    fn sync_config_doc_roundtrip() {
+        let msg = DaemonMessage::SyncConfigDoc {
+            doc: SyncDoc::InstalledPlugins,
+            content: r#"{"version":2,"plugins":{}}"#.to_string(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"sync_claude_config\""));
-        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        let encoded = serde_json::to_string(&msg).expect("encode");
+        assert!(encoded.contains("\"type\":\"sync_config_doc\""));
+        let decoded: DaemonMessage = serde_json::from_str(&encoded).expect("decode");
         assert!(
-            matches!(decoded, DaemonMessage::SyncClaudeConfig { content } if content == r#"{"mcpServers":{}}"#)
+            matches!(decoded, DaemonMessage::SyncConfigDoc { doc, .. } if doc == SyncDoc::InstalledPlugins)
         );
     }
 
