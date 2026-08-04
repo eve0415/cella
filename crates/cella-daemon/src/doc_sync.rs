@@ -61,6 +61,18 @@ pub struct DocSyncState {
     /// the host document. `None` when it cannot be resolved, which makes the
     /// repair a no-op.
     host_claude: Option<String>,
+    /// Monotonic revision of `canonical`, stamped on every push so an agent can
+    /// drop a stale one that overtook a newer push in flight.
+    rev: u64,
+    /// Whether any valid source has ever supplied content.
+    ///
+    /// An absent or malformed host file loads canonical as `{}`, which is
+    /// indistinguishable from a genuinely empty document. Pushing that to a
+    /// container whose own copy is intact would destroy the only good copy —
+    /// and the container cannot object, since its reannounce is an empty patch
+    /// (its file matches its baseline). Until something seeds it, the hub stays
+    /// silent.
+    seeded: bool,
 }
 
 impl DocSyncState {
@@ -71,11 +83,12 @@ impl DocSyncState {
         let host_claude =
             cella_env::claude_code::host_claude_dir().map(|d| d.to_string_lossy().into_owned());
         let raw = path.and_then(|p| std::fs::read(p).ok());
-        let canonical = raw
+        let parsed = raw
             .as_deref()
             .and_then(|b| std::str::from_utf8(b).ok())
-            .and_then(|s| host_canonical(doc, s, host_claude.as_deref()))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .and_then(|s| host_canonical(doc, s, host_claude.as_deref()));
+        let seeded = parsed.is_some();
+        let canonical = parsed.unwrap_or_else(|| serde_json::json!({}));
         let last_hash = raw
             .as_deref()
             .map(cella_filesync::sha256_hex)
@@ -87,6 +100,8 @@ impl DocSyncState {
             last_hash,
             host_dirty: false,
             host_claude,
+            seeded,
+            rev: 0,
         }
     }
 
@@ -142,9 +157,12 @@ async fn transact(
     state: &Arc<Mutex<DocSyncState>>,
     host_path: Option<&Path>,
     mutate: impl FnOnce(&mut DocSyncState) -> bool,
-) -> (String, bool) {
+) -> Option<(String, u64, bool)> {
     let mut st = state.lock().await;
     let changed = mutate(&mut st);
+    if changed {
+        st.rev += 1;
+    }
     // `host_dirty` carries a previously failed write: canonical had already
     // moved, so without it a transient error would leave the host stale forever
     // — `last_hash` still names the unchanged file, so `ingest_host` returns
@@ -154,7 +172,10 @@ async fn transact(
     {
         write_host(&mut st, path);
     }
-    (st.wire_string(), changed)
+    // Nothing may be pushed before a valid source has been seen: canonical is
+    // `{}` only because the host file was missing or malformed, and a container
+    // holding the one good copy would have it overwritten.
+    st.seeded.then(|| (st.wire_string(), st.rev, changed))
 }
 
 /// Write the canonical document to the host file, recording its hash only on a
@@ -193,10 +214,13 @@ pub async fn on_host_change(
     host_path: &Path,
     doc: SyncDoc,
 ) {
-    let (wire, changed) =
-        transact(state, Some(host_path), |st| ingest_host(st, host_path, doc)).await;
+    let Some((wire, rev, changed)) =
+        transact(state, Some(host_path), |st| ingest_host(st, host_path, doc)).await
+    else {
+        return;
+    };
     if changed {
-        broadcast(handles, doc, &wire).await;
+        broadcast(handles, doc, rev, &wire).await;
     }
 }
 
@@ -230,6 +254,8 @@ fn ingest_host(st: &mut DocSyncState, host_path: &Path, doc: SyncDoc) -> bool {
         return false;
     };
 
+    // A parseable host file is a valid source, so the hub may speak from here on.
+    st.seeded = true;
     let patch = cella_env::claude_code::diff_documents(doc, &st.host_snapshot, &incoming);
     let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
     let changed = merged != st.canonical;
@@ -262,7 +288,7 @@ pub async fn on_agent_change(
         return;
     };
 
-    let (wire, changed) = transact(state, host_path, |st| {
+    let Some((wire, rev, changed)) = transact(state, host_path, |st| {
         // Fold in any host edit the watcher has not debounced yet, so this patch
         // lands on the host's real current state rather than a stale canonical.
         let host_changed = host_path.is_some_and(|path| ingest_host(st, path, doc));
@@ -271,24 +297,33 @@ pub async fn on_agent_change(
         st.canonical = merged;
         host_changed || patch_changed
     })
-    .await;
+    .await
+    else {
+        return;
+    };
 
     if !changed {
         // Nothing new for the peers, but the sender still gets canonical: its
         // patch may have been empty because it is *behind*, not in sync.
-        send_to(handles, sender, doc, &wire).await;
+        send_to(handles, sender, doc, rev, &wire).await;
         return;
     }
     // Broadcast includes the sender — its own content hash drops the echo, and
     // the reply is what advances that agent's baseline.
-    broadcast(handles, doc, &wire).await;
+    broadcast(handles, doc, rev, &wire).await;
 }
 
 /// Send one canonical document to a connected agent.
-async fn push(tx: &tokio::sync::mpsc::Sender<DaemonMessage>, doc: SyncDoc, content: &str) {
+async fn push(
+    tx: &tokio::sync::mpsc::Sender<DaemonMessage>,
+    doc: SyncDoc,
+    rev: u64,
+    content: &str,
+) {
     let _ = tx
         .send(DaemonMessage::SyncConfigDoc {
             doc,
+            rev,
             content: content.to_string(),
         })
         .await;
@@ -297,7 +332,7 @@ async fn push(tx: &tokio::sync::mpsc::Sender<DaemonMessage>, doc: SyncDoc, conte
 /// Send `content` as a `SyncConfigDoc` to every opted-in connected agent,
 /// including the origin of an inbound change — its own content hash drops the
 /// echo, so excluding it would only cost a branch.
-async fn broadcast(handles: &Handles, doc: SyncDoc, content: &str) {
+async fn broadcast(handles: &Handles, doc: SyncDoc, rev: u64, content: &str) {
     // Clone the senders under the lock, then send after releasing it — never
     // hold the registry mutex across an await.
     let senders: Vec<tokio::sync::mpsc::Sender<DaemonMessage>> = {
@@ -310,13 +345,13 @@ async fn broadcast(handles: &Handles, doc: SyncDoc, content: &str) {
     };
 
     for tx in senders {
-        push(&tx, doc, content).await;
+        push(&tx, doc, rev, content).await;
     }
 }
 
 /// Send `content` as a `SyncConfigDoc` to a single opted-in agent by name.
 /// Used to converge the sender of a patch (reconnect/catch-up repair).
-async fn send_to(handles: &Handles, name: &str, doc: SyncDoc, content: &str) {
+async fn send_to(handles: &Handles, name: &str, doc: SyncDoc, rev: u64, content: &str) {
     let tx = {
         let registry = handles.lock().await;
         registry
@@ -325,7 +360,7 @@ async fn send_to(handles: &Handles, name: &str, doc: SyncDoc, content: &str) {
             .and_then(|h| h.agent_tx.clone())
     };
     if let Some(tx) = tx {
-        push(&tx, doc, content).await;
+        push(&tx, doc, rev, content).await;
     }
 }
 
@@ -344,6 +379,8 @@ mod tests {
             last_hash: cella_filesync::sha256_hex(&bytes),
             host_dirty: false,
             host_claude: Some("/Users/alice/.claude".to_string()),
+            seeded: true,
+            rev: 0,
         }))
     }
 
@@ -701,7 +738,7 @@ mod tests {
         std::fs::write(&host, r#"{"official":{"lastUpdated":"2"}}"#).expect("host edit");
         on_host_change(&state, &handles, &host, SyncDoc::KnownMarketplaces).await;
 
-        let DaemonMessage::SyncConfigDoc { doc, content } =
+        let DaemonMessage::SyncConfigDoc { doc, content, .. } =
             agent.try_recv().expect("agent must be notified")
         else {
             panic!("expected SyncConfigDoc");
@@ -830,6 +867,89 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["m"]["installLocation"],
             json!("/Users/alice/.claude/plugins/marketplaces/m")
         );
+    }
+
+    /// An unseeded hub — host file absent or malformed at startup — must stay
+    /// silent. Its canonical is `{}` only because it has no source, and a
+    /// container holding the one good copy cannot object: its reannounce is an
+    /// empty patch, because its file matches its own baseline.
+    #[tokio::test]
+    async fn an_unseeded_hub_pushes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        // No host file at all.
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        assert!(!state.lock().await.seeded, "precondition");
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            "{}",
+            "cella-a",
+        )
+        .await;
+
+        assert!(
+            agent.try_recv().is_err(),
+            "an unseeded hub must not push an empty canonical over a good copy"
+        );
+    }
+
+    /// Once a container contributes real content the hub has a source, and
+    /// normal push behaviour resumes.
+    #[tokio::test]
+    async fn a_patch_seeds_an_empty_hub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        std::fs::write(&host, "{").expect("malformed host file");
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        assert!(!state.lock().await.seeded, "precondition");
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        // The host file becomes valid; ingest seeds the hub.
+        std::fs::write(&host, r#"{"a":{"lastUpdated":"1"}}"#).expect("host edit");
+        on_host_change(&state, &handles, &host, SyncDoc::KnownMarketplaces).await;
+
+        assert!(state.lock().await.seeded);
+        assert!(agent.try_recv().is_ok(), "a seeded hub pushes again");
+    }
+
+    /// Revisions must advance with each canonical state so an agent can drop a
+    /// push that overtook a newer one in flight.
+    #[tokio::test]
+    async fn each_canonical_state_gets_a_higher_revision() {
+        let state = state_from(json!({}), SyncDoc::KnownMarketplaces);
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        for expected in 1..=2u64 {
+            on_agent_change(
+                &state,
+                &handles,
+                None,
+                SyncDoc::KnownMarketplaces,
+                &format!(r#"{{"a":{{"lastUpdated":"{expected}"}}}}"#),
+                "cella-a",
+            )
+            .await;
+            let DaemonMessage::SyncConfigDoc { rev, .. } =
+                agent.try_recv().expect("agent must be notified")
+            else {
+                panic!("expected SyncConfigDoc");
+            };
+            assert_eq!(rev, expected);
+        }
     }
 
     /// The host file keeps its real entry-array schema; the normalized

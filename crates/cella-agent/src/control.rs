@@ -226,9 +226,9 @@ async fn run_reader_loop(
                     });
                 }
             }
-            DaemonMessage::SyncConfigDoc { doc, content } => {
+            DaemonMessage::SyncConfigDoc { doc, rev, content } => {
                 if let Some(ref tx) = claude_apply_tx {
-                    let _ = tx.send((doc, content)).await;
+                    let _ = tx.send((doc, rev, content)).await;
                 }
             }
             other => {

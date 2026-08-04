@@ -572,7 +572,17 @@ pub enum DaemonMessage {
     /// host-shaped and, for `InstalledPlugins`, normalized — the receiving agent
     /// converts to its own on-disk form before writing. Only sent to agents that
     /// advertised `claude_config_sync` in their `AgentHello`.
-    SyncConfigDoc { doc: SyncDoc, content: String },
+    ///
+    /// `rev` increases with each canonical state. The daemon serializes its
+    /// transactions but fans out after releasing the document lock, so two
+    /// pushes can reach an agent out of order; the agent drops any `rev` older
+    /// than the last one it applied. Revisions restart at 0 with the daemon, so
+    /// an agent resets its watermark on every (re)connect.
+    SyncConfigDoc {
+        doc: SyncDoc,
+        rev: u64,
+        content: String,
+    },
 
     // -- Worktree operation responses (daemon → in-container agent) ---------
     /// Progress update for a long-running operation (branch creation, etc.).
@@ -1483,13 +1493,14 @@ mod tests {
     fn sync_config_doc_roundtrip() {
         let msg = DaemonMessage::SyncConfigDoc {
             doc: SyncDoc::InstalledPlugins,
+            rev: 7,
             content: r#"{"version":2,"plugins":{}}"#.to_string(),
         };
         let encoded = serde_json::to_string(&msg).expect("encode");
         assert!(encoded.contains("\"type\":\"sync_config_doc\""));
         let decoded: DaemonMessage = serde_json::from_str(&encoded).expect("decode");
         assert!(
-            matches!(decoded, DaemonMessage::SyncConfigDoc { doc, .. } if doc == SyncDoc::InstalledPlugins)
+            matches!(decoded, DaemonMessage::SyncConfigDoc { doc, rev, .. } if doc == SyncDoc::InstalledPlugins && rev == 7)
         );
     }
 

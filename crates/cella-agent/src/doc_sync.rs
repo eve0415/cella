@@ -58,7 +58,7 @@ const BASELINE_DIR: &str = "/tmp/.cella/doc-sync";
 
 /// Canonical content pushed by the daemon, tagged with the document it belongs
 /// to. Carried on one channel from the control reader to the writer task.
-pub type ApplyMessage = (SyncDoc, String);
+pub type ApplyMessage = (SyncDoc, u64, String);
 
 /// One document's watcher/writer state.
 pub struct DocState {
@@ -75,6 +75,14 @@ pub struct DocState {
     baseline: Mutex<serde_json::Value>,
     /// Hash of the raw bytes last written to / read from the container file.
     last_hash: Mutex<String>,
+    /// Highest canonical revision applied for this document.
+    ///
+    /// The daemon serializes its transactions but fans out after releasing the
+    /// document lock, so a newer push can overtake an older one; applying the
+    /// older one last would record stale content as the baseline and hash, with
+    /// nothing to repair it. Reset on every (re)connect, because revisions
+    /// restart with the daemon.
+    last_rev: Mutex<u64>,
 }
 
 impl DocState {
@@ -95,6 +103,7 @@ impl DocState {
             baseline_path,
             baseline: Mutex::new(baseline),
             last_hash: Mutex::new(initial_hash(&path)),
+            last_rev: Mutex::new(0),
             path,
             map,
         }
@@ -272,6 +281,9 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
 pub async fn reannounce_messages() -> Vec<AgentMessage> {
     let mut out = Vec::new();
     for st in states() {
+        // Revisions restart with the daemon, so a reconnect may be talking to a
+        // fresh one whose numbering is lower than what we last applied.
+        *st.last_rev.lock().await = 0;
         // Clone the baseline and drop the guard before the await: a temporary
         // guard in argument position lives to the end of the `let` statement,
         // so passing `&*lock().await` inline would hold the mutex across
@@ -329,11 +341,19 @@ pub fn spawn(control: &Arc<Mutex<ReconnectingClient>>, apply_rx: mpsc::Receiver<
 
 /// Apply daemon-pushed canonical documents to their container files.
 async fn run_writer(mut apply_rx: mpsc::Receiver<ApplyMessage>) {
-    while let Some((doc, content)) = apply_rx.recv().await {
+    while let Some((doc, rev, content)) = apply_rx.recv().await {
         let Some(st) = states().iter().find(|s| s.doc == doc) else {
             debug!("doc sync: dropping {doc:?} push, no state for it");
             continue;
         };
+        {
+            let mut last = st.last_rev.lock().await;
+            if rev < *last {
+                debug!("doc sync: dropping {doc:?} rev {rev}, already applied {last}");
+                continue;
+            }
+            *last = rev;
+        }
         apply_canonical(st, &content).await;
     }
 }
@@ -475,6 +495,13 @@ where
     F: FnOnce(AgentMessage) -> Fut,
     Fut: Future<Output = Result<(), CellaPortError>>,
 {
+    // Snapshot the baseline *before* reading the file. Taken afterwards, a peer
+    // push landing in between advances the baseline to include the peer's keys
+    // while `raw` still predates them — and diffing a newer baseline against an
+    // older document fabricates a tombstone for every one of those keys, which
+    // the daemon would then apply as a deletion. Captured first, the file is
+    // always at or after the baseline, so the diff can only add.
+    let baseline = st.baseline.lock().await.clone();
     let Ok(raw) = tokio::fs::read_to_string(&st.path).await else {
         return; // mid-rename or transiently unreadable; next event covers it
     };
@@ -489,8 +516,7 @@ where
         );
         return;
     };
-    let patch =
-        cella_env::claude_code::diff_documents(st.doc, &*st.baseline.lock().await, &canonical);
+    let patch = cella_env::claude_code::diff_documents(st.doc, &baseline, &canonical);
     if patch.as_object().is_some_and(serde_json::Map::is_empty) {
         // Reformatted but semantically identical; nothing to send.
         *st.last_hash.lock().await = hash;
@@ -789,6 +815,47 @@ mod tests {
             cella_filesync::sha256_hex(
                 to_local(SyncDoc::KnownMarketplaces, &json!({}), None).as_bytes()
             ),
+        );
+    }
+
+    /// The daemon fans out after releasing its document lock, so a newer push
+    /// can overtake an older one. Applying the older one last would record stale
+    /// content as this container's baseline and hash, with nothing to repair it.
+    #[tokio::test]
+    async fn a_stale_revision_is_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let st = doc_state(
+            tmp.path(),
+            SyncDoc::KnownMarketplaces,
+            "known_marketplaces.json",
+            None,
+        );
+        let states = [Arc::new(st)];
+
+        // Simulate the writer loop's watermark check over an out-of-order pair.
+        let apply = |rev: u64, content: &'static str| {
+            let st = Arc::clone(&states[0]);
+            async move {
+                {
+                    let mut last = st.last_rev.lock().await;
+                    if rev < *last {
+                        return;
+                    }
+                    *last = rev;
+                }
+                apply_canonical(&st, content).await;
+            }
+        };
+        apply(2, r#"{"a":{"lastUpdated":"2"}}"#).await;
+        apply(1, r#"{"a":{"lastUpdated":"1"}}"#).await;
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&states[0].path).expect("written"))
+                .expect("valid json");
+        assert_eq!(
+            on_disk["a"]["lastUpdated"],
+            json!("2"),
+            "the newer revision must win regardless of arrival order"
         );
     }
 
