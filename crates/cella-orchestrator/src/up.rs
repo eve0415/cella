@@ -1236,9 +1236,21 @@ impl EnsureUpContext<'_> {
             );
         }
 
-        // Opt the container into ~/.claude.json sync (env is immutable after
-        // create, so it must be set here at create time).
-        let tool_env = crate::tool_install::tool_config_env_vars(settings, remote_user);
+        // Opt the container into Claude Code config sync (env is immutable
+        // after create, so it must be set here at create time). The workspace
+        // pair lets the agent translate `projectPath` in the plugin manifests.
+        // Derived from the effective workspace mount, not from
+        // `(workspace_folder, workspace_root)`: a custom or disabled
+        // `workspaceMount`, or a volume-backed workspace, makes that pair wrong
+        // or nonexistent, and a wrong pair rewrites `projectPath` under a host
+        // path that isn't there.
+        let workspace_pair = create_opts
+            .workspace_mount
+            .as_ref()
+            .filter(|m| m.mount_type == "bind")
+            .map(|m| (m.target.as_str(), std::path::Path::new(m.source.as_str())));
+        let tool_env =
+            crate::tool_install::tool_config_env_vars(settings, remote_user, workspace_pair);
         if !tool_env.is_empty() {
             if create_opts.env.is_empty() {
                 create_opts.env = image_env.to_vec();

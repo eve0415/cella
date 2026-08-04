@@ -5,7 +5,6 @@
 
 pub mod audit;
 pub mod browser;
-pub mod claude_config_sync;
 pub mod clipboard;
 pub mod control_server;
 pub mod credential;
@@ -14,6 +13,7 @@ pub mod credential_mux;
 pub mod credential_proxy;
 pub mod credential_resolver;
 pub mod daemon;
+pub mod doc_sync;
 mod error;
 pub mod health;
 pub mod logging;

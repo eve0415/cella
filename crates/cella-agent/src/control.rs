@@ -51,7 +51,7 @@ impl ControlClient {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             container_name: container_name.to_string(),
             auth_token: auth_token.to_string(),
-            claude_config_sync: crate::claude_config_sync::sync_enabled(),
+            claude_config_sync: crate::doc_sync::sync_enabled(),
             transient,
         };
         let mut json = serde_json::to_string(&hello)?;
@@ -96,12 +96,12 @@ impl ControlClient {
     }
 
     /// Spawn a background reader task that dispatches `TunnelRequest` and
-    /// `SyncClaudeConfig` messages to their handlers and forwards everything
+    /// `SyncConfigDoc` messages to their handlers and forwards everything
     /// else to the response channel.
     pub fn start_reader(
         &mut self,
         tunnel_config: Option<crate::tunnel::TunnelConfig>,
-        claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        claude_apply_tx: Option<tokio::sync::mpsc::Sender<crate::doc_sync::ApplyMessage>>,
     ) {
         let Some(reader) = self.reader.take() else {
             return;
@@ -194,7 +194,7 @@ async fn run_reader_loop(
     mut reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     response_tx: tokio::sync::mpsc::Sender<DaemonMessage>,
     tunnel_config: Option<crate::tunnel::TunnelConfig>,
-    claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    claude_apply_tx: Option<tokio::sync::mpsc::Sender<crate::doc_sync::ApplyMessage>>,
 ) {
     let mut line = String::new();
     loop {
@@ -226,9 +226,9 @@ async fn run_reader_loop(
                     });
                 }
             }
-            DaemonMessage::SyncClaudeConfig { content } => {
+            DaemonMessage::SyncConfigDoc { doc, rev, content } => {
                 if let Some(ref tx) = claude_apply_tx {
-                    let _ = tx.send(content).await;
+                    let _ = tx.send((doc, rev, content)).await;
                 }
             }
             other => {

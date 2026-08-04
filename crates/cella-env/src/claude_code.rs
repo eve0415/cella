@@ -56,17 +56,6 @@ pub fn host_home() -> Option<PathBuf> {
     host_claude_dir().and_then(|d| d.parent().map(PathBuf::from))
 }
 
-/// Replace home-path prefix in file content.
-///
-/// Performs a simple string replacement of `{from_home}/.claude` with
-/// `{to_home}/.claude` for rewriting plugin manifest paths.
-pub fn rewrite_claude_home(content: &str, from_home: &str, to_home: &str) -> String {
-    content.replace(
-        &format!("{from_home}/.claude"),
-        &format!("{to_home}/.claude"),
-    )
-}
-
 /// Apply an RFC 7386 JSON Merge Patch to `base`.
 ///
 /// A `null` value in `patch` deletes that key from `base`; nested objects merge
@@ -133,7 +122,338 @@ pub fn diff_merge_patch(old: &serde_json::Value, new: &serde_json::Value) -> ser
     serde_json::Value::Object(patch)
 }
 
+/// Manifest fields carrying an absolute filesystem path.
+///
+/// Rewriting is restricted to these rather than applied to the raw document text
+/// so a prefix appearing inside an unrelated string can never be corrupted.
+const PATH_FIELDS: &[&str] = &["installPath", "installLocation", "projectPath"];
+
+/// Bidirectional path mapping between one container's view and the host's.
+///
+/// Claude Code string-prefix-matches `installPath` / `installLocation`, so the
+/// manifest each side reads must carry paths literally correct for that side.
+/// `workspace` is `None` when the container's workspace is not bind-mounted from
+/// a host directory, in which case `projectPath` passes through.
+#[derive(Debug, Clone)]
+pub struct PathMap {
+    /// `({container_home}/.claude, {host_home}/.claude)`
+    pub claude: (String, String),
+    /// `({container_workspace}, {host_workspace})`
+    pub workspace: Option<(String, String)>,
+}
+
+/// Which way a rewrite runs.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    ToHost,
+    ToContainer,
+}
+
+impl PathMap {
+    /// Container-shaped document → host-shaped.
+    #[must_use]
+    pub fn to_host(&self, doc: &serde_json::Value) -> serde_json::Value {
+        self.rewritten(doc, Direction::ToHost)
+    }
+
+    /// Host-shaped document → container-shaped.
+    #[must_use]
+    pub fn to_container(&self, doc: &serde_json::Value) -> serde_json::Value {
+        self.rewritten(doc, Direction::ToContainer)
+    }
+
+    /// Apply the first matching prefix substitution to every [`PATH_FIELDS`]
+    /// value.
+    ///
+    /// Pairs are tried **longest prefix first**. The two mappings are disjoint on
+    /// a typical layout, but nothing guarantees it — a workspace living under the
+    /// `.claude` directory would otherwise match the shorter `.claude` pair and
+    /// be mangled, and the mangling is not symmetric, so
+    /// `to_container(to_host(x)) != x`. Longest-first makes the more specific
+    /// mapping win in both directions, which restores the inverse property.
+    fn rewritten(&self, doc: &serde_json::Value, direction: Direction) -> serde_json::Value {
+        let mut subs: Vec<(&str, &str)> = std::iter::once(&self.claude)
+            .chain(self.workspace.iter())
+            .map(|(container, host)| match direction {
+                Direction::ToHost => (trim_trailing_slash(container), trim_trailing_slash(host)),
+                Direction::ToContainer => {
+                    (trim_trailing_slash(host), trim_trailing_slash(container))
+                }
+            })
+            .collect();
+        subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let mut out = doc.clone();
+        rewrite_path_fields(&mut out, &subs);
+        out
+    }
+}
+
+/// Drop a trailing separator, except from the root itself.
+///
+/// A custom `workspaceMount` may legitimately give `target=/workspace/`, and a
+/// prefix carrying that separator would leave `subdir` rather than `/subdir`
+/// after stripping, failing the component-boundary test against the unsuffixed
+/// form Docker and `projectPath` actually use.
+fn trim_trailing_slash(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some("") | None => path,
+        Some(trimmed) => trimmed,
+    }
+}
+
+/// Whether `prefix` covers `text` at a path-component boundary.
+///
+/// A raw `starts_with` would let a mapping rooted at `/workspaces/app` capture
+/// `/workspaces/application` and rewrite it into the wrong workspace namespace,
+/// which for `projectPath` also produces the wrong normalized context key.
+fn is_path_prefix(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Walk `value`, replacing a leading `from` with `to` in every path field.
+fn rewrite_path_fields(value: &mut serde_json::Value, subs: &[(&str, &str)]) {
+    map_path_fields(value, &|text| {
+        subs.iter()
+            .find(|(from, _)| is_path_prefix(text, from))
+            .map(|(from, to)| text.replacen(from, to, 1))
+    });
+}
+
+/// Walk `value`, applying `f` to every [`PATH_FIELDS`] string and replacing it
+/// when `f` returns `Some`.
+fn map_path_fields(value: &mut serde_json::Value, f: &impl Fn(&str) -> Option<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if PATH_FIELDS.contains(&key.as_str())
+                    && let Some(text) = child.as_str()
+                    && let Some(replacement) = f(text)
+                {
+                    *child = serde_json::Value::String(replacement);
+                    continue;
+                }
+                map_path_fields(child, f);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                map_path_fields(item, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite *any* writer's `<home>/.claude` prefix in the path fields to
+/// `host_claude`.
+///
+/// The create-time seed used to do this with a `sed` matching `/home/*/.claude`,
+/// `/Users/*/.claude` and `/root/.claude`, because a manifest could have been
+/// written by a container running as a different user. Doing it on the parsed
+/// value instead is component-aware and cannot corrupt an unrelated string —
+/// and it belongs on the host side, where it repairs the canonical document
+/// rather than only the copy handed to one container.
+#[must_use]
+pub fn repair_claude_home(doc: &serde_json::Value, host_claude: &str) -> serde_json::Value {
+    let mut out = doc.clone();
+    map_path_fields(&mut out, &|text| {
+        let idx = text.find("/.claude")?;
+        let rest = &text[idx + "/.claude".len()..];
+        // Only a whole `.claude` component counts — never `.claude-backup`.
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return None;
+        }
+        let repaired = format!("{host_claude}{rest}");
+        (repaired != text).then_some(repaired)
+    });
+    out
+}
+
+/// Key an `installed_plugins.json` entry by its install context.
+///
+/// `scope` alone is ambiguous once a plugin is installed for more than one
+/// project, so a non-user scope is qualified by its `projectPath`.
+fn entry_context_key(entry: &serde_json::Value) -> String {
+    let scope = entry
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("user");
+    entry
+        .get("projectPath")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| scope.to_string(), |path| format!("{scope}:{path}"))
+}
+
+/// Rewrite each `plugins[key]` entry array into an object keyed by install
+/// context.
+///
+/// RFC 7386 replaces arrays wholesale, so leaving the entry lists as arrays
+/// would make two containers editing different scopes of the same plugin
+/// clobber each other. This form exists only in memory and on the wire —
+/// [`denormalize_installed_plugins`] restores the on-disk schema before any
+/// write.
+///
+/// A `plugins` value that is not an array is passed through unchanged rather
+/// than dropped: an unrecognised shape from a newer Claude Code must survive a
+/// round trip, not be silently deleted.
+#[must_use]
+pub fn normalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value {
+    let mut out = doc.clone();
+    let Some(plugins) = out
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return out;
+    };
+    for value in plugins.values_mut() {
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
+        let mut keyed = serde_json::Map::new();
+        for entry in entries {
+            keyed.insert(entry_context_key(entry), entry.clone());
+        }
+        *value = serde_json::Value::Object(keyed);
+    }
+    out
+}
+
+/// Whether `value` is the exact shape [`normalize_installed_plugins`] produces:
+/// an object whose every key is its own entry's context key.
+///
+/// Checked rather than assumed because normalization deliberately passes an
+/// unrecognised `plugins` value through untouched for forward compatibility. If
+/// denormalization then turned *any* object into an array, an object-shaped
+/// entry from a newer Claude Code would survive normalization only to be
+/// corrupted on the very next write.
+fn is_normalized_entry_map(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        // An empty map is the normalized form of an empty entry array. Treating
+        // it as such is what lets a plugin losing its last context diff into
+        // per-context deletions rather than a whole-key one; the cost is that an
+        // unrecognised empty object also denormalizes to `[]`.
+        map.iter()
+            .all(|(key, entry)| *key == entry_context_key(entry))
+    })
+}
+
+/// Restore the on-disk entry-array schema from the normalized form.
+///
+/// Entries are emitted in sorted context-key order so the output is byte-stable:
+/// loop suppression hashes raw bytes, and an unstable order would read as a
+/// change on every write.
+#[must_use]
+pub fn denormalize_installed_plugins(doc: &serde_json::Value) -> serde_json::Value {
+    let mut out = doc.clone();
+    let Some(plugins) = out
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return out;
+    };
+    for value in plugins.values_mut() {
+        if !is_normalized_entry_map(value) {
+            continue;
+        }
+        let Some(keyed) = value.as_object() else {
+            continue;
+        };
+        let mut keys: Vec<&String> = keyed.keys().collect();
+        keys.sort();
+        let entries: Vec<serde_json::Value> = keys
+            .into_iter()
+            .filter_map(|k| keyed.get(k).cloned())
+            .collect();
+        *value = serde_json::Value::Array(entries);
+    }
+    out
+}
+
+/// Diff two canonical documents into a merge patch, per document.
+///
+/// Identical to [`diff_merge_patch`] except for `InstalledPlugins`, where a
+/// plugin key disappearing entirely would otherwise become
+/// `plugins.<name> = null` — deleting every install context, including ones
+/// *other* containers added, which is exactly the independence normalization
+/// exists to provide. Such a deletion is expanded into one tombstone per context
+/// the old document held, so only this source's contexts are removed.
+#[must_use]
+pub fn diff_documents(
+    doc: SyncDoc,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> serde_json::Value {
+    let mut patch = diff_merge_patch(old, new);
+    if doc != SyncDoc::InstalledPlugins {
+        return patch;
+    }
+    let Some(old_plugins) = old.get("plugins").and_then(serde_json::Value::as_object) else {
+        return patch;
+    };
+    let Some(patch_plugins) = patch
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return patch;
+    };
+    for (name, entry_patch) in patch_plugins.iter_mut() {
+        if !entry_patch.is_null() {
+            continue;
+        }
+        let Some(contexts) = old_plugins.get(name).and_then(serde_json::Value::as_object) else {
+            continue; // not a context map — leave the wholesale deletion alone
+        };
+        *entry_patch = serde_json::Value::Object(
+            contexts
+                .keys()
+                .map(|ctx| (ctx.clone(), serde_json::Value::Null))
+                .collect(),
+        );
+    }
+    patch
+}
+
+/// On-disk content → canonical (host-shaped, normalized) form.
+///
+/// `map` is `None` on the host, where the on-disk form is already host-shaped.
+/// It is also ignored for [`SyncDoc::ClaudeJson`], whose codec is the identity:
+/// host and container `projects` keys are disjoint and merge additively, so that
+/// document is never path-translated regardless of what the caller passes.
+///
+/// Returns `None` for unparseable input so the caller can skip the event rather
+/// than merge a fabricated empty document over real state.
+#[must_use]
+pub fn to_canonical(doc: SyncDoc, raw: &str, map: Option<&PathMap>) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    Some(match doc {
+        SyncDoc::ClaudeJson => parsed,
+        SyncDoc::KnownMarketplaces => map.map_or_else(|| parsed.clone(), |m| m.to_host(&parsed)),
+        SyncDoc::InstalledPlugins => {
+            let hosted = map.map_or_else(|| parsed.clone(), |m| m.to_host(&parsed));
+            normalize_installed_plugins(&hosted)
+        }
+    })
+}
+
+/// Canonical form → on-disk content for whichever side `map` describes.
+#[must_use]
+pub fn to_local(doc: SyncDoc, canonical: &serde_json::Value, map: Option<&PathMap>) -> String {
+    let localized = match doc {
+        SyncDoc::ClaudeJson => canonical.clone(),
+        SyncDoc::KnownMarketplaces => {
+            map.map_or_else(|| canonical.clone(), |m| m.to_container(canonical))
+        }
+        SyncDoc::InstalledPlugins => {
+            let denormalized = denormalize_installed_plugins(canonical);
+            map.map_or_else(|| denormalized.clone(), |m| m.to_container(&denormalized))
+        }
+    };
+    serde_json::to_string_pretty(&localized).unwrap_or_else(|_| "{}".to_string())
+}
+
 use crate::paths::home_dir;
+use cella_protocol::SyncDoc;
 
 #[cfg(test)]
 mod tests {
@@ -167,37 +487,6 @@ mod tests {
             let home = host_home().expect("host_home should return Some when host_claude_dir does");
             assert_eq!(home, claude_dir.parent().unwrap());
         }
-    }
-
-    #[test]
-    fn rewrite_claude_home_replaces_paths() {
-        let content = r#"{"installPath": "/home/node/.claude/plugins/cache/foo"}"#;
-        let result = rewrite_claude_home(content, "/home/node", "/home/vscode");
-        assert_eq!(
-            result,
-            r#"{"installPath": "/home/vscode/.claude/plugins/cache/foo"}"#
-        );
-    }
-
-    #[test]
-    fn rewrite_claude_home_multiple_occurrences() {
-        let content = "/home/node/.claude/a /home/node/.claude/b";
-        let result = rewrite_claude_home(content, "/home/node", "/home/vscode");
-        assert_eq!(result, "/home/vscode/.claude/a /home/vscode/.claude/b");
-    }
-
-    #[test]
-    fn rewrite_claude_home_noop_when_same() {
-        let content = "/home/vscode/.claude/plugins";
-        let result = rewrite_claude_home(content, "/home/vscode", "/home/vscode");
-        assert_eq!(result, content);
-    }
-
-    #[test]
-    fn rewrite_claude_home_macos_to_linux() {
-        let content = r#"{"path": "/Users/alice/.claude/plugins"}"#;
-        let result = rewrite_claude_home(content, "/Users/alice", "/home/vscode");
-        assert_eq!(result, r#"{"path": "/home/vscode/.claude/plugins"}"#);
     }
 
     use serde_json::json;
@@ -308,5 +597,473 @@ mod tests {
                 "roundtrip failed for old={old} new={new}"
             );
         }
+    }
+
+    // ── installed_plugins.json normalization ────────────────────────────────
+
+    #[test]
+    fn normalize_keys_entries_by_scope_and_project() {
+        let doc = json!({
+            "version": 2,
+            "plugins": {
+                "p@m": [
+                    { "scope": "user", "installPath": "/h/.claude/plugins/cache/p" },
+                    { "scope": "project", "projectPath": "/w/a", "installPath": "/h/.claude/plugins/cache/p" }
+                ]
+            }
+        });
+        let n = normalize_installed_plugins(&doc);
+        assert_eq!(n["version"], json!(2));
+        let entries = &n["plugins"]["p@m"];
+        assert!(entries.get("user").is_some());
+        assert!(entries.get("project:/w/a").is_some());
+        assert_eq!(
+            entries["user"]["installPath"],
+            json!("/h/.claude/plugins/cache/p")
+        );
+    }
+
+    /// The merge granularity this normalization exists for: two sources editing
+    /// different install contexts of the same plugin must not clobber each other,
+    /// which a wholesale-replaced array cannot express.
+    #[test]
+    fn normalized_form_merges_per_context() {
+        let base = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        let theirs = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "2.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        let patch = diff_merge_patch(&base, &theirs);
+        let merged = apply_merge_patch(&base, &patch);
+        assert_eq!(merged["plugins"]["p@m"]["user"]["version"], json!("2.0"));
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/a"]["version"],
+            json!("1.0")
+        );
+    }
+
+    #[test]
+    fn denormalize_roundtrips_with_sorted_entries() {
+        let doc = json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        });
+        let back = denormalize_installed_plugins(&normalize_installed_plugins(&doc));
+        let entries = back["plugins"]["p@m"].as_array().expect("array restored");
+        assert_eq!(entries.len(), 2);
+        // Sorted by context key: "project:/w/a" < "user".
+        assert_eq!(entries[0]["scope"], json!("project"));
+        assert_eq!(entries[1]["scope"], json!("user"));
+    }
+
+    #[test]
+    fn normalize_leaves_unexpected_shapes_untouched() {
+        let doc = json!({ "version": 2, "plugins": { "p@m": "not-an-array" } });
+        assert_eq!(normalize_installed_plugins(&doc), doc);
+    }
+
+    // ── PathMap ─────────────────────────────────────────────────────────────
+
+    fn test_map() -> PathMap {
+        PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: Some(("/workspaces/cella".into(), "/Users/alice/src/cella".into())),
+        }
+    }
+
+    #[test]
+    fn to_host_rewrites_install_and_project_paths() {
+        let doc = json!({ "plugins": { "p@m": [{
+            "installPath": "/home/vscode/.claude/plugins/cache/p",
+            "projectPath": "/workspaces/cella",
+            "version": "1.0"
+        }]}});
+        let out = test_map().to_host(&doc);
+        let e = &out["plugins"]["p@m"][0];
+        assert_eq!(
+            e["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(e["projectPath"], json!("/Users/alice/src/cella"));
+        assert_eq!(e["version"], json!("1.0"));
+    }
+
+    #[test]
+    fn to_container_is_the_inverse() {
+        let container =
+            json!({ "m": { "installLocation": "/home/vscode/.claude/plugins/marketplaces/m" }});
+        let host =
+            json!({ "m": { "installLocation": "/Users/alice/.claude/plugins/marketplaces/m" }});
+        let map = test_map();
+        assert_eq!(map.to_host(&container), host);
+        assert_eq!(map.to_container(&host), container);
+    }
+
+    /// A non-path field that happens to contain a matching substring must not be
+    /// rewritten — the reason this targets fields rather than raw text.
+    #[test]
+    fn non_path_fields_are_untouched() {
+        let doc = json!({ "note": "installed under /home/vscode/.claude/plugins" });
+        assert_eq!(test_map().to_host(&doc), doc);
+    }
+
+    /// Nothing guarantees the two mappings are disjoint. When the workspace sits
+    /// under the claude directory, the shorter `.claude` prefix must not win —
+    /// its rewrite is not symmetric, so first-match-wins would break the inverse.
+    #[test]
+    fn nested_workspace_still_roundtrips() {
+        let map = PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: Some((
+                "/home/vscode/.claude/work".into(),
+                "/Users/alice/.claude/work".into(),
+            )),
+        };
+        let doc = json!({ "p": [{
+            "projectPath": "/home/vscode/.claude/work/cella",
+            "installPath": "/home/vscode/.claude/plugins/cache/p"
+        }]});
+        let hosted = map.to_host(&doc);
+        assert_eq!(
+            hosted["p"][0]["projectPath"],
+            json!("/Users/alice/.claude/work/cella")
+        );
+        assert_eq!(
+            hosted["p"][0]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(map.to_container(&hosted), doc);
+    }
+
+    #[test]
+    fn unmapped_workspace_leaves_project_path_alone() {
+        let map = PathMap {
+            claude: ("/home/vscode/.claude".into(), "/Users/alice/.claude".into()),
+            workspace: None,
+        };
+        let doc = json!({ "p": [{ "projectPath": "/workspaces/other" }] });
+        assert_eq!(map.to_host(&doc), doc);
+    }
+
+    // ── document codec ──────────────────────────────────────────────────────
+
+    #[test]
+    fn claude_json_codec_is_identity() {
+        let raw = r#"{"projects":{"/workspaces/x":{}}}"#;
+        let canon = to_canonical(SyncDoc::ClaudeJson, raw, None).expect("parses");
+        assert_eq!(
+            canon,
+            serde_json::from_str::<serde_json::Value>(raw).expect("valid json")
+        );
+    }
+
+    /// `~/.claude.json` never gets path translation: host and container
+    /// `projects` keys are disjoint and merge additively, so a map passed by a
+    /// caller that syncs all three documents must be ignored for this one.
+    #[test]
+    fn claude_json_codec_ignores_the_path_map() {
+        let raw = r#"{"projects":{"/workspaces/x":{"projectPath":"/workspaces/cella"}}}"#;
+        let canon = to_canonical(SyncDoc::ClaudeJson, raw, Some(&test_map())).expect("parses");
+        assert_eq!(
+            canon,
+            serde_json::from_str::<serde_json::Value>(raw).expect("valid json")
+        );
+        assert_eq!(
+            to_local(SyncDoc::ClaudeJson, &canon, Some(&test_map())),
+            serde_json::to_string_pretty(&canon).expect("serializes")
+        );
+    }
+
+    #[test]
+    fn installed_plugins_codec_roundtrips_through_container_form() {
+        let on_disk = r#"{"version":2,"plugins":{"p@m":[{"scope":"user","installPath":"/home/vscode/.claude/plugins/cache/p"}]}}"#;
+        let map = test_map();
+        let canon = to_canonical(SyncDoc::InstalledPlugins, on_disk, Some(&map)).expect("parses");
+        // Canonical is host-shaped and normalized.
+        assert_eq!(
+            canon["plugins"]["p@m"]["user"]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        let local = to_local(SyncDoc::InstalledPlugins, &canon, Some(&map));
+        let reparsed: serde_json::Value = serde_json::from_str(&local).expect("valid json");
+        assert_eq!(
+            reparsed,
+            serde_json::from_str::<serde_json::Value>(on_disk).expect("valid json")
+        );
+    }
+
+    #[test]
+    fn invalid_json_yields_none_rather_than_a_default() {
+        assert!(to_canonical(SyncDoc::KnownMarketplaces, "{not json", None).is_none());
+    }
+
+    /// The property the two codec `match` arms must jointly satisfy: for every
+    /// document, `to_local` then `to_canonical` is the identity on canonical
+    /// values. Exhaustive matching forces a new `SyncDoc` variant to be handled
+    /// in both arms, but nothing else checks that the two agree.
+    ///
+    /// Stated canonical-first rather than disk-first on purpose:
+    /// `denormalize_installed_plugins` emits entries in sorted context-key
+    /// order, so the disk-first direction only holds for an already-sorted
+    /// input, while this direction holds unconditionally.
+    #[test]
+    fn codec_roundtrips_canonical_for_every_document() {
+        let cases = [
+            (
+                SyncDoc::ClaudeJson,
+                json!({ "projects": { "/Users/alice/p": { "k": 1 } } }),
+            ),
+            (
+                SyncDoc::KnownMarketplaces,
+                json!({ "m": { "installLocation": "/Users/alice/.claude/plugins/marketplaces/m" } }),
+            ),
+            (
+                SyncDoc::InstalledPlugins,
+                json!({ "version": 2, "plugins": { "p@m": {
+                    "project:/Users/alice/src/cella": {
+                        "scope": "project",
+                        "projectPath": "/Users/alice/src/cella",
+                        "installPath": "/Users/alice/.claude/plugins/cache/p"
+                    },
+                    "user": {
+                        "scope": "user",
+                        "installPath": "/Users/alice/.claude/plugins/cache/p"
+                    }
+                }}}),
+            ),
+        ];
+        for (doc, canonical) in cases {
+            for map in [None, Some(test_map())] {
+                let local = to_local(doc, &canonical, map.as_ref());
+                assert_eq!(
+                    to_canonical(doc, &local, map.as_ref()).expect("codec output must reparse"),
+                    canonical,
+                    "{doc:?} roundtrip failed (map: {})",
+                    map.is_some()
+                );
+            }
+        }
+    }
+
+    /// A mapping rooted at `/workspaces/app` must not capture
+    /// `/workspaces/application`.
+    #[test]
+    fn prefix_match_respects_component_boundaries() {
+        let map = PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some((
+                "/workspaces/app".to_string(),
+                "/Users/alice/src/app".to_string(),
+            )),
+        };
+        let doc = json!({ "p": [
+            { "projectPath": "/workspaces/application" },
+            { "projectPath": "/workspaces/app" },
+            { "projectPath": "/workspaces/app/sub" }
+        ]});
+        let out = map.to_host(&doc);
+        assert_eq!(
+            out["p"][0]["projectPath"],
+            json!("/workspaces/application"),
+            "a sibling sharing the prefix must be left alone"
+        );
+        assert_eq!(out["p"][1]["projectPath"], json!("/Users/alice/src/app"));
+        assert_eq!(
+            out["p"][2]["projectPath"],
+            json!("/Users/alice/src/app/sub")
+        );
+    }
+
+    /// An empty entry array normalizes to an empty context map — that is what
+    /// lets a plugin losing its last context diff into per-context tombstones
+    /// rather than a whole-key deletion — and must denormalize back to `[]` so
+    /// the on-disk schema is unchanged.
+    #[test]
+    fn empty_entry_arrays_round_trip_through_an_empty_context_map() {
+        let doc = json!({ "version": 2, "plugins": { "p@m": [] } });
+        let normalized = normalize_installed_plugins(&doc);
+        assert_eq!(normalized["plugins"]["p@m"], json!({}));
+        assert_eq!(denormalize_installed_plugins(&normalized), doc);
+    }
+
+    /// Normalization passes an unrecognised `plugins` value through for forward
+    /// compatibility; denormalization must not then mangle it into an array.
+    #[test]
+    fn denormalize_leaves_unrecognized_object_shapes_untouched() {
+        let doc = json!({
+            "version": 3,
+            "plugins": { "p@m": { "someFutureKey": { "nested": true } } }
+        });
+        assert_eq!(denormalize_installed_plugins(&doc), doc);
+        // And the pair still round-trips such a document unchanged.
+        assert_eq!(
+            denormalize_installed_plugins(&normalize_installed_plugins(&doc)),
+            doc
+        );
+    }
+
+    /// A custom mount may supply a trailing separator; matching must still land
+    /// on component boundaries and must not produce a doubled separator.
+    #[test]
+    fn trailing_separators_do_not_break_matching() {
+        let map = PathMap {
+            claude: (
+                "/home/vscode/.claude".to_string(),
+                "/Users/alice/.claude".to_string(),
+            ),
+            workspace: Some(("/workspace/".to_string(), "/host/code/".to_string())),
+        };
+        let doc = json!({ "p": [
+            { "projectPath": "/workspace/sub" },
+            { "projectPath": "/workspace" }
+        ]});
+        let hosted = map.to_host(&doc);
+        assert_eq!(hosted["p"][0]["projectPath"], json!("/host/code/sub"));
+        assert_eq!(hosted["p"][1]["projectPath"], json!("/host/code"));
+        assert_eq!(
+            map.to_container(&hosted)["p"][0]["projectPath"],
+            json!("/workspace/sub")
+        );
+    }
+
+    #[test]
+    fn root_prefix_keeps_its_separator() {
+        assert_eq!(trim_trailing_slash("/"), "/");
+        assert_eq!(trim_trailing_slash("/a/"), "/a");
+        assert_eq!(trim_trailing_slash("/a"), "/a");
+    }
+
+    /// A manifest written by a container running as a different user carries
+    /// that user's home; the host copy must be repaired to the host's own.
+    #[test]
+    fn repair_rewrites_any_writers_claude_home() {
+        let doc = json!({ "plugins": { "p@m": [
+            { "installPath": "/home/node/.claude/plugins/cache/p" },
+            { "installPath": "/root/.claude/plugins/cache/q" },
+            { "installPath": "/Users/bob/.claude/plugins/cache/r" }
+        ]}});
+        let out = repair_claude_home(&doc, "/Users/alice/.claude");
+        let e = &out["plugins"]["p@m"];
+        assert_eq!(
+            e[0]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/p")
+        );
+        assert_eq!(
+            e[1]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/q")
+        );
+        assert_eq!(
+            e[2]["installPath"],
+            json!("/Users/alice/.claude/plugins/cache/r")
+        );
+    }
+
+    #[test]
+    fn repair_leaves_non_claude_and_partial_matches_alone() {
+        let doc = json!({ "p": [
+            { "projectPath": "/workspaces/cella" },
+            { "installPath": "/home/node/.claude-backup/x" }
+        ]});
+        assert_eq!(repair_claude_home(&doc, "/Users/alice/.claude"), doc);
+    }
+
+    #[test]
+    fn repair_is_a_noop_for_already_host_shaped_paths() {
+        let doc = json!({ "p": [{ "installPath": "/Users/alice/.claude/plugins/cache/p" }] });
+        assert_eq!(repair_claude_home(&doc, "/Users/alice/.claude"), doc);
+    }
+
+    // ── diff_documents ──────────────────────────────────────────────────────
+
+    /// The independence normalization exists for must survive a *deletion*: a
+    /// container removing its own install context must not take a peer's with
+    /// it. A generic diff emits `plugins.<name> = null`, which does exactly that.
+    #[test]
+    fn deleting_a_plugin_emits_per_context_tombstones() {
+        let baseline = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" }
+            ]}
+        }));
+        // Claude Code drops the key entirely once the last local context goes.
+        let after = normalize_installed_plugins(&json!({ "version": 2, "plugins": {} }));
+
+        let patch = diff_documents(SyncDoc::InstalledPlugins, &baseline, &after);
+        assert_eq!(
+            patch["plugins"]["p@m"],
+            json!({ "user": null, "project:/w/a": null }),
+            "the deletion must be expressed per context, not as a whole-key null"
+        );
+
+        // A peer added a context while this container was offline; it survives.
+        let canonical = normalize_installed_plugins(&json!({
+            "version": 2,
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/a", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/peer", "version": "2.0" }
+            ]}
+        }));
+        let merged = apply_merge_patch(&canonical, &patch);
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/peer"]["version"],
+            json!("2.0"),
+            "a peer's context must survive another container's deletion"
+        );
+        assert!(merged["plugins"]["p@m"]["user"].is_null());
+    }
+
+    /// Claude Code may instead leave the key present with an empty list.
+    #[test]
+    fn emptying_a_plugin_entry_list_also_tombstones_per_context() {
+        let baseline = normalize_installed_plugins(&json!({
+            "plugins": { "p@m": [{ "scope": "user", "version": "1.0" }] }
+        }));
+        let after = normalize_installed_plugins(&json!({ "plugins": { "p@m": [] } }));
+        let patch = diff_documents(SyncDoc::InstalledPlugins, &baseline, &after);
+
+        let canonical = normalize_installed_plugins(&json!({
+            "plugins": { "p@m": [
+                { "scope": "user", "version": "1.0" },
+                { "scope": "project", "projectPath": "/w/peer", "version": "2.0" }
+            ]}
+        }));
+        let merged = apply_merge_patch(&canonical, &patch);
+        assert_eq!(
+            merged["plugins"]["p@m"]["project:/w/peer"]["version"],
+            json!("2.0"),
+            "an emptied entry list must not wipe a peer's context"
+        );
+    }
+
+    #[test]
+    fn diff_documents_is_the_plain_diff_for_other_documents() {
+        let old = json!({ "a": 1, "b": 2 });
+        let new = json!({ "a": 1 });
+        assert_eq!(
+            diff_documents(SyncDoc::ClaudeJson, &old, &new),
+            diff_merge_patch(&old, &new)
+        );
+        assert_eq!(
+            diff_documents(SyncDoc::KnownMarketplaces, &old, &new),
+            diff_merge_patch(&old, &new)
+        );
     }
 }

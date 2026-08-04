@@ -32,7 +32,7 @@ Installers return `Option<ExecResult>` -- `None` when the idempotency guard shor
 - `build_tool_config_mount_specs()` -- produces bind/tmpfs mounts for forwarding host tool configs (~/.claude, ~/.codex, ~/.gemini, ~/.config/nvim, ~/.tmux.conf) into the container
 - `ensure_tool_config_paths()` -- pre-creates missing config files/dirs on the host so mount specs can detect them
 - `setup_plugin_manifests()` -- populates the tmpfs-backed plugin directory with symlinks and path-rewritten manifest JSONs
-- `tool_config_env_vars()` -- pins the container plugin directory and host home used by agent-side manifest write-back
+- `tool_config_env_vars()` -- pins the paths agent-side document sync needs: the container plugin directory, the host home, and the container/host workspace pair used to translate `projectPath`
 - `verify_tool_callable()` -- two-phase probe (login shell, then interactive) matching `cella exec`'s wrapping
 - `symlink_to_usr_local_bin()` -- idempotent symlink creation with safety check against overwriting regular files
 

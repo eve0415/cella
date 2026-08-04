@@ -2,6 +2,27 @@ use std::path::Path;
 
 use cella_backend::MountConfig;
 
+/// The container↔host path pair for the workspace, or `None` when there is no
+/// host directory behind it.
+///
+/// Derived from the *effective* workspace mount rather than assuming
+/// `(workspace_folder, workspace_root)`: a config may set a custom
+/// `workspaceMount` (e.g. `source=/host/code,target=/code`), disable it
+/// entirely, or back the workspace with a volume. In those cases the naive pair
+/// is wrong or nonexistent, and a wrong pair silently rewrites `projectPath`
+/// under a host path that does not exist.
+#[must_use]
+pub fn workspace_path_pair(
+    config: &serde_json::Value,
+    host_mount_folder: &Path,
+    container_mount_folder: &str,
+) -> Option<(String, String)> {
+    let mount = map_workspace_mount(config, host_mount_folder, container_mount_folder, None)?;
+    // Only a bind mount has a host path to map to; a volume-backed workspace
+    // gets no translation, exactly as before this existed.
+    (mount.mount_type == "bind").then_some((mount.target, mount.source))
+}
+
 pub(super) fn map_workspace_mount(
     config: &serde_json::Value,
     workspace_root: &Path,
@@ -362,5 +383,45 @@ mod tests {
             m.consistency.is_none(),
             "custom workspaceMount should not get injected consistency"
         );
+    }
+
+    #[test]
+    fn workspace_path_pair_defaults_to_folder_and_root() {
+        let config = json!({});
+        let pair = workspace_path_pair(&config, Path::new("/host/code"), "/workspaces/code");
+        assert_eq!(
+            pair,
+            Some((
+                "/workspaces/code".to_string(),
+                Path::new("/host/code")
+                    .canonicalize()
+                    .unwrap_or_else(|_| Path::new("/host/code").to_path_buf())
+                    .to_string_lossy()
+                    .to_string()
+            ))
+        );
+    }
+
+    /// A custom `workspaceMount` is the real mapping — the naive
+    /// `(workspace_folder, workspace_root)` pair would be wrong here.
+    #[test]
+    fn workspace_path_pair_follows_a_custom_mount() {
+        let config = json!({"workspaceMount": "type=bind,source=/host/code,target=/code"});
+        assert_eq!(
+            workspace_path_pair(&config, Path::new("/elsewhere"), "/workspaces/x"),
+            Some(("/code".to_string(), "/host/code".to_string()))
+        );
+    }
+
+    #[test]
+    fn workspace_path_pair_absent_when_mount_disabled() {
+        let config = json!({"workspaceMount": ""});
+        assert!(workspace_path_pair(&config, Path::new("/host"), "/workspaces/x").is_none());
+    }
+
+    #[test]
+    fn workspace_path_pair_absent_for_a_volume_workspace() {
+        let config = json!({"workspaceMount": "type=volume,source=ws,target=/code"});
+        assert!(workspace_path_pair(&config, Path::new("/host"), "/workspaces/x").is_none());
     }
 }

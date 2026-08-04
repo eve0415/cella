@@ -1205,6 +1205,24 @@ impl UpContext {
         }
     }
 
+    /// Create the Claude home symlink and seed the tmpfs plugin manifests.
+    ///
+    /// The seed's path rewrite reads the pinned workspace pair from the
+    /// container's own environment, so it and the agent's `PathMap` are the same
+    /// mapping by construction.
+    async fn setup_claude_code(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+    ) {
+        if !settings.tools.claude_code.forward_config {
+            return;
+        }
+        create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
+        setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
+    }
+
     /// Run post-create setup: env injection, credentials, Claude Code, userEnvProbe.
     pub(crate) async fn post_create_setup(
         &self,
@@ -1284,11 +1302,8 @@ impl UpContext {
             )
             .await;
 
-        // Create home path symlink and populate plugin manifests
-        if settings.tools.claude_code.forward_config {
-            create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
-            setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
-        }
+        self.setup_claude_code(container_id, remote_user, settings)
+            .await;
 
         // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
         // files instead of single-file bind mounts (anti-ghost). Shared by the

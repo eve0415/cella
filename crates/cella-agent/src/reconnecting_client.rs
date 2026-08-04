@@ -1,7 +1,6 @@
 //! Reconnecting wrapper around [`ControlClient`] that retries initial connection
 //! and transparently reconnects on TCP drops.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -49,24 +48,27 @@ pub struct ReconnectingClient {
     /// The `DaemonHello` received during the most recent handshake.
     daemon_hello: Option<DaemonHello>,
     tunnel_config: Option<crate::tunnel::TunnelConfig>,
-    /// Forwards daemon-pushed `~/.claude.json` content to the config writer.
+    /// Forwards daemon-pushed canonical documents to the config writer.
     /// `None` when this agent did not opt into config sync. Re-passed to
     /// `start_reader` on every (re)connect so the reader survives reconnects.
-    claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// Path of the `~/.claude.json` to re-announce to the daemon on every
-    /// (re)connect (before the reader starts). `None` when sync is disabled.
-    claude_config_path: Option<PathBuf>,
+    claude_apply_tx: Option<tokio::sync::mpsc::Sender<crate::doc_sync::ApplyMessage>>,
+    /// Whether to re-announce the synced documents on every (re)connect.
+    reannounce_docs: bool,
 }
 
-/// Re-announce the current `~/.claude.json` to the daemon over a freshly
-/// established connection, *before* the reader is started — so the read happens
-/// before any inbound push can clobber local edits, and the daemon can merge this
-/// container's state and push back whatever it is missing. No-op when sync is off.
-async fn reannounce_claude_config(client: &mut ControlClient, path: Option<&Path>) {
-    if let Some(msg) = crate::claude_config_sync::reannounce_message(path).await
-        && let Err(e) = client.send(&msg).await
-    {
-        debug!("claude sync: re-announce on connect failed: {e}");
+/// Re-announce every synced document to the daemon over a freshly established
+/// connection, *before* the reader is started — so the read happens before any
+/// inbound push can clobber local edits, and the daemon can merge this
+/// container's state and reply with whatever it is missing. No-op when sync is
+/// off.
+async fn reannounce_config_docs(client: &mut ControlClient, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for msg in crate::doc_sync::reannounce_messages().await {
+        if let Err(e) = client.send(&msg).await {
+            debug!("doc sync: re-announce on connect failed: {e}");
+        }
     }
 }
 
@@ -83,16 +85,13 @@ impl ReconnectingClient {
         initial_addr: &str,
         container_name: &str,
         initial_token: &str,
-        claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        claude_apply_tx: Option<tokio::sync::mpsc::Sender<crate::doc_sync::ApplyMessage>>,
     ) -> Self {
         let start = tokio::time::Instant::now();
         let mut last_warn = start;
         let mut addr = initial_addr.to_string();
         let mut token = initial_token.to_string();
-        let claude_config_path = claude_apply_tx
-            .is_some()
-            .then(crate::claude_config_sync::config_path)
-            .flatten();
+        let reannounce_docs = claude_apply_tx.is_some();
 
         loop {
             match ControlClient::connect(&addr, container_name, &token, false).await {
@@ -102,7 +101,7 @@ impl ReconnectingClient {
                         daemon_addr: addr.clone(),
                         auth_token: token.clone(),
                     });
-                    reannounce_claude_config(&mut client, claude_config_path.as_deref()).await;
+                    reannounce_config_docs(&mut client, reannounce_docs).await;
                     client.start_reader(tunnel_config.clone(), claude_apply_tx.clone());
                     return Self {
                         addr,
@@ -113,7 +112,7 @@ impl ReconnectingClient {
                         daemon_hello: Some(hello),
                         tunnel_config,
                         claude_apply_tx,
-                        claude_config_path,
+                        reannounce_docs,
                     };
                 }
                 Err(e) => {
@@ -184,7 +183,7 @@ impl ReconnectingClient {
             daemon_addr: new_addr.clone(),
             auth_token: new_token.clone(),
         });
-        reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
+        reannounce_config_docs(&mut client, self.reannounce_docs).await;
         client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
         self.inner = Some(client);
         self.daemon_hello = Some(hello);
@@ -256,7 +255,7 @@ impl ReconnectingClient {
                     daemon_addr: self.addr.clone(),
                     auth_token: self.auth_token.clone(),
                 });
-                reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
+                reannounce_config_docs(&mut client, self.reannounce_docs).await;
                 client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                 self.inner = Some(client);
                 self.daemon_hello = Some(hello);
@@ -285,7 +284,7 @@ impl ReconnectingClient {
                         daemon_addr: info.addr.clone(),
                         auth_token: info.token.clone(),
                     });
-                    reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
+                    reannounce_config_docs(&mut client, self.reannounce_docs).await;
                     client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                     self.addr = info.addr;
                     self.auth_token = info.token;
@@ -426,7 +425,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         assert!(client.take_reconnected());
@@ -444,7 +443,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         let msg = AgentMessage::Health {
@@ -466,7 +465,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         let result = client.recv().await;
@@ -486,7 +485,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
         assert!(!client.take_reconnected());
     }
@@ -502,7 +501,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
         let result = client.try_reconnect().await;
         assert!(result.is_err());
@@ -521,7 +520,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         let msg = AgentMessage::Health {
@@ -545,7 +544,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         let (addr, name, token) = client.connection_params();
@@ -565,7 +564,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
-            claude_config_path: None,
+            reannounce_docs: false,
         };
 
         assert!(client.inner.is_none());
