@@ -18,7 +18,10 @@ const TAG_PAGE_SIZE: usize = 100;
 const REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build a registry client with both timeouts set.
-fn registry_client() -> oci_client::Client {
+///
+/// Every client in this crate is built here, so no call path is left with
+/// `oci-client`'s unbounded defaults.
+pub(crate) fn registry_client() -> oci_client::Client {
     oci_client::Client::new(ClientConfig {
         protocol: ClientProtocol::Https,
         read_timeout: Some(REGISTRY_TIMEOUT),
@@ -133,21 +136,20 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
             Err(e) => return Err(crate::TagListError::new(reference, &e).into()),
         };
 
-        let page_len = response.tags.len();
         let next_last = response.tags.last().cloned();
+        let plan = plan_page(response.tags.len(), last.as_deref(), next_last.as_deref());
 
-        // A repeated cursor means this is the page we already have. Break
-        // *before* extending, or the whole listing comes back doubled.
-        if is_repeat_page(last.as_deref(), next_last.as_deref()) {
-            debug!("registry ignored `last`; stopping on the repeated page");
+        if plan == PagePlan::Repeat {
+            // The page we already have. Stop *before* extending, or the whole
+            // listing comes back doubled.
+            debug!("registry ignored `last`; discarding the repeated page");
             break;
         }
 
-        let done = is_final_page(page_len, last.as_deref(), next_last.as_deref());
         last = next_last;
         all_tags.extend(response.tags);
 
-        if done {
+        if plan == PagePlan::Final {
             break;
         }
     }
@@ -181,18 +183,22 @@ pub fn normalize_reference(reference: &str) -> String {
     format!("docker.io/library/{reference}")
 }
 
-/// Whether this page is the previous page served again.
-///
-/// A registry that ignores `?last=` answers every request identically, so an
-/// unchanged trailing tag means no new content — the page must be discarded,
-/// not appended.
-fn is_repeat_page(previous_last: Option<&str>, new_last: Option<&str>) -> bool {
-    previous_last.is_some() && previous_last == new_last
+/// What to do with a tag page that just arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagePlan {
+    /// The previous page served again — discard it and stop.
+    Repeat,
+    /// Keep it, then stop.
+    Final,
+    /// Keep it and ask for another.
+    More,
 }
 
-/// Whether a tag page is the last one worth asking for.
+/// Decide what a tag page means, from whether the cursor advanced and whether
+/// the page was the size we asked for.
 ///
-/// Three ways a listing ends:
+/// Registries end a listing in three different ways, and only the first is the
+/// one the spec describes:
 ///
 /// - **Short page** — the normal end. Stopping here also avoids a follow-up
 ///   request that would trip the `{"tags": null}` deserialization bug some
@@ -200,12 +206,19 @@ fn is_repeat_page(previous_last: Option<&str>, new_last: Option<&str>) -> bool {
 /// - **Over-full page** — the registry ignored `?n=` and answered with the
 ///   whole list. MCR does this: `devcontainers/rust` returns all 408 tags
 ///   however small an `n` you ask for.
-/// - **Stalled cursor** — the registry ignored `?last=`, so the next request
-///   would return the same page forever. MCR does this too.
+/// - **Stalled cursor** — the registry ignored `?last=`, so every further
+///   request repeats this page. MCR does this too, which is why the repeat is
+///   dropped rather than appended.
 ///
 /// Without the last two, listing an MCR repository never terminates.
-fn is_final_page(page_len: usize, previous_last: Option<&str>, new_last: Option<&str>) -> bool {
-    page_len != TAG_PAGE_SIZE || new_last.is_none() || previous_last == new_last
+fn plan_page(page_len: usize, previous_last: Option<&str>, new_last: Option<&str>) -> PagePlan {
+    if previous_last.is_some() && previous_last == new_last {
+        return PagePlan::Repeat;
+    }
+    if page_len != TAG_PAGE_SIZE || new_last.is_none() {
+        return PagePlan::Final;
+    }
+    PagePlan::More
 }
 
 /// The version component of an OCI reference: a tag or a digest.
@@ -285,50 +298,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_registry_that_ignores_pagination_still_terminates() {
-        // Regression: MCR ignores both `?n=` and `?last=` and answers every
-        // request with the full list (408 tags for devcontainers/rust). The
-        // old `page_len < TAG_PAGE_SIZE` exit could never fire, so listing
-        // MCR tags looped forever.
-        assert!(
-            is_final_page(408, None, Some("trixie")),
-            "an over-full page means the registry ignored `n`"
-        );
-        // ...and even at exactly the page size, a cursor that does not move
-        // is the end of the road.
-        assert!(
-            is_final_page(TAG_PAGE_SIZE, Some("trixie"), Some("trixie")),
-            "a stalled cursor must end the listing"
-        );
-    }
-
     /// Regression: the stalled page was appended before the loop broke, so a
     /// registry honouring `?n=` but ignoring `?last=` returned every tag twice.
     #[test]
-    fn a_stalled_cursor_does_not_duplicate_its_page() {
-        assert!(
-            is_repeat_page(Some("trixie"), Some("trixie")),
+    fn a_stalled_cursor_discards_its_repeated_page() {
+        assert_eq!(
+            plan_page(TAG_PAGE_SIZE, Some("trixie"), Some("trixie")),
+            PagePlan::Repeat,
             "the same cursor twice means the same page came back"
         );
-        assert!(
-            !is_repeat_page(None, Some("trixie")),
-            "the first page has no previous cursor to repeat"
+    }
+
+    /// Regression: MCR ignores both `?n=` and `?last=` and answers every
+    /// request with the full list (408 tags for devcontainers/rust), so a
+    /// `page_len < TAG_PAGE_SIZE` exit could never fire and listing looped
+    /// forever.
+    #[test]
+    fn a_registry_that_ignores_pagination_still_terminates() {
+        assert_eq!(
+            plan_page(408, None, Some("trixie")),
+            PagePlan::Final,
+            "an over-full page means the registry ignored `n`"
         );
-        assert!(!is_repeat_page(Some("a"), Some("b")));
     }
 
     #[test]
     fn a_paginating_registry_keeps_going_until_a_short_page() {
-        assert!(
-            !is_final_page(TAG_PAGE_SIZE, Some("a"), Some("b")),
+        assert_eq!(
+            plan_page(TAG_PAGE_SIZE, Some("a"), Some("b")),
+            PagePlan::More,
             "a full page with an advancing cursor has more to come"
         );
-        assert!(
-            is_final_page(7, Some("a"), Some("b")),
-            "a short page ends it"
+        assert_eq!(plan_page(7, Some("a"), Some("b")), PagePlan::Final);
+        assert_eq!(
+            plan_page(0, None, None),
+            PagePlan::Final,
+            "empty page ends it"
         );
-        assert!(is_final_page(0, None, None), "an empty page ends it");
     }
 
     #[test]

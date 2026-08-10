@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use oci_client::Reference;
-use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
+use oci_client::client::{Config, ImageLayer};
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use sha2::{Digest, Sha256};
@@ -76,7 +76,7 @@ pub async fn list_published_tags(
     registry: &str,
     repository: &str,
 ) -> Result<Vec<String>, PushError> {
-    let client = new_client();
+    let client = crate::inspect::registry_client();
     let auth = build_registry_auth(registry);
     let oci_ref = Reference::with_tag(
         registry.to_owned(),
@@ -139,7 +139,7 @@ pub async fn push_artifact(
         return Ok(None);
     }
 
-    let client = new_client();
+    let client = crate::inspect::registry_client();
     let auth = build_registry_auth(registry);
 
     let image_layers: Vec<ImageLayer> = layers
@@ -215,13 +215,6 @@ pub async fn push_artifact(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-fn new_client() -> oci_client::Client {
-    oci_client::Client::new(ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    })
-}
 
 /// Serialize `manifest` using OCI canonical JSON (the same formatter that
 /// `oci-distribution` uses before the registry PUT) and return the digest as
