@@ -134,13 +134,12 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
         };
 
         let page_len = response.tags.len();
-        last = response.tags.last().cloned();
+        let next_last = response.tags.last().cloned();
+        let done = is_final_page(page_len, last.as_deref(), next_last.as_deref());
+        last = next_last;
         all_tags.extend(response.tags);
 
-        // A partial page means we've reached the end. Avoid making a
-        // follow-up request that would trigger the null-tags deserialization
-        // bug in some registries (including GHCR).
-        if page_len < TAG_PAGE_SIZE {
+        if done {
             break;
         }
     }
@@ -172,6 +171,24 @@ pub fn normalize_reference(reference: &str) -> String {
         return format!("docker.io/{reference}");
     }
     format!("docker.io/library/{reference}")
+}
+
+/// Whether a tag page is the last one worth asking for.
+///
+/// Three ways a listing ends:
+///
+/// - **Short page** — the normal end. Stopping here also avoids a follow-up
+///   request that would trip the `{"tags": null}` deserialization bug some
+///   registries (including GHCR) hit on the final page.
+/// - **Over-full page** — the registry ignored `?n=` and answered with the
+///   whole list. MCR does this: `devcontainers/rust` returns all 408 tags
+///   however small an `n` you ask for.
+/// - **Stalled cursor** — the registry ignored `?last=`, so the next request
+///   would return the same page forever. MCR does this too.
+///
+/// Without the last two, listing an MCR repository never terminates.
+fn is_final_page(page_len: usize, previous_last: Option<&str>, new_last: Option<&str>) -> bool {
+    page_len != TAG_PAGE_SIZE || new_last.is_none() || previous_last == new_last
 }
 
 /// The version component of an OCI reference: a tag or a digest.
@@ -249,6 +266,37 @@ mod tests {
             version,
             ReferenceVersion::Digest("sha256:abc123".to_owned())
         );
+    }
+
+    #[test]
+    fn a_registry_that_ignores_pagination_still_terminates() {
+        // Regression: MCR ignores both `?n=` and `?last=` and answers every
+        // request with the full list (408 tags for devcontainers/rust). The
+        // old `page_len < TAG_PAGE_SIZE` exit could never fire, so listing
+        // MCR tags looped forever.
+        assert!(
+            is_final_page(408, None, Some("trixie")),
+            "an over-full page means the registry ignored `n`"
+        );
+        // ...and even at exactly the page size, a cursor that does not move
+        // is the end of the road.
+        assert!(
+            is_final_page(TAG_PAGE_SIZE, Some("trixie"), Some("trixie")),
+            "a stalled cursor must end the listing"
+        );
+    }
+
+    #[test]
+    fn a_paginating_registry_keeps_going_until_a_short_page() {
+        assert!(
+            !is_final_page(TAG_PAGE_SIZE, Some("a"), Some("b")),
+            "a full page with an advancing cursor has more to come"
+        );
+        assert!(
+            is_final_page(7, Some("a"), Some("b")),
+            "a short page ends it"
+        );
+        assert!(is_final_page(0, None, None), "an empty page ends it");
     }
 
     #[test]
