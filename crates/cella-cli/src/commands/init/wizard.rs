@@ -836,7 +836,15 @@ async fn prompt_variant_with_pin(
         )
         .await
     {
-        Ok(fetched) => fetched.tags,
+        Ok(fetched) => {
+            if fetched.source == cella_oci::TagSource::StaleCache {
+                eprintln!(
+                    "  {} registry unreachable; offering cached tags, which may be out of date",
+                    style::dim("(note)")
+                );
+            }
+            fetched.tags
+        }
         Err(e) => {
             eprintln!(
                 "  {} could not fetch image tags: {e}; using variant as-is",
