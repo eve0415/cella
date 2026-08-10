@@ -2,4 +2,5 @@
 //! devcontainer configuration.
 
 pub mod candidates;
+pub mod jsonc_edit;
 pub mod release;
