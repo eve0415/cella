@@ -135,6 +135,14 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
 
         let page_len = response.tags.len();
         let next_last = response.tags.last().cloned();
+
+        // A repeated cursor means this is the page we already have. Break
+        // *before* extending, or the whole listing comes back doubled.
+        if is_repeat_page(last.as_deref(), next_last.as_deref()) {
+            debug!("registry ignored `last`; stopping on the repeated page");
+            break;
+        }
+
         let done = is_final_page(page_len, last.as_deref(), next_last.as_deref());
         last = next_last;
         all_tags.extend(response.tags);
@@ -171,6 +179,15 @@ pub fn normalize_reference(reference: &str) -> String {
         return format!("docker.io/{reference}");
     }
     format!("docker.io/library/{reference}")
+}
+
+/// Whether this page is the previous page served again.
+///
+/// A registry that ignores `?last=` answers every request identically, so an
+/// unchanged trailing tag means no new content — the page must be discarded,
+/// not appended.
+fn is_repeat_page(previous_last: Option<&str>, new_last: Option<&str>) -> bool {
+    previous_last.is_some() && previous_last == new_last
 }
 
 /// Whether a tag page is the last one worth asking for.
@@ -284,6 +301,21 @@ mod tests {
             is_final_page(TAG_PAGE_SIZE, Some("trixie"), Some("trixie")),
             "a stalled cursor must end the listing"
         );
+    }
+
+    /// Regression: the stalled page was appended before the loop broke, so a
+    /// registry honouring `?n=` but ignoring `?last=` returned every tag twice.
+    #[test]
+    fn a_stalled_cursor_does_not_duplicate_its_page() {
+        assert!(
+            is_repeat_page(Some("trixie"), Some("trixie")),
+            "the same cursor twice means the same page came back"
+        );
+        assert!(
+            !is_repeat_page(None, Some("trixie")),
+            "the first page has no previous cursor to repeat"
+        );
+        assert!(!is_repeat_page(Some("a"), Some("b")));
     }
 
     #[test]
