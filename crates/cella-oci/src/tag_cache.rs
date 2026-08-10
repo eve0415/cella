@@ -56,7 +56,7 @@ impl TagCache {
             return None;
         }
 
-        let tags = self.read(&path)?;
+        let tags = read_entry(&path)?;
         debug!("tag cache hit for {reference}");
         Some(tags)
     }
@@ -66,7 +66,7 @@ impl TagCache {
     /// Used as a fallback when the registry is unreachable, where stale data
     /// beats no data.
     pub fn get_stale(&self, reference: &str) -> Option<Vec<String>> {
-        let tags = self.read(&self.path_for(reference))?;
+        let tags = read_entry(&self.path_for(reference))?;
         debug!("stale tag cache hit for {reference}");
         Some(tags)
     }
@@ -87,13 +87,6 @@ impl TagCache {
         Ok(())
     }
 
-    /// Deserialize a cache entry, treating any unreadable or corrupt file as
-    /// a miss.
-    fn read(&self, path: &Path) -> Option<Vec<String>> {
-        let _ = self;
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
-    }
-
     /// Compute the cache file path for an image reference.
     ///
     /// The reference is hashed so that its slashes and colons cannot become
@@ -103,6 +96,11 @@ impl TagCache {
         let hash = hex::encode(&Sha256::digest(prefixed.as_bytes())[..8]);
         self.root.join(format!("{hash}.json"))
     }
+}
+
+/// Deserialize a cache entry, treating any unreadable or corrupt file as a miss.
+fn read_entry(path: &Path) -> Option<Vec<String>> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 impl Default for TagCache {

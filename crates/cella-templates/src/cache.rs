@@ -209,10 +209,6 @@ impl TemplateCache {
     // Template artifact cache
     // -----------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Template artifact cache
-    // -----------------------------------------------------------------------
-
     /// Check whether a template artifact is cached.
     pub fn get_template(&self, registry: &str, repository: &str, digest: &str) -> Option<PathBuf> {
         let path = self.template_path(registry, repository, digest);
