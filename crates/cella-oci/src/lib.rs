@@ -4,6 +4,7 @@ pub mod extract;
 pub mod inspect;
 pub mod limits;
 pub mod push;
+pub mod tag_cache;
 pub mod tags;
 
 pub use auth::{DockerCredentials, resolve_credentials};
@@ -15,7 +16,11 @@ pub use limits::{
     MAX_COLLECTION_JSON_BYTES, would_exceed_cap,
 };
 pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
-pub use tags::{MAX_PINNED_TAGS, VersionKey, pinnable_tags, version_key};
+pub use tag_cache::TagCache;
+pub use tags::{
+    FetchedTags, MAX_PINNED_TAGS, TagSource, VersionKey, fetch_image_tags, pinnable_tags,
+    version_key,
+};
 
 use oci_client::secrets::RegistryAuth;
 use tracing::debug;

@@ -4,12 +4,7 @@
 //! (e.g. `4.0.6-22-trixie`) rather than using the template's default
 //! tag pattern.
 
-use oci_client::Reference;
-use oci_client::client::{ClientConfig, ClientProtocol};
 use tracing::debug;
-
-use crate::cache::TemplateCache;
-use crate::error::TemplateError;
 
 /// Information about the image variant option detected in a template.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,63 +76,6 @@ pub fn detect_image_variant_option(config_content: &str) -> Option<ImageVariantI
         option_key: last_key?,
     })
 }
-
-/// Parse an image reference into `(registry, repository)`.
-///
-/// # Errors
-///
-/// Returns [`TemplateError::TagFetchFailed`] if the reference has no `/`.
-pub fn parse_image_ref(image: &str) -> Result<(String, String), TemplateError> {
-    image
-        .split_once('/')
-        .map(|(reg, repo)| (reg.to_owned(), repo.to_owned()))
-        .ok_or_else(|| TemplateError::TagFetchFailed {
-            image: image.to_owned(),
-            message: "invalid image reference: expected registry/repository".to_owned(),
-        })
-}
-
-/// Fetch available tags for an image from its OCI registry.
-///
-/// # Errors
-///
-/// Returns [`TemplateError::TagFetchFailed`] on network or API errors.
-pub async fn fetch_image_tags(
-    image_ref: &str,
-    cache: &TemplateCache,
-    force_refresh: bool,
-) -> Result<Vec<String>, TemplateError> {
-    if !force_refresh && let Some(tags) = cache.get_image_tags(image_ref) {
-        return Ok(tags);
-    }
-
-    let (registry, repository) = parse_image_ref(image_ref)?;
-
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_client::Client::new(config);
-
-    let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
-    let auth = build_registry_auth(&registry);
-
-    debug!("fetching image tags for {image_ref}");
-
-    let response = client
-        .list_tags(&oci_ref, &auth, None, None)
-        .await
-        .map_err(|e| TemplateError::TagFetchFailed {
-            image: image_ref.to_owned(),
-            message: format!("failed to list tags: {e}"),
-        })?;
-
-    let _ = cache.put_image_tags(image_ref, &response.tags);
-
-    Ok(response.tags)
-}
-
-use cella_oci::build_registry_auth;
 
 // ===========================================================================
 // Tests
@@ -235,54 +173,5 @@ mod tests {
     fn detect_variant_no_tag_at_all() {
         let config = r#"{"image": "ubuntu"}"#;
         assert!(detect_image_variant_option(config).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_image_ref
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_image_ref_mcr() {
-        let (reg, repo) = parse_image_ref("mcr.microsoft.com/devcontainers/rust").unwrap();
-        assert_eq!(reg, "mcr.microsoft.com");
-        assert_eq!(repo, "devcontainers/rust");
-    }
-
-    #[test]
-    fn parse_image_ref_ghcr() {
-        let (reg, repo) = parse_image_ref("ghcr.io/myorg/myimage").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "myorg/myimage");
-    }
-
-    #[test]
-    fn parse_image_ref_invalid() {
-        assert!(parse_image_ref("no-slash").is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // Image tag cache
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn image_tag_cache_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = TemplateCache::with_root(dir.path());
-        let tags = vec!["4.0.6-trixie".to_owned(), "4.0.5-trixie".to_owned()];
-
-        cache
-            .put_image_tags("mcr.microsoft.com/devcontainers/rust", &tags)
-            .unwrap();
-        let cached = cache
-            .get_image_tags("mcr.microsoft.com/devcontainers/rust")
-            .unwrap();
-        assert_eq!(cached, tags);
-    }
-
-    #[test]
-    fn image_tag_cache_miss() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = TemplateCache::with_root(dir.path());
-        assert!(cache.get_image_tags("nonexistent").is_none());
     }
 }

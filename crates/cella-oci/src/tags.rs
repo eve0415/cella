@@ -4,6 +4,10 @@
 //! `2.0.9-trixie` after `2.0.14-trixie`. Everything here exists so callers
 //! rank tags by version instead of by string.
 
+use tracing::warn;
+
+use crate::tag_cache::TagCache;
+
 /// Maximum number of pinned tags to present to the user.
 pub const MAX_PINNED_TAGS: usize = 15;
 
@@ -84,6 +88,69 @@ pub fn version_key(prefix: &str) -> Option<VersionKey> {
                 .collect()
         })
         .collect()
+}
+
+/// Where a tag list came from.
+///
+/// Callers surface [`Self::StaleCache`] to the user: the answer is real but
+/// may be out of date, which is a different thing from a fresh answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSource {
+    /// Fetched from the registry just now.
+    Registry,
+    /// Served from a cache entry still inside its TTL.
+    Cache,
+    /// Served from an expired cache entry because the registry was
+    /// unreachable.
+    StaleCache,
+}
+
+/// A published tag list together with where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedTags {
+    /// The tags, in registry order (lexical — rank them before use).
+    pub tags: Vec<String>,
+    /// Provenance of `tags`.
+    pub source: TagSource,
+}
+
+/// Fetch the published tag list for an image reference, via a 1-hour cache.
+///
+/// When the registry cannot be reached, an expired cache entry is served
+/// instead and flagged as [`TagSource::StaleCache`] so the caller can warn.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be reached and no cached tag
+/// list exists for this reference.
+pub async fn fetch_image_tags(
+    cache: &TagCache,
+    reference: &str,
+    force_refresh: bool,
+) -> miette::Result<FetchedTags> {
+    if !force_refresh && let Some(tags) = cache.get(reference) {
+        return Ok(FetchedTags {
+            tags,
+            source: TagSource::Cache,
+        });
+    }
+
+    match crate::fetch_published_tags(reference).await {
+        Ok(tags) => {
+            let _ = cache.put(reference, &tags);
+            Ok(FetchedTags {
+                tags,
+                source: TagSource::Registry,
+            })
+        }
+        Err(e) => cache.get_stale(reference).map_or(Err(e), |tags| {
+            warn!("registry unreachable for {reference}; using cached tags");
+            Ok(FetchedTags {
+                tags,
+                source: TagSource::StaleCache,
+            })
+        }),
+    }
 }
 
 // ===========================================================================
@@ -210,6 +277,32 @@ mod tests {
     fn pinnable_tags_no_matches() {
         let tags = vec!["latest", "bookworm", "1.2.3-bookworm"];
         assert!(pinnable_tags(&tags, "trixie").is_empty());
+    }
+
+    /// The offline path: an unreachable registry must serve whatever the
+    /// cache holds rather than failing, and must say the answer is stale.
+    #[tokio::test]
+    async fn unreachable_registry_falls_back_to_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TagCache::with_root(dir.path());
+        let cached = vec!["2.0.14-trixie".to_owned()];
+        cache.put("registry.invalid/foo/bar", &cached).unwrap();
+
+        // Force a refresh so the fresh-cache branch cannot serve this, then
+        // backdate so only the stale reader can.
+        let old = filetime::FileTime::from_unix_time(0, 0);
+        let entry = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        filetime::set_file_mtime(entry.path(), old).unwrap();
+
+        let fetched = fetch_image_tags(&cache, "registry.invalid/foo/bar", true)
+            .await
+            .expect("stale cache must satisfy an unreachable registry");
+        assert_eq!(fetched.tags, cached);
+        assert_eq!(fetched.source, TagSource::StaleCache);
     }
 
     #[test]
