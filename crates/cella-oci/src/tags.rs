@@ -380,6 +380,46 @@ mod tests {
         assert_eq!(fetched.source, TagSource::StaleCache);
     }
 
+    /// The messy real-world case: 1924 tags, both spellings of every numeric
+    /// variant, and lexical registry ordering.
+    #[test]
+    fn ranks_the_real_mcr_base_tag_list() {
+        let raw = include_str!("../testdata/mcr-devcontainers-base-tags.json");
+        let tags: Vec<String> = serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect();
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        assert!(tags.len() > 1000, "fixture should be the full list");
+
+        // Both numeric spellings are live in this data and must both rank.
+        assert!(!pinnable_tags(&refs, "alpine3.20").is_empty());
+        assert!(!pinnable_tags(&refs, "ubuntu-24.04").is_empty());
+        assert!(!pinnable_tags(&refs, "ubuntu24.04").is_empty());
+
+        // The lexical trap: last-in-list is not newest.
+        let newest = pinnable_tags(&refs, "bookworm").first().copied().unwrap();
+        let last_lexical = refs
+            .iter()
+            .rfind(|t| t.ends_with("-bookworm"))
+            .copied()
+            .unwrap();
+        assert_ne!(newest, last_lexical);
+
+        // And the ranked head really is the maximum by version key.
+        let newest_key = split_tag(newest)
+            .and_then(|(version, _)| version_key(version))
+            .unwrap();
+        for tag in pinnable_tags(&refs, "bookworm") {
+            let key = split_tag(tag)
+                .and_then(|(version, _)| version_key(version))
+                .unwrap();
+            assert!(key <= newest_key, "{tag} outranks the reported newest");
+        }
+    }
+
     #[test]
     fn pinnable_tags_truncates_to_max() {
         let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)
