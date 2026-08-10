@@ -11,6 +11,7 @@ use super::candidates::{self, Candidates};
 use super::jsonc_edit;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
 use crate::commands::{OutputFormat, boxed_err_to_report};
+use crate::style;
 
 /// How much the command may do to the config without being asked again.
 ///
@@ -115,7 +116,10 @@ impl UpdateArgs {
         let refresh = self.refresh || self.to.is_some();
         let fetched = cella_oci::fetch_image_tags(&cache, &reference, refresh).await?;
         if fetched.source == TagSource::StaleCache {
-            eprintln!("\u{26a0} registry unreachable — using cached tags");
+            eprintln!(
+                "{} registry unreachable — using cached tags",
+                style::warn_mark()
+            );
         }
 
         let computed = candidates::compute(&fetched.tags, &tag);
@@ -125,16 +129,14 @@ impl UpdateArgs {
         }
         let found = computed.unwrap_or_else(|| Candidates::floating(&tag));
 
-        if self.nothing_to_do(&found) {
-            if matches!(self.output.resolve(), OutputFormat::Json) {
-                println!("{}", render_json(&reference, &found)?);
-            } else {
-                eprintln!("Base image is up to date.");
-            }
+        // `nothing_to_do` implies `reports_only`, so the JSON case falls
+        // through to the single render below rather than repeating it here.
+        let json_output = matches!(self.output.resolve(), OutputFormat::Json);
+        if self.nothing_to_do(&found) && !json_output {
+            eprintln!("Base image is up to date.");
             return Ok(());
         }
 
-        let json_output = matches!(self.output.resolve(), OutputFormat::Json);
         if self.reports_only(&found) {
             println!("{}", render_json(&reference, &found)?);
             return Ok(());
@@ -174,7 +176,7 @@ impl UpdateArgs {
                 .into_diagnostic()?
             );
         } else {
-            eprintln!("\u{2713} {tag} -> {new_tag}");
+            eprintln!("{} {tag} -> {new_tag}", style::success_mark());
         }
         Ok(())
     }
@@ -231,8 +233,11 @@ impl UpdateArgs {
         }
         for os_move in &found.os_moves {
             options.push(format!(
-                "{}   {} \u{2192} {}",
-                os_move.tag, os_move.from, os_move.to
+                "{}   {} {} {}",
+                os_move.tag,
+                os_move.from,
+                style::hint_arrow(),
+                os_move.to
             ));
         }
         let keep = format!("keep {}", found.current);
@@ -255,13 +260,6 @@ impl UpdateArgs {
             && let Some(best) = found.os_moves.first()
         {
             return Some(best.tag.clone());
-        }
-        if found.version_bump.is_none() && !found.os_moves.is_empty() {
-            eprintln!(
-                "({} OS move(s) available; pass --allow-os-change)",
-                found.os_moves.len()
-            );
-            return None;
         }
         if !found.os_moves.is_empty() {
             eprintln!(
@@ -353,8 +351,11 @@ fn display_candidates(reference: &str, found: &Candidates) {
     }
     for os_move in &found.os_moves {
         eprintln!(
-            "  {}   ({} \u{2192} {})",
-            os_move.tag, os_move.from, os_move.to
+            "  {}   ({} {} {})",
+            os_move.tag,
+            os_move.from,
+            style::hint_arrow(),
+            os_move.to
         );
     }
 }

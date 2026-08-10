@@ -1,6 +1,5 @@
 //! Turns a pinned tag plus a published tag list into the updates worth offering.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use cella_oci::{VersionKey, split_tag, version_key};
@@ -56,14 +55,16 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
 
     // Ranking finds the newest tag sharing the pin's selection; it says
-    // nothing about whether that tag beats the pin, so each candidate is
-    // measured against this key before being offered.
-    let current_key = version_key(current_version);
+    // nothing about whether that tag beats the pin, so every candidate is
+    // measured against this key before being offered. An unparseable pin
+    // leaves nothing to measure against, so nothing is offered.
+    let Some(current_key) = version_key(current_version) else {
+        return Some(Candidates::floating(current));
+    };
 
     let version_bump = newest_in_variant(&refs, selection)
-        .filter(|best| *best != current)
-        .filter(|best| is_at_least(best, current_key.as_ref(), Ordering::Greater))
-        .map(str::to_owned);
+        .filter(|(key, tag)| *tag != current && *key > current_key)
+        .map(|(_, tag)| tag.to_owned());
 
     let os_moves = distro_of(selection).map_or_else(Vec::new, |(prefix, _, current_release)| {
         newer_releases(&refs, &current_release)
@@ -73,11 +74,11 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
                 // prefix across: `22-bookworm` moves to `22-trixie`, never to
                 // whatever the newest `-trixie` tag happens to be.
                 let target = format!("{prefix}{target_distro}");
-                let tag = newest_in_variant(&refs, &target)?;
+                let (key, tag) = newest_in_variant(&refs, &target)?;
                 // A newer OS whose version stream has only just started would
                 // roll the image version backwards. Moving forward on one axis
                 // is not worth moving backwards on the other.
-                is_at_least(tag, current_key.as_ref(), Ordering::Equal).then(|| OsMove {
+                (key >= current_key).then(|| OsMove {
                     tag: tag.to_owned(),
                     from: selection.to_owned(),
                     to: target,
@@ -91,24 +92,6 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         version_bump,
         os_moves,
     })
-}
-
-/// Whether `tag`'s version reaches `floor` — strictly above it when
-/// `at_least` is [`Ordering::Greater`], at or above it when
-/// [`Ordering::Equal`].
-///
-/// An unparseable pin or candidate answers `false`: without a comparable
-/// version there is no evidence the move is forward.
-fn is_at_least(tag: &str, floor: Option<&VersionKey>, at_least: Ordering) -> bool {
-    let Some(floor) = floor else {
-        return false;
-    };
-    split_pin(tag)
-        .and_then(|(version, _)| version_key(version))
-        .is_some_and(|key| {
-            let ord = key.cmp(floor);
-            ord == Ordering::Greater || ord == at_least
-        })
 }
 
 /// Split a pinned tag into the image's own version and the selection that
@@ -203,7 +186,10 @@ fn prefers(candidate: &str, current: &str) -> bool {
 ///
 /// An empty selection means the tag *is* the version (`ubuntu:24.04`); it
 /// needs no special case here.
-fn newest_in_variant<'a>(tags: &[&'a str], selection: &str) -> Option<&'a str> {
+///
+/// The winning [`VersionKey`] is returned alongside the tag so callers can
+/// compare it against the pin without parsing the tag a second time.
+fn newest_in_variant<'a>(tags: &[&'a str], selection: &str) -> Option<(VersionKey, &'a str)> {
     tags.iter()
         .filter_map(|t| {
             let (version, tag_selection) = split_pin(t)?;
@@ -213,7 +199,6 @@ fn newest_in_variant<'a>(tags: &[&'a str], selection: &str) -> Option<&'a str> {
             version_key(version).map(|key| (key, *t))
         })
         .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, tag)| tag)
 }
 
 // ===========================================================================
