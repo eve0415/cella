@@ -148,6 +148,32 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
     Ok(all_tags)
 }
 
+/// Expand a Docker Hub shorthand into a fully qualified reference.
+///
+/// A first segment containing `.` or `:`, or the literal `localhost`, is
+/// treated as a registry host and left alone — this is the same rule the
+/// Docker CLI uses.
+///
+/// This is applied on the image path only. [`parse_reference`] is also
+/// reached with user-supplied *feature* references, which the devcontainer
+/// spec requires to be registry-qualified; there its "expected registry/repo"
+/// error is the useful diagnostic, and normalizing would turn a typo into a
+/// confusing Docker Hub 404.
+pub fn normalize_reference(reference: &str) -> String {
+    let first = reference.split('/').next().unwrap_or(reference);
+    let is_registry = first == "localhost" || first.contains('.') || first.contains(':');
+
+    // The `contains('/')` guard matters: `ubuntu:24.04`'s first segment
+    // contains `:` but is a repository, not a host.
+    if reference.contains('/') {
+        if is_registry {
+            return reference.to_owned();
+        }
+        return format!("docker.io/{reference}");
+    }
+    format!("docker.io/library/{reference}")
+}
+
 /// The version component of an OCI reference: a tag or a digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceVersion {
@@ -222,6 +248,27 @@ mod tests {
         assert_eq!(
             version,
             ReferenceVersion::Digest("sha256:abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalizes_bare_docker_hub_references() {
+        assert_eq!(
+            normalize_reference("ubuntu:24.04"),
+            "docker.io/library/ubuntu:24.04"
+        );
+        assert_eq!(
+            normalize_reference("node:22-bookworm"),
+            "docker.io/library/node:22-bookworm"
+        );
+        assert_eq!(normalize_reference("myorg/img:1"), "docker.io/myorg/img:1");
+        assert_eq!(
+            normalize_reference("mcr.microsoft.com/devcontainers/rust:2.0.14-trixie"),
+            "mcr.microsoft.com/devcontainers/rust:2.0.14-trixie"
+        );
+        assert_eq!(
+            normalize_reference("localhost:5000/img:1"),
+            "localhost:5000/img:1"
         );
     }
 

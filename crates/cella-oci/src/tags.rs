@@ -153,6 +153,12 @@ pub async fn fetch_image_tags(
     reference: &str,
     force_refresh: bool,
 ) -> miette::Result<FetchedTags> {
+    // Normalize here rather than in `parse_reference`: `ubuntu:24.04` is a
+    // legitimate image pin, but the same shorthand in a feature reference is
+    // a typo worth reporting. Done before the cache lookup so both spellings
+    // of a reference share one cache entry.
+    let reference = &crate::normalize_reference(reference);
+
     if !force_refresh && let Some(tags) = cache.get(reference) {
         return Ok(FetchedTags {
             tags,
