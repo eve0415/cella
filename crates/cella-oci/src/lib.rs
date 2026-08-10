@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod cache;
+pub mod error;
 pub mod extract;
 pub mod inspect;
 pub mod limits;
@@ -9,6 +10,7 @@ pub mod tags;
 
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
+pub use error::TagListError;
 pub use extract::{ExtractionError, extract_layer, is_extractable_layer};
 pub use inspect::{fetch_manifest_with_digest, fetch_published_tags, parse_reference};
 pub use limits::{

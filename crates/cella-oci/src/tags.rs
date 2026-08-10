@@ -320,6 +320,34 @@ mod tests {
         assert!(pinnable_tags(&tags, "trixie").is_empty());
     }
 
+    /// With nothing cached there is no answer to give, so the failure has to
+    /// be actionable on its own.
+    #[tokio::test]
+    async fn unreachable_registry_without_cache_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TagCache::with_root(dir.path());
+
+        let err = fetch_image_tags(&cache, "registry.invalid/foo/bar", true)
+            .await
+            .expect_err("an unresolvable registry must not succeed");
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("registry.invalid"),
+            "diagnostic must name the reference, got: {rendered}"
+        );
+
+        // Assert on the structured help rather than `rendered` — miette
+        // word-wraps to terminal width and would split the path.
+        let help = miette::Diagnostic::help(&*err)
+            .expect("diagnostic must tell the user what to check")
+            .to_string();
+        assert!(
+            help.contains("~/.docker/config.json"),
+            "help must point at the credential store, got: {help}"
+        );
+    }
+
     /// The offline path: an unreachable registry must serve whatever the
     /// cache holds rather than failing, and must say the answer is stale.
     #[tokio::test]

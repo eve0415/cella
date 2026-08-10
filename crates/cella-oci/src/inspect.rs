@@ -13,6 +13,20 @@ use crate::build_registry_auth;
 /// Number of tags to request per registry page when listing tags.
 const TAG_PAGE_SIZE: usize = 100;
 
+/// Registry requests are bounded so a hung endpoint cannot hang the CLI.
+/// `oci-client` defaults both of these to `None`.
+const REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build a registry client with both timeouts set.
+fn registry_client() -> oci_client::Client {
+    oci_client::Client::new(ClientConfig {
+        protocol: ClientProtocol::Https,
+        read_timeout: Some(REGISTRY_TIMEOUT),
+        connect_timeout: Some(REGISTRY_TIMEOUT),
+        ..ClientConfig::default()
+    })
+}
+
 /// Fetch the OCI manifest for a feature reference and return the manifest JSON
 /// together with its sha256 digest hex string (without the `sha256:` prefix).
 ///
@@ -30,11 +44,7 @@ pub async fn fetch_manifest_with_digest(
 ) -> miette::Result<(serde_json::Value, String)> {
     let (registry, repository, version) = parse_reference(reference)?;
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_client::Client::new(config);
+    let client = registry_client();
 
     let oci_ref = match &version {
         ReferenceVersion::Tag(tag) => {
@@ -94,11 +104,7 @@ pub async fn fetch_manifest_with_digest(
 pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>> {
     let (registry, repository, _version) = parse_reference(reference)?;
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_client::Client::new(config);
+    let client = registry_client();
 
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
     let auth = build_registry_auth(&registry);
@@ -124,9 +130,7 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
                 debug!("treating null-tags deserialization on follow-up page as end-of-list");
                 break;
             }
-            Err(e) => {
-                return Err(miette::miette!("failed to list tags for {reference}: {e}"));
-            }
+            Err(e) => return Err(crate::TagListError::new(reference, &e).into()),
         };
 
         let page_len = response.tags.len();
