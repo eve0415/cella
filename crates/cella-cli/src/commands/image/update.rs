@@ -113,7 +113,7 @@ impl UpdateArgs {
             return Ok(());
         };
 
-        if found.is_empty() {
+        if self.nothing_to_do(&found) {
             if matches!(self.output.resolve(), OutputFormat::Json) {
                 println!("{}", render_json(&reference, &found)?);
             } else {
@@ -130,7 +130,9 @@ impl UpdateArgs {
             return Ok(());
         }
 
-        if !json_output {
+        // Skipped when empty: with `--to` we get here having nothing to
+        // offer, and an "updates available:" header over no rows is a lie.
+        if !json_output && !found.is_empty() {
             display_candidates(&reference, &found);
         }
 
@@ -161,6 +163,15 @@ impl UpdateArgs {
             eprintln!("\u{2713} {tag} -> {new_tag}");
         }
         Ok(())
+    }
+
+    /// Whether to stop with "up to date".
+    ///
+    /// `--to` names a tag outright, which is consent to apply it whether or
+    /// not cella would have offered it — pinning back to a known-good older
+    /// tag is a legitimate use and must not be reported as a no-op.
+    const fn nothing_to_do(&self, found: &Candidates) -> bool {
+        found.is_empty() && self.to.is_none()
     }
 
     /// Decide which tag to apply, or `None` when the user declined.
@@ -412,6 +423,37 @@ mod tests {
         );
         // `latest` has no leading version, so nothing is offered.
         assert!(candidates::compute(&["24.04".to_owned()], "latest").is_none());
+    }
+
+    /// Regression: `--to` was swallowed by the "up to date" early return, so
+    /// pinning back to a known-good older tag silently did nothing.
+    #[test]
+    fn an_explicit_target_still_applies_when_nothing_is_offered() {
+        use clap::Parser as _;
+
+        let up_to_date = Candidates {
+            current: "2.0.14-1-trixie".to_owned(),
+            version_bump: None,
+            os_moves: Vec::new(),
+        };
+        assert!(up_to_date.is_empty());
+
+        let parse = |argv: &[&str]| match crate::Cli::try_parse_from(argv).unwrap().command {
+            crate::commands::Command::Image(args) => match args.command {
+                super::super::ImageCommand::Update(update) => update,
+            },
+            _ => panic!("expected the image subcommand"),
+        };
+
+        assert!(
+            !parse(&["cella", "image", "update", "--to", "2.0.9-trixie"])
+                .nothing_to_do(&up_to_date),
+            "a named tag is consent to apply it, offered or not"
+        );
+        assert!(
+            parse(&["cella", "image", "update"]).nothing_to_do(&up_to_date),
+            "without --to, no candidates means nothing to do"
+        );
     }
 
     #[test]
