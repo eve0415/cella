@@ -3,12 +3,14 @@
 use clap::Args;
 use inquire::Select;
 
+use miette::IntoDiagnostic as _;
+
 use cella_oci::{TagCache, TagSource};
 
 use super::candidates::{self, Candidates};
 use super::jsonc_edit;
-use crate::commands::OutputFormat;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
+use crate::commands::{OutputFormat, boxed_err_to_report};
 
 /// How much the command may do to the config without being asked again.
 ///
@@ -78,11 +80,15 @@ impl UpdateArgs {
     ///
     /// Returns an error on config discovery failure, unreachable registry
     /// with no cached tags, or a failed write.
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let config_path = resolve::discover_config(&self.common)?;
-        let raw = resolve::read_raw_config(&config_path)?;
-        let stripped = cella_jsonc::strip(&raw)?;
-        let config: serde_json::Value = serde_json::from_str(&stripped)?;
+    ///
+    /// Returns [`miette::Report`] rather than a boxed error so the registry
+    /// diagnostic's help text survives to the user — boxing erases
+    /// [`miette::Diagnostic`].
+    pub async fn execute(self) -> miette::Result<()> {
+        let config_path = resolve::discover_config(&self.common).map_err(boxed_err_to_report)?;
+        let raw = resolve::read_raw_config(&config_path).map_err(boxed_err_to_report)?;
+        let stripped = cella_jsonc::strip(&raw).into_diagnostic()?;
+        let config: serde_json::Value = serde_json::from_str(&stripped).into_diagnostic()?;
 
         let target = match classify(&config) {
             Ok(target) => target,
@@ -140,13 +146,16 @@ impl UpdateArgs {
             return Ok(());
         }
 
-        let Some(new_tag) = self.choose(&found, &fetched.tags)? else {
+        let Some(new_tag) = self
+            .choose(&found, &fetched.tags)
+            .map_err(boxed_err_to_report)?
+        else {
             return Ok(());
         };
 
         let new_image = format!("{reference}:{new_tag}");
-        let updated = jsonc_edit::set_image(&raw, &new_image)?;
-        std::fs::write(&config_path, updated)?;
+        let updated = jsonc_edit::set_image(&raw, &new_image).map_err(boxed_err_to_report)?;
+        std::fs::write(&config_path, updated).into_diagnostic()?;
 
         if json_output {
             println!(
@@ -157,7 +166,8 @@ impl UpdateArgs {
                         "previous": tag,
                         "applied": new_tag,
                     }
-                }))?
+                }))
+                .into_diagnostic()?
             );
         } else {
             eprintln!("\u{2713} {tag} -> {new_tag}");
@@ -329,24 +339,22 @@ fn display_candidates(reference: &str, found: &Candidates) {
 ///
 /// Deliberately its own shape rather than an addition to `cella outdated`,
 /// whose output mirrors the official CLI's `loadVersionInfo` contract.
-fn render_json(
-    reference: &str,
-    found: &Candidates,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
     let os_moves: Vec<serde_json::Value> = found
         .os_moves
         .iter()
         .map(|m| serde_json::json!({"tag": m.tag, "from": m.from, "to": m.to}))
         .collect();
 
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    serde_json::to_string_pretty(&serde_json::json!({
         "image": {
             "reference": reference,
             "current": found.current,
             "versionBump": found.version_bump,
             "osMoves": os_moves,
         }
-    }))?)
+    }))
+    .into_diagnostic()
 }
 
 // ===========================================================================
@@ -357,6 +365,49 @@ fn render_json(
 mod tests {
     use super::super::release;
     use super::*;
+
+    /// Parse a full CLI invocation down to the `image update` args.
+    fn parse_update(argv: &[&str]) -> UpdateArgs {
+        use clap::Parser as _;
+        match crate::Cli::try_parse_from(argv).unwrap().command {
+            crate::commands::Command::Image(args) => match args.command {
+                super::super::ImageCommand::Update(update) => update,
+            },
+            _ => panic!("expected the image subcommand"),
+        }
+    }
+
+    /// Regression: `?` coerced the registry error into `Box<dyn Error>`, which
+    /// erases `Diagnostic`, so the `~/.docker/config.json` help never reached
+    /// the user even though the error type carried it.
+    #[tokio::test]
+    async fn an_unreachable_registry_keeps_its_help_through_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &config,
+            r#"{"image": "registry.invalid/nobody/nothing:1-trixie"}"#,
+        )
+        .unwrap();
+
+        let args = parse_update(&[
+            "cella",
+            "image",
+            "update",
+            "--check",
+            "-f",
+            config.to_str().unwrap(),
+        ]);
+        let err = args
+            .execute()
+            .await
+            .expect_err("an unresolvable registry must fail");
+
+        assert!(
+            miette::Diagnostic::help(&*err).is_some(),
+            "actionable help must survive the command boundary, got: {err:?}"
+        );
+    }
 
     #[test]
     fn reports_the_config_shape_it_cannot_handle() {
@@ -429,8 +480,6 @@ mod tests {
     /// pinning back to a known-good older tag silently did nothing.
     #[test]
     fn an_explicit_target_still_applies_when_nothing_is_offered() {
-        use clap::Parser as _;
-
         let up_to_date = Candidates {
             current: "2.0.14-1-trixie".to_owned(),
             version_bump: None,
@@ -438,20 +487,13 @@ mod tests {
         };
         assert!(up_to_date.is_empty());
 
-        let parse = |argv: &[&str]| match crate::Cli::try_parse_from(argv).unwrap().command {
-            crate::commands::Command::Image(args) => match args.command {
-                super::super::ImageCommand::Update(update) => update,
-            },
-            _ => panic!("expected the image subcommand"),
-        };
-
         assert!(
-            !parse(&["cella", "image", "update", "--to", "2.0.9-trixie"])
+            !parse_update(&["cella", "image", "update", "--to", "2.0.9-trixie"])
                 .nothing_to_do(&up_to_date),
             "a named tag is consent to apply it, offered or not"
         );
         assert!(
-            parse(&["cella", "image", "update"]).nothing_to_do(&up_to_date),
+            parse_update(&["cella", "image", "update"]).nothing_to_do(&up_to_date),
             "without --to, no candidates means nothing to do"
         );
     }

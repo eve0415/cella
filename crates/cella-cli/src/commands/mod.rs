@@ -599,7 +599,7 @@ impl Command {
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
             Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
-            Self::Image(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Image(args) => args.execute(progress).await,
             Self::Upgrade(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Init(args) => args.execute(progress).await.map_err(boxed_err_to_report),

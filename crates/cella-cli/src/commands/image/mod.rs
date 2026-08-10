@@ -33,10 +33,11 @@ impl ImageArgs {
     /// # Errors
     ///
     /// Propagates the subcommand's error.
-    pub async fn execute(
-        self,
-        _progress: Progress,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// Returns [`miette::Report`] directly rather than a boxed error: boxing
+    /// erases [`miette::Diagnostic`], and the registry failure's help text is
+    /// the whole point of that diagnostic.
+    pub async fn execute(self, _progress: Progress) -> miette::Result<()> {
         match self.command {
             ImageCommand::Update(args) => args.execute().await,
         }
