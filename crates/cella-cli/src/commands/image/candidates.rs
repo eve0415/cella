@@ -30,7 +30,7 @@ pub struct Candidates {
 
 impl Candidates {
     /// Whether there is nothing to offer.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.version_bump.is_none() && self.os_moves.is_empty()
     }
 }
@@ -145,11 +145,7 @@ mod tests {
         let bump = c.version_bump.expect("a newer trixie tag exists");
         assert!(bump.ends_with("-trixie"));
 
-        let lexically_last = tags
-            .iter()
-            .filter(|t| t.ends_with("-trixie"))
-            .next_back()
-            .unwrap();
+        let lexically_last = tags.iter().rfind(|t| t.ends_with("-trixie")).unwrap();
         assert_ne!(&bump, lexically_last, "lexically last is not newest");
     }
 
