@@ -139,17 +139,47 @@ fn try_creds_store(registry: &str, config: &DockerConfig) -> Option<DockerCreden
     Some(creds)
 }
 
+/// The keys to try in `~/.docker/config.json` for a registry, in order.
+///
+/// Docker Hub is the one registry whose config key is not its hostname:
+/// `docker login` writes credentials under the legacy
+/// `https://index.docker.io/v1/`, while image references name it `docker.io`.
+/// Looking up only the reference spelling finds nothing and silently falls
+/// back to anonymous.
+fn config_keys(registry: &str) -> &'static [&'static str] {
+    const HUB_ALIASES: &[&str] = &[
+        "https://index.docker.io/v1/",
+        "index.docker.io",
+        "registry-1.docker.io",
+        "docker.io",
+    ];
+
+    if HUB_ALIASES.contains(&registry) {
+        HUB_ALIASES
+    } else {
+        &[]
+    }
+}
+
 /// Walk the config resolution chain: auths -> credHelpers -> credsStore.
 fn resolve_from_config(registry: &str, config: &DockerConfig) -> DockerCredentials {
-    if let Some(creds) = try_inline_auths(registry, config) {
+    // The registry as written first, then any equivalent spellings.
+    for key in std::iter::once(registry).chain(config_keys(registry).iter().copied()) {
+        if let Some(creds) = try_inline_auths(key, config) {
+            return creds;
+        }
+        if let Some(creds) = try_cred_helper(key, config) {
+            return creds;
+        }
+    }
+
+    // credsStore is global, so it is asked once, with the canonical key the
+    // helper itself expects.
+    let store_key = config_keys(registry).first().copied().unwrap_or(registry);
+    if let Some(creds) = try_creds_store(store_key, config) {
         return creds;
     }
-    if let Some(creds) = try_cred_helper(registry, config) {
-        return creds;
-    }
-    if let Some(creds) = try_creds_store(registry, config) {
-        return creds;
-    }
+
     debug!("no credentials found for {registry}");
     DockerCredentials::default()
 }
@@ -223,6 +253,39 @@ mod tests {
     // -----------------------------------------------------------------------
     // decode_auth_field
     // -----------------------------------------------------------------------
+
+    /// Regression: references name Docker Hub `docker.io`, but `docker login`
+    /// writes its credentials under `https://index.docker.io/v1/`. An exact
+    /// lookup on `docker.io` therefore found nothing and every Hub request
+    /// went out anonymous.
+    #[test]
+    fn docker_hub_credentials_are_found_under_their_legacy_key() {
+        let config: DockerConfig = serde_json::from_str(&format!(
+            r#"{{"auths": {{"https://index.docker.io/v1/": {{"auth": "{}"}}}}}}"#,
+            BASE64.encode("hubuser:hubpass")
+        ))
+        .unwrap();
+
+        let creds = resolve_from_config("docker.io", &config);
+        assert_eq!(creds.username.as_deref(), Some("hubuser"));
+        assert_eq!(creds.password.as_deref(), Some("hubpass"));
+    }
+
+    #[test]
+    fn a_non_hub_registry_is_looked_up_verbatim() {
+        let config: DockerConfig = serde_json::from_str(&format!(
+            r#"{{"auths": {{"ghcr.io": {{"auth": "{}"}}}}}}"#,
+            BASE64.encode("gh:token")
+        ))
+        .unwrap();
+
+        assert_eq!(
+            resolve_from_config("ghcr.io", &config).username.as_deref(),
+            Some("gh")
+        );
+        // Hub aliases must not leak into an unrelated registry's lookup.
+        assert!(resolve_from_config("docker.io", &config).username.is_none());
+    }
 
     #[test]
     fn decode_valid_auth() {

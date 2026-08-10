@@ -13,6 +13,23 @@ use crate::build_registry_auth;
 /// Number of tags to request per registry page when listing tags.
 const TAG_PAGE_SIZE: usize = 100;
 
+/// Registry requests are bounded so a hung endpoint cannot hang the CLI.
+/// `oci-client` defaults both of these to `None`.
+const REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build a registry client with both timeouts set.
+///
+/// Every client in this crate is built here, so no call path is left with
+/// `oci-client`'s unbounded defaults.
+pub(crate) fn registry_client() -> oci_client::Client {
+    oci_client::Client::new(ClientConfig {
+        protocol: ClientProtocol::Https,
+        read_timeout: Some(REGISTRY_TIMEOUT),
+        connect_timeout: Some(REGISTRY_TIMEOUT),
+        ..ClientConfig::default()
+    })
+}
+
 /// Fetch the OCI manifest for a feature reference and return the manifest JSON
 /// together with its sha256 digest hex string (without the `sha256:` prefix).
 ///
@@ -30,11 +47,7 @@ pub async fn fetch_manifest_with_digest(
 ) -> miette::Result<(serde_json::Value, String)> {
     let (registry, repository, version) = parse_reference(reference)?;
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_client::Client::new(config);
+    let client = registry_client();
 
     let oci_ref = match &version {
         ReferenceVersion::Tag(tag) => {
@@ -94,11 +107,7 @@ pub async fn fetch_manifest_with_digest(
 pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>> {
     let (registry, repository, _version) = parse_reference(reference)?;
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_client::Client::new(config);
+    let client = registry_client();
 
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), "latest".to_owned());
     let auth = build_registry_auth(&registry);
@@ -124,24 +133,92 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
                 debug!("treating null-tags deserialization on follow-up page as end-of-list");
                 break;
             }
-            Err(e) => {
-                return Err(miette::miette!("failed to list tags for {reference}: {e}"));
-            }
+            Err(e) => return Err(crate::TagListError::new(reference, &e).into()),
         };
 
-        let page_len = response.tags.len();
-        last = response.tags.last().cloned();
+        let next_last = response.tags.last().cloned();
+        let plan = plan_page(response.tags.len(), last.as_deref(), next_last.as_deref());
+
+        if plan == PagePlan::Repeat {
+            // The page we already have. Stop *before* extending, or the whole
+            // listing comes back doubled.
+            debug!("registry ignored `last`; discarding the repeated page");
+            break;
+        }
+
+        last = next_last;
         all_tags.extend(response.tags);
 
-        // A partial page means we've reached the end. Avoid making a
-        // follow-up request that would trigger the null-tags deserialization
-        // bug in some registries (including GHCR).
-        if page_len < TAG_PAGE_SIZE {
+        if plan == PagePlan::Final {
             break;
         }
     }
 
     Ok(all_tags)
+}
+
+/// Expand a Docker Hub shorthand into a fully qualified reference.
+///
+/// A first segment containing `.` or `:`, or the literal `localhost`, is
+/// treated as a registry host and left alone — this is the same rule the
+/// Docker CLI uses.
+///
+/// This is applied on the image path only. [`parse_reference`] is also
+/// reached with user-supplied *feature* references, which the devcontainer
+/// spec requires to be registry-qualified; there its "expected registry/repo"
+/// error is the useful diagnostic, and normalizing would turn a typo into a
+/// confusing Docker Hub 404.
+pub fn normalize_reference(reference: &str) -> String {
+    let first = reference.split('/').next().unwrap_or(reference);
+    let is_registry = first == "localhost" || first.contains('.') || first.contains(':');
+
+    // The `contains('/')` guard matters: `ubuntu:24.04`'s first segment
+    // contains `:` but is a repository, not a host.
+    if reference.contains('/') {
+        if is_registry {
+            return reference.to_owned();
+        }
+        return format!("docker.io/{reference}");
+    }
+    format!("docker.io/library/{reference}")
+}
+
+/// What to do with a tag page that just arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagePlan {
+    /// The previous page served again — discard it and stop.
+    Repeat,
+    /// Keep it, then stop.
+    Final,
+    /// Keep it and ask for another.
+    More,
+}
+
+/// Decide what a tag page means, from whether the cursor advanced and whether
+/// the page was the size we asked for.
+///
+/// Registries end a listing in three different ways, and only the first is the
+/// one the spec describes:
+///
+/// - **Short page** — the normal end. Stopping here also avoids a follow-up
+///   request that would trip the `{"tags": null}` deserialization bug some
+///   registries (including GHCR) hit on the final page.
+/// - **Over-full page** — the registry ignored `?n=` and answered with the
+///   whole list. MCR does this: `devcontainers/rust` returns all 408 tags
+///   however small an `n` you ask for.
+/// - **Stalled cursor** — the registry ignored `?last=`, so every further
+///   request repeats this page. MCR does this too, which is why the repeat is
+///   dropped rather than appended.
+///
+/// Without the last two, listing an MCR repository never terminates.
+fn plan_page(page_len: usize, previous_last: Option<&str>, new_last: Option<&str>) -> PagePlan {
+    if previous_last.is_some() && previous_last == new_last {
+        return PagePlan::Repeat;
+    }
+    if page_len != TAG_PAGE_SIZE || new_last.is_none() {
+        return PagePlan::Final;
+    }
+    PagePlan::More
 }
 
 /// The version component of an OCI reference: a tag or a digest.
@@ -218,6 +295,66 @@ mod tests {
         assert_eq!(
             version,
             ReferenceVersion::Digest("sha256:abc123".to_owned())
+        );
+    }
+
+    /// Regression: the stalled page was appended before the loop broke, so a
+    /// registry honouring `?n=` but ignoring `?last=` returned every tag twice.
+    #[test]
+    fn a_stalled_cursor_discards_its_repeated_page() {
+        assert_eq!(
+            plan_page(TAG_PAGE_SIZE, Some("trixie"), Some("trixie")),
+            PagePlan::Repeat,
+            "the same cursor twice means the same page came back"
+        );
+    }
+
+    /// Regression: MCR ignores both `?n=` and `?last=` and answers every
+    /// request with the full list (408 tags for devcontainers/rust), so a
+    /// `page_len < TAG_PAGE_SIZE` exit could never fire and listing looped
+    /// forever.
+    #[test]
+    fn a_registry_that_ignores_pagination_still_terminates() {
+        assert_eq!(
+            plan_page(408, None, Some("trixie")),
+            PagePlan::Final,
+            "an over-full page means the registry ignored `n`"
+        );
+    }
+
+    #[test]
+    fn a_paginating_registry_keeps_going_until_a_short_page() {
+        assert_eq!(
+            plan_page(TAG_PAGE_SIZE, Some("a"), Some("b")),
+            PagePlan::More,
+            "a full page with an advancing cursor has more to come"
+        );
+        assert_eq!(plan_page(7, Some("a"), Some("b")), PagePlan::Final);
+        assert_eq!(
+            plan_page(0, None, None),
+            PagePlan::Final,
+            "empty page ends it"
+        );
+    }
+
+    #[test]
+    fn normalizes_bare_docker_hub_references() {
+        assert_eq!(
+            normalize_reference("ubuntu:24.04"),
+            "docker.io/library/ubuntu:24.04"
+        );
+        assert_eq!(
+            normalize_reference("node:22-bookworm"),
+            "docker.io/library/node:22-bookworm"
+        );
+        assert_eq!(normalize_reference("myorg/img:1"), "docker.io/myorg/img:1");
+        assert_eq!(
+            normalize_reference("mcr.microsoft.com/devcontainers/rust:2.0.14-trixie"),
+            "mcr.microsoft.com/devcontainers/rust:2.0.14-trixie"
+        );
+        assert_eq!(
+            normalize_reference("localhost:5000/img:1"),
+            "localhost:5000/img:1"
         );
     }
 

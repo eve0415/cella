@@ -92,7 +92,6 @@ pub async fn run(
     let (template_opts, pinned_image) = prompt_options_with_pin(
         &metadata,
         image_variant_info.as_ref(),
-        &cache,
         args.refresh,
         &progress,
     )
@@ -752,7 +751,6 @@ fn read_template_config(template_dir: &std::path::Path) -> Option<String> {
 async fn prompt_options_with_pin(
     metadata: &TemplateMetadata,
     variant_info: Option<&cella_templates::tags::ImageVariantInfo>,
-    cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
 ) -> Result<
@@ -782,8 +780,7 @@ async fn prompt_options_with_pin(
 
         if is_variant_option {
             let (value, pin) =
-                prompt_variant_with_pin(key, opt, variant_info.unwrap(), cache, refresh, progress)
-                    .await?;
+                prompt_variant_with_pin(key, opt, variant_info.unwrap(), refresh, progress).await?;
             resolved.insert(key.clone(), value);
             pinned_image = pin;
         } else {
@@ -803,7 +800,6 @@ async fn prompt_variant_with_pin(
     key: &str,
     opt: &cella_templates::types::TemplateOption,
     variant_info: &cella_templates::tags::ImageVariantInfo,
-    cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
 ) -> Result<(serde_json::Value, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
@@ -832,11 +828,23 @@ async fn prompt_variant_with_pin(
     let all_tags = match progress
         .run_step_result(
             "Fetching image tags",
-            cella_templates::tags::fetch_image_tags(&variant_info.base_image, cache, refresh),
+            cella_oci::fetch_image_tags(
+                &cella_oci::TagCache::new(),
+                &variant_info.base_image,
+                refresh,
+            ),
         )
         .await
     {
-        Ok(tags) => tags,
+        Ok(fetched) => {
+            if fetched.source == cella_oci::TagSource::StaleCache {
+                eprintln!(
+                    "  {} registry unreachable; offering cached tags, which may be out of date",
+                    style::dim("(note)")
+                );
+            }
+            fetched.tags
+        }
         Err(e) => {
             eprintln!(
                 "  {} could not fetch image tags: {e}; using variant as-is",
@@ -847,7 +855,7 @@ async fn prompt_variant_with_pin(
     };
 
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    let filtered = cella_templates::tags::pinnable_tags(&tag_refs, &selection);
+    let filtered = cella_oci::pinnable_tags(&tag_refs, &selection);
 
     if filtered.is_empty() {
         eprintln!(
