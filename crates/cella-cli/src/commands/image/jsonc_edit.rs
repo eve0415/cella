@@ -22,6 +22,26 @@ pub fn set_image(
     let root_obj = root
         .object_value()
         .ok_or("devcontainer.json root is not an object")?;
+    // JSONC permits duplicate keys, and the two readers disagree about which
+    // one wins: serde_json (used to pick the tag) keeps the last, the CST
+    // keeps the first. Rewriting either would report an update the tools
+    // reading this file do not see.
+    let duplicates = root_obj
+        .properties()
+        .iter()
+        .filter(|p| {
+            p.name()
+                .is_some_and(|n| n.decoded_value() == Ok("image".to_owned()))
+        })
+        .count();
+    if duplicates > 1 {
+        return Err(
+            "devcontainer.json defines more than one \"image\" property — \
+             remove the duplicates and retry"
+                .into(),
+        );
+    }
+
     let prop = root_obj
         .get("image")
         .ok_or("devcontainer.json has no \"image\" property")?;
@@ -60,6 +80,17 @@ mod tests {
         let out = set_image(src, "ubuntu:24.10").unwrap();
         assert!(out.starts_with("// top of file"));
         assert!(out.contains("ubuntu:24.10"));
+    }
+
+    /// Regression: the command reads the image with `serde_json` (last
+    /// duplicate wins) but rewrote through the CST (first match), so a config
+    /// with two `"image"` keys reported a successful update while the value
+    /// every devcontainer tool honours kept the old tag.
+    #[test]
+    fn refuses_a_config_with_more_than_one_image_key() {
+        let src = r#"{"image": "a:1", "image": "b:2"}"#;
+        let err = set_image(src, "z:9").unwrap_err().to_string();
+        assert!(err.contains("more than one"), "got: {err}");
     }
 
     #[test]
