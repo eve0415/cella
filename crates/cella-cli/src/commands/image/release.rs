@@ -43,6 +43,14 @@ const CODENAMES: &[(&str, &str, u32)] = &[
 /// `debian-12` and `debian12` forms.
 const FAMILIES: &[&str] = &["debian", "ubuntu", "alpine"];
 
+/// Whether `variant` is a distro codename rather than a numeric spelling.
+///
+/// Used to pick one canonical spelling when a repository publishes several
+/// aliases of the same release (`bookworm`, `debian-12`, `debian12`).
+pub fn is_codename(variant: &str) -> bool {
+    CODENAMES.iter().any(|(name, _, _)| *name == variant)
+}
+
 /// Map a variant suffix to a release, or `None` when cella does not
 /// recognise it.
 pub fn parse_variant(variant: &str) -> Option<Release> {

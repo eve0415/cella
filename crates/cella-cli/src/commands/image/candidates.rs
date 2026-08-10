@@ -1,10 +1,10 @@
 //! Turns a pinned tag plus a published tag list into the updates worth offering.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use cella_oci::{pinnable_tags, split_tag, version_key};
 
-use super::release::parse_variant;
+use super::release::{Release, is_codename, parse_variant};
 
 /// A move to a newer release of the same distro family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,19 @@ pub struct Candidates {
 }
 
 impl Candidates {
+    /// An empty candidate set for a tag cella cannot rank.
+    ///
+    /// Used when the current tag is floating (`latest`, `trixie`) but the
+    /// user named a target explicitly — there is nothing to offer, yet there
+    /// is still something to apply.
+    pub fn floating(current: &str) -> Self {
+        Self {
+            current: current.to_owned(),
+            version_bump: None,
+            os_moves: Vec::new(),
+        }
+    }
+
     /// Whether there is nothing to offer.
     pub const fn is_empty(&self) -> bool {
         self.version_bump.is_none() && self.os_moves.is_empty()
@@ -38,49 +51,36 @@ impl Candidates {
 /// Compute candidates for `current`, or `None` when `current` is a floating
 /// tag with no version to advance (`latest`, `trixie`, `dev-1-trixie`).
 pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
-    let (current_version, variant) = split_tag(current)?;
+    let (current_version, selection) = split_pin(current)?;
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
 
-    let version_bump = newest_in_variant(&refs, variant)
+    let version_bump = newest_in_variant(&refs, selection)
         .filter(|best| *best != current)
         .filter(|best| {
-            // `pinnable_tags` ranks within a variant but knows nothing about
+            // `pinnable_tags` ranks within a selection but knows nothing about
             // what is currently pinned. A "newest" that is not actually newer
             // than the pin must not be offered as an upgrade.
             let Some(current_key) = version_key(current_version) else {
                 return false;
             };
-            split_tag(best)
+            split_pin(best)
                 .and_then(|(version, _)| version_key(version))
                 .is_some_and(|key| key > current_key)
         })
         .map(str::to_owned);
 
-    let os_moves = parse_variant(variant).map_or_else(Vec::new, |current_release| {
-        // Dedupe variants first: a repository publishes many tags per
-        // variant, and only the newest of each is ever offered.
-        let mut targets: Vec<(u32, &str)> = refs
-            .iter()
-            .filter_map(|t| split_tag(t).map(|(_, v)| v))
-            .filter(|v| !v.is_empty())
-            .collect::<BTreeSet<_>>()
+    let os_moves = distro_of(selection).map_or_else(Vec::new, |(prefix, _, current_release)| {
+        newer_releases(&refs, &current_release)
             .into_iter()
-            .filter_map(|v| {
-                let release = parse_variant(v)?;
-                release
-                    .is_newer_than(&current_release)
-                    .then_some((release.ord, v))
-            })
-            .collect();
-        targets.sort_unstable_by_key(|(ord, _)| std::cmp::Reverse(*ord));
-
-        targets
-            .into_iter()
-            .filter_map(|(_, target)| {
+            .filter_map(|(_, target_distro)| {
+                // Rebuild the full selection so an OS move carries the pinned
+                // prefix across: `22-bookworm` moves to `22-trixie`, never to
+                // whatever the newest `-trixie` tag happens to be.
+                let target = format!("{prefix}{target_distro}");
                 Some(OsMove {
-                    tag: newest_in_variant(&refs, target)?.to_owned(),
-                    from: variant.to_owned(),
-                    to: target.to_owned(),
+                    tag: newest_in_variant(&refs, &target)?.to_owned(),
+                    from: selection.to_owned(),
+                    to: target,
                 })
             })
             .collect()
@@ -91,6 +91,88 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         version_bump,
         os_moves,
     })
+}
+
+/// Split a pinned tag into the image's own version and the selection that
+/// must be held fixed.
+///
+/// [`cella_oci::split_tag`] puts *every* leading numeric group in the version,
+/// but only the first is the image's version. A composite tag like
+/// `4.0.10-22-trixie` (typescript-node) encodes a runtime major the user
+/// pinned deliberately, so everything after the first group belongs to the
+/// selection: offering `5.0.1-24-trixie` would move Node 22 to Node 24.
+fn split_pin(tag: &str) -> Option<(&str, &str)> {
+    let (version, variant) = split_tag(tag)?;
+    if variant.is_empty() {
+        return Some((version, ""));
+    }
+    version.find('-').map_or(Some((version, variant)), |cut| {
+        Some((&tag[..cut], &tag[cut + 1..]))
+    })
+}
+
+/// Locate the distro-release portion of a selection.
+///
+/// Returns the prefix that must be preserved across an OS move, the distro
+/// spelling itself, and the release it denotes. For `22-trixie` this is
+/// `("22-", "trixie", Debian 13)`; for `ubuntu-24.04` it is
+/// `("", "ubuntu-24.04", Ubuntu 24.04)`.
+fn distro_of(selection: &str) -> Option<(&str, &str, Release)> {
+    let mut start = 0;
+    loop {
+        let rest = &selection[start..];
+        if let Some(release) = parse_variant(rest) {
+            return Some((&selection[..start], rest, release));
+        }
+        start += rest.find('-')? + 1;
+    }
+}
+
+/// Every release newer than `current` that the tag list publishes, newest
+/// first, as `(ordinal, canonical spelling)`.
+///
+/// A repository may publish several aliases of one release — `devcontainers/base`
+/// ships `bookworm`, `debian-12` and `debian12` — so releases are deduplicated
+/// by identity rather than by spelling, and the codename wins as the canonical
+/// form. Without this the user sees the same move three times and a `--yes
+/// --allow-os-change` tie picks an arbitrary alias.
+fn newer_releases<'a>(tags: &[&'a str], current: &Release) -> Vec<(u32, &'a str)> {
+    let mut best: BTreeMap<(&str, u32), &'a str> = BTreeMap::new();
+
+    for &tag in tags {
+        let Some((_, selection)) = split_pin(tag) else {
+            continue;
+        };
+        let Some((_, distro, release)) = distro_of(selection) else {
+            continue;
+        };
+        if !release.is_newer_than(current) {
+            continue;
+        }
+        best.entry((release.family, release.ord))
+            .and_modify(|chosen| {
+                if prefers(distro, chosen) {
+                    *chosen = distro;
+                }
+            })
+            .or_insert(distro);
+    }
+
+    let mut targets: Vec<(u32, &'a str)> = best
+        .into_iter()
+        .map(|((_, ord), distro)| (ord, distro))
+        .collect();
+    targets.sort_unstable_by_key(|(ord, distro)| (std::cmp::Reverse(*ord), *distro));
+    targets
+}
+
+/// Whether `candidate` is the better spelling of a release than `current`.
+///
+/// Codename first (that is what containers.dev documents), then shortest,
+/// then lexical — so the choice is total and does not depend on tag order.
+fn prefers(candidate: &str, current: &str) -> bool {
+    (is_codename(candidate), current.len(), current)
+        > (is_codename(current), candidate.len(), candidate)
 }
 
 /// Newest tag carrying `variant`.
@@ -168,6 +250,100 @@ mod tests {
         let targets: Vec<&str> = c.os_moves.iter().map(|m| m.to.as_str()).collect();
         assert_eq!(targets, vec!["trixie", "bookworm", "bullseye"]);
         assert!(c.os_moves.iter().all(|m| m.from == "buster"));
+    }
+
+    /// Regression: `split_tag` puts every leading numeric group in the
+    /// version, so `4.0.10-22-trixie` looked like version `4.0.10-22` of
+    /// variant `trixie` and ranked against *every* `-trixie` tag. A user
+    /// pinned to Node 22 was offered Node 24 — and `--yes` would take it.
+    #[test]
+    fn a_pinned_runtime_major_is_never_silently_changed() {
+        let tags: Vec<String> = [
+            "5.0.1-24-trixie",
+            "4.0.10-24-trixie",
+            "5.0.1-22-trixie",
+            "4.0.10-22-trixie",
+            "22-trixie",
+            "24-trixie",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+
+        let c = compute(&tags, "4.0.10-22-trixie").unwrap();
+        assert_eq!(c.version_bump.as_deref(), Some("5.0.1-22-trixie"));
+    }
+
+    #[test]
+    fn an_os_move_preserves_the_pinned_runtime_major() {
+        let tags: Vec<String> = [
+            "4.0.10-22-bookworm",
+            "5.0.1-22-trixie",
+            "5.0.1-24-trixie",
+            "4.0.10-24-bookworm",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+
+        let c = compute(&tags, "4.0.10-22-bookworm").unwrap();
+        assert_eq!(c.os_moves.len(), 1, "got {:?}", c.os_moves);
+        assert_eq!(c.os_moves[0].to, "22-trixie");
+        assert_eq!(
+            c.os_moves[0].tag, "5.0.1-22-trixie",
+            "moving OS must not also move Node"
+        );
+    }
+
+    /// Regression: `devcontainers/base` publishes `bookworm`, `debian-12` and
+    /// `debian12` for one release. Deduping the strings before mapping them
+    /// to releases produced three identical choices, and the tie made
+    /// `--yes --allow-os-change` pick an arbitrary spelling.
+    #[test]
+    fn aliases_of_one_release_collapse_to_a_single_move() {
+        let tags: Vec<String> = [
+            "1.0.0-bullseye",
+            "1.0.0-bookworm",
+            "1.0.0-debian-12",
+            "1.0.0-debian12",
+            "1.0.1-bookworm",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+
+        let c = compute(&tags, "1.0.0-bullseye").unwrap();
+        assert_eq!(c.os_moves.len(), 1, "got {:?}", c.os_moves);
+        assert_eq!(
+            c.os_moves[0].to, "bookworm",
+            "the codename is the canonical spelling"
+        );
+        assert_eq!(c.os_moves[0].tag, "1.0.1-bookworm");
+    }
+
+    /// The real messy repository: every numeric variant has two spellings, so
+    /// a target list with duplicates would show the same release twice.
+    #[test]
+    fn the_real_base_image_offers_one_move_per_release() {
+        let raw = include_str!("../../../../cella-oci/testdata/mcr-devcontainers-base-tags.json");
+        let tags: Vec<String> = serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect();
+
+        let c = compute(&tags, "1.0.0-bullseye").unwrap();
+        let mut ordinals: Vec<&str> = c.os_moves.iter().map(|m| m.to.as_str()).collect();
+        let before = ordinals.len();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        assert_eq!(ordinals.len(), before, "duplicate targets: {ordinals:?}");
+        assert!(
+            c.os_moves.iter().all(|m| parse_variant(&m.to).is_some()),
+            "every target must be a recognised release: {:?}",
+            c.os_moves
+        );
     }
 
     #[test]
