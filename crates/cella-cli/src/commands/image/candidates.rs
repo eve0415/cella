@@ -1,8 +1,9 @@
 //! Turns a pinned tag plus a published tag list into the updates worth offering.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use cella_oci::{pinnable_tags, split_tag, version_key};
+use cella_oci::{VersionKey, pinnable_tags, split_tag, version_key};
 
 use super::release::{Release, is_codename, parse_variant};
 
@@ -54,19 +55,13 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
     let (current_version, selection) = split_pin(current)?;
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
 
+    // `pinnable_tags` ranks within a selection but knows nothing about what is
+    // currently pinned, so every candidate is measured against the pin.
+    let current_key = version_key(current_version);
+
     let version_bump = newest_in_variant(&refs, selection)
         .filter(|best| *best != current)
-        .filter(|best| {
-            // `pinnable_tags` ranks within a selection but knows nothing about
-            // what is currently pinned. A "newest" that is not actually newer
-            // than the pin must not be offered as an upgrade.
-            let Some(current_key) = version_key(current_version) else {
-                return false;
-            };
-            split_pin(best)
-                .and_then(|(version, _)| version_key(version))
-                .is_some_and(|key| key > current_key)
-        })
+        .filter(|best| is_at_least(best, current_key.as_ref(), Ordering::Greater))
         .map(str::to_owned);
 
     let os_moves = distro_of(selection).map_or_else(Vec::new, |(prefix, _, current_release)| {
@@ -77,8 +72,12 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
                 // prefix across: `22-bookworm` moves to `22-trixie`, never to
                 // whatever the newest `-trixie` tag happens to be.
                 let target = format!("{prefix}{target_distro}");
-                Some(OsMove {
-                    tag: newest_in_variant(&refs, &target)?.to_owned(),
+                let tag = newest_in_variant(&refs, &target)?;
+                // A newer OS whose version stream has only just started would
+                // roll the image version backwards. Moving forward on one axis
+                // is not worth moving backwards on the other.
+                is_at_least(tag, current_key.as_ref(), Ordering::Equal).then(|| OsMove {
+                    tag: tag.to_owned(),
                     from: selection.to_owned(),
                     to: target,
                 })
@@ -91,6 +90,24 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         version_bump,
         os_moves,
     })
+}
+
+/// Whether `tag`'s version reaches `floor` — strictly above it when
+/// `at_least` is [`Ordering::Greater`], at or above it when
+/// [`Ordering::Equal`].
+///
+/// An unparseable pin or candidate answers `false`: without a comparable
+/// version there is no evidence the move is forward.
+fn is_at_least(tag: &str, floor: Option<&VersionKey>, at_least: Ordering) -> bool {
+    let Some(floor) = floor else {
+        return false;
+    };
+    split_pin(tag)
+        .and_then(|(version, _)| version_key(version))
+        .is_some_and(|key| {
+            let ord = key.cmp(floor);
+            ord == Ordering::Greater || ord == at_least
+        })
 }
 
 /// Split a pinned tag into the image's own version and the selection that
@@ -342,6 +359,35 @@ mod tests {
         assert!(
             c.os_moves.iter().all(|m| parse_variant(&m.to).is_some()),
             "every target must be a recognised release: {:?}",
+            c.os_moves
+        );
+    }
+
+    /// Regression: `version_bump` was guarded against a "newest" that is not
+    /// actually newer, but `os_moves` was not. A release whose version stream
+    /// has only just started would roll the image version backwards, and
+    /// `--yes --allow-os-change` would take it without asking.
+    #[test]
+    fn an_os_move_is_never_a_version_downgrade() {
+        let tags: Vec<String> = ["3.0.4-bookworm", "1.0.0-trixie", "3.0.4-trixie"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+
+        // trixie's newest is 3.0.4 here, which is not a downgrade.
+        let ok = compute(&tags, "3.0.4-bookworm").unwrap();
+        assert_eq!(ok.os_moves.len(), 1);
+        assert_eq!(ok.os_moves[0].tag, "3.0.4-trixie");
+
+        // Drop it, and the only trixie tag left is two majors behind.
+        let young: Vec<String> = ["3.0.4-bookworm", "1.0.0-trixie"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let c = compute(&young, "3.0.4-bookworm").unwrap();
+        assert!(
+            c.os_moves.is_empty(),
+            "a move that rolls the version back is not an update: {:?}",
             c.os_moves
         );
     }
