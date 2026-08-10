@@ -53,7 +53,7 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub refresh: bool,
 
-    /// Output format (json implies --check).
+    /// Output format (json implies --check unless --yes or --to is given).
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
 }
@@ -109,7 +109,11 @@ impl UpdateArgs {
         };
 
         let cache = TagCache::new();
-        let fetched = cella_oci::fetch_image_tags(&cache, &reference, self.refresh).await?;
+        // `--to` is validated against this list, and a cache hit can be an
+        // hour old — old enough to reject a tag published since. Naming a tag
+        // is worth a round trip.
+        let refresh = self.refresh || self.to.is_some();
+        let fetched = cella_oci::fetch_image_tags(&cache, &reference, refresh).await?;
         if fetched.source == TagSource::StaleCache {
             eprintln!("\u{26a0} registry unreachable — using cached tags");
         }
@@ -130,10 +134,8 @@ impl UpdateArgs {
             return Ok(());
         }
 
-        // `--to` names a tag outright, so it applies even under --output json;
-        // clap already rejects `--to` with `--check`.
         let json_output = matches!(self.output.resolve(), OutputFormat::Json);
-        if json_output && self.to.is_none() {
+        if self.reports_only(&found) {
             println!("{}", render_json(&reference, &found)?);
             return Ok(());
         }
@@ -175,6 +177,17 @@ impl UpdateArgs {
             eprintln!("\u{2713} {tag} -> {new_tag}");
         }
         Ok(())
+    }
+
+    /// Whether JSON output should report and stop.
+    ///
+    /// `--output json` implies `--check`, but only in the absence of an
+    /// explicit instruction to apply: `--to` names a tag and `--yes` accepts
+    /// the offered one, and silently discarding either would hand a CI job a
+    /// zero exit status and an unchanged file.
+    fn reports_only(&self, found: &Candidates) -> bool {
+        let applying = self.to.is_some() || (self.apply.yes && !found.is_empty());
+        matches!(self.output.resolve(), OutputFormat::Json) && !applying
     }
 
     /// Whether an unrankable current tag ends the run.
@@ -526,6 +539,41 @@ mod tests {
         assert!(
             parse_update(&["cella", "image", "update"]).stop_at_floating(None),
             "without --to a floating tag really is nothing to do"
+        );
+    }
+
+    /// Regression: the JSON early return fired before `choose`, so
+    /// `--yes --output json` printed candidates, exited 0, and wrote nothing.
+    /// A CI job auto-bumping the base image saw success and no change.
+    #[test]
+    fn json_output_does_not_swallow_an_explicit_apply() {
+        let bump = Candidates {
+            current: "2.0.2-trixie".to_owned(),
+            version_bump: Some("2.0.14-1-trixie".to_owned()),
+            os_moves: Vec::new(),
+        };
+
+        assert!(
+            !parse_update(&["cella", "image", "update", "--yes", "--output", "json"])
+                .reports_only(&bump),
+            "--yes is an instruction to apply, whatever the output format"
+        );
+        assert!(
+            parse_update(&["cella", "image", "update", "--output", "json"]).reports_only(&bump),
+            "plain --output json still implies --check"
+        );
+        assert!(
+            !parse_update(&[
+                "cella",
+                "image",
+                "update",
+                "--to",
+                "2.0.14-1-trixie",
+                "--output",
+                "json"
+            ])
+            .reports_only(&bump),
+            "--to already applied under json and must keep doing so"
         );
     }
 
