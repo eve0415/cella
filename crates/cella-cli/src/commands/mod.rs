@@ -11,6 +11,7 @@ mod down;
 mod exec;
 pub mod features;
 mod features_configuration;
+pub mod image;
 mod init;
 mod install;
 mod list;
