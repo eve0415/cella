@@ -847,7 +847,7 @@ async fn prompt_variant_with_pin(
     };
 
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    let filtered = cella_templates::tags::pinnable_tags(&tag_refs, &selection);
+    let filtered = cella_oci::pinnable_tags(&tag_refs, &selection);
 
     if filtered.is_empty() {
         eprintln!(
