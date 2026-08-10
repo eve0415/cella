@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use cella_oci::{VersionKey, pinnable_tags, split_tag, version_key};
+use cella_oci::{VersionKey, split_tag, version_key};
 
 use super::release::{Release, is_codename, parse_variant};
 
@@ -55,8 +55,9 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
     let (current_version, selection) = split_pin(current)?;
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
 
-    // `pinnable_tags` ranks within a selection but knows nothing about what is
-    // currently pinned, so every candidate is measured against the pin.
+    // Ranking finds the newest tag sharing the pin's selection; it says
+    // nothing about whether that tag beats the pin, so each candidate is
+    // measured against this key before being offered.
     let current_key = version_key(current_version);
 
     let version_bump = newest_in_variant(&refs, selection)
@@ -192,23 +193,27 @@ fn prefers(candidate: &str, current: &str) -> bool {
         > (is_codename(current), candidate.len(), candidate)
 }
 
-/// Newest tag carrying `variant`.
+/// Newest tag whose selection is exactly `selection`.
 ///
-/// An empty variant means the tag *is* the version (`ubuntu:24.04`), so rank
-/// purely numeric tags directly — `pinnable_tags` cannot express an empty
-/// selection.
-fn newest_in_variant<'a>(tags: &[&'a str], variant: &str) -> Option<&'a str> {
-    if variant.is_empty() {
-        return tags
-            .iter()
-            .filter_map(|t| match split_tag(t) {
-                Some((version, "")) => version_key(version).map(|key| (key, *t)),
-                _ => None,
-            })
-            .max_by(|a, b| a.0.cmp(&b.0))
-            .map(|(_, tag)| tag);
-    }
-    pinnable_tags(tags, variant).first().copied()
+/// Split the same way as the pin, so ranking and the newer-than guard agree
+/// on what counts as the version. Matching a looser suffix instead would rank
+/// `2.0.14-1-trixie` as the newest `-trixie` tag even for a pin on the plain
+/// `-trixie` line, then reject it for having the same version — reporting
+/// "up to date" while a genuinely newer plain tag sat unoffered.
+///
+/// An empty selection means the tag *is* the version (`ubuntu:24.04`); it
+/// needs no special case here.
+fn newest_in_variant<'a>(tags: &[&'a str], selection: &str) -> Option<&'a str> {
+    tags.iter()
+        .filter_map(|t| {
+            let (version, tag_selection) = split_pin(t)?;
+            if tag_selection != selection {
+                return None;
+            }
+            version_key(version).map(|key| (key, *t))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, tag)| tag)
 }
 
 // ===========================================================================
@@ -223,6 +228,10 @@ mod tests {
     /// reading the file — MCR publishes continuously, so this is pinned to
     /// the captured data rather than to whatever upstream holds today.
     const NEWEST_TRIXIE: &str = "2.0.14-1-trixie";
+
+    /// Newest tag on the fixture's *plain* `-trixie` line, i.e. with no
+    /// revision group.
+    const NEWEST_PLAIN_TRIXIE: &str = "2.0.14-trixie";
 
     fn rust_tags() -> Vec<String> {
         let raw = include_str!("../../../testdata/mcr-devcontainers-rust-tags.json");
@@ -411,13 +420,40 @@ mod tests {
 
         let c = compute(&tags, NEWEST_TRIXIE).unwrap();
         assert_eq!(c.version_bump, None);
+
+        // MCR publishes two parallel lines: plain `X-trixie` and revision
+        // `X-1-trixie`. A pin stays on the line it is on, so the plain line's
+        // newest is what a plain pin is offered.
         assert_eq!(
             compute(&tags, "2.0.2-trixie")
                 .unwrap()
                 .version_bump
                 .as_deref(),
-            Some(NEWEST_TRIXIE)
+            Some(NEWEST_PLAIN_TRIXIE)
         );
+        assert_eq!(
+            compute(&tags, NEWEST_PLAIN_TRIXIE).unwrap().version_bump,
+            None
+        );
+    }
+
+    /// The two tag lines must not be crossed in either direction: a revision
+    /// pin is not an upgrade for a plain pin, nor the reverse.
+    #[test]
+    fn a_pin_stays_on_its_own_tag_line() {
+        let tags = rust_tags();
+        assert!(tags.iter().any(|t| t == NEWEST_PLAIN_TRIXIE));
+
+        for (pin, expected) in [
+            ("2.0.9-trixie", Some(NEWEST_PLAIN_TRIXIE)),
+            ("2.0.9-1-trixie", Some(NEWEST_TRIXIE)),
+        ] {
+            assert_eq!(
+                compute(&tags, pin).unwrap().version_bump.as_deref(),
+                expected,
+                "pin {pin} crossed lines"
+            );
+        }
     }
 
     #[test]
