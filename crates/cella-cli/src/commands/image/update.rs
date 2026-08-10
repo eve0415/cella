@@ -114,10 +114,12 @@ impl UpdateArgs {
             eprintln!("\u{26a0} registry unreachable — using cached tags");
         }
 
-        let Some(found) = candidates::compute(&fetched.tags, &tag) else {
+        let computed = candidates::compute(&fetched.tags, &tag);
+        if self.stop_at_floating(computed.as_ref()) {
             eprintln!("{tag} tracks latest — nothing to pin");
             return Ok(());
-        };
+        }
+        let found = computed.unwrap_or_else(|| Candidates::floating(&tag));
 
         if self.nothing_to_do(&found) {
             if matches!(self.output.resolve(), OutputFormat::Json) {
@@ -173,6 +175,15 @@ impl UpdateArgs {
             eprintln!("\u{2713} {tag} -> {new_tag}");
         }
         Ok(())
+    }
+
+    /// Whether an unrankable current tag ends the run.
+    ///
+    /// `latest` and bare codenames have no version to advance, so there is
+    /// nothing to compute — but `--to` names a target outright, and applying
+    /// it is exactly how a user pins a floating tag for the first time.
+    const fn stop_at_floating(&self, computed: Option<&Candidates>) -> bool {
+        computed.is_none() && self.to.is_none()
     }
 
     /// Whether to stop with "up to date".
@@ -495,6 +506,26 @@ mod tests {
         assert!(
             parse_update(&["cella", "image", "update"]).nothing_to_do(&up_to_date),
             "without --to, no candidates means nothing to do"
+        );
+    }
+
+    /// Regression: `compute` returns `None` for a floating tag, and the early
+    /// return fired before `--to` was consulted — so pinning `ubuntu:latest`
+    /// to a real tag reported "nothing to pin" and changed nothing.
+    #[test]
+    fn an_explicit_target_survives_a_floating_current_tag() {
+        assert!(
+            candidates::compute(&["24.04".to_owned()], "latest").is_none(),
+            "precondition: a floating tag computes nothing"
+        );
+
+        assert!(
+            !parse_update(&["cella", "image", "update", "--to", "24.04"]).stop_at_floating(None),
+            "a named tag is how a floating pin gets fixed"
+        );
+        assert!(
+            parse_update(&["cella", "image", "update"]).stop_at_floating(None),
+            "without --to a floating tag really is nothing to do"
         );
     }
 
