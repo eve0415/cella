@@ -67,6 +67,31 @@ fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
     version_key(extended)
 }
 
+/// Split a tag into its leading numeric version and its trailing variant.
+///
+/// The version is the longest run of leading dash-separated groups whose
+/// segments are all decimal digits; everything after it is the variant.
+///
+/// Returns `None` when there is no leading numeric group at all, which is
+/// exactly the set of floating tags (`latest`, `trixie`, `dev-1-trixie`).
+pub fn split_tag(tag: &str) -> Option<(&str, &str)> {
+    let mut end = 0;
+    for group in tag.split('-') {
+        let numeric = !group.is_empty()
+            && group
+                .split('.')
+                .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()));
+        if !numeric {
+            break;
+        }
+        end += group.len() + 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((&tag[..end - 1], tag.get(end..).unwrap_or("")))
+}
+
 /// Sort key for a tag's version part.
 ///
 /// Dash-separated groups of dot-separated numbers, compared group by group
@@ -160,6 +185,22 @@ pub async fn fetch_image_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_version_from_variant() {
+        assert_eq!(split_tag("2.0.14-trixie"), Some(("2.0.14", "trixie")));
+        assert_eq!(split_tag("2.0.9-1-trixie"), Some(("2.0.9-1", "trixie")));
+        assert_eq!(split_tag("1-ubuntu-24.04"), Some(("1", "ubuntu-24.04")));
+        assert_eq!(split_tag("24.04"), Some(("24.04", "")));
+    }
+
+    #[test]
+    fn rejects_tags_without_a_leading_version() {
+        assert_eq!(split_tag("latest"), None);
+        assert_eq!(split_tag("trixie"), None);
+        assert_eq!(split_tag("dev-1-trixie"), None);
+        assert_eq!(split_tag("bookworm"), None);
+    }
 
     #[test]
     fn ranks_numerically_not_lexically() {

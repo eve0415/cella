@@ -19,7 +19,7 @@ pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artif
 pub use tag_cache::TagCache;
 pub use tags::{
     FetchedTags, MAX_PINNED_TAGS, TagSource, VersionKey, fetch_image_tags, pinnable_tags,
-    version_key,
+    split_tag, version_key,
 };
 
 use oci_client::secrets::RegistryAuth;
