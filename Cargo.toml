@@ -64,18 +64,18 @@ yaml_serde = "=0.10.4"
 toml = "=1.1.4"
 
 # Encoding
-base64 = "=0.23.0"
+base64 = "=0.23.1"
 
 # Error handling
-thiserror = "=2.0.19"
+thiserror = "=2.0.20"
 
 # Logging
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "=4.6.5", features = ["derive"] }
-clap_complete = "=4.6.8"
+clap = { version = "=4.6.6", features = ["derive"] }
+clap_complete = "=4.6.9"
 
 # Interactive prompts
 inquire = "=0.9.4"
@@ -92,7 +92,7 @@ hex = "=0.4.3"
 olpc-cjson = "=0.1.4"
 
 # Stream processing
-futures-util = "=0.3.33"
+futures-util = "=0.3.34"
 bytes = "=1.12.1"
 
 # Terminal
@@ -140,7 +140,7 @@ glob = "=0.3.4"
 jsonc-parser = { version = "=0.33.1", features = ["cst"] }
 
 # Certificate management
-rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-native-certs = "=0.8.4"
 rustls-pemfile = "=2.2.0"
