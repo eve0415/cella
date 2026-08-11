@@ -343,6 +343,7 @@ dependencies = [
  "cella-network",
  "cella-port",
  "cella-protocol",
+ "cella-wayland",
  "divan",
  "http-body-util",
  "hyper",

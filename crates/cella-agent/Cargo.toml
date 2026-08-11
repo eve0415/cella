@@ -17,6 +17,7 @@ cella-network.workspace = true
 cella-port.workspace = true
 miette.workspace = true
 cella-protocol.workspace = true
+cella-wayland.workspace = true
 nix.workspace = true
 notify.workspace = true
 rcgen.workspace = true
