@@ -1371,7 +1371,17 @@ async fn build_override_and_start(
     let progress = ctx.progress;
 
     let managed = ctx.client.capabilities().managed_agent;
-    let mut extra_env = build_extra_env(daemon_env, env_fwd, cfg.remote_env, managed);
+    // Loaded up here rather than at its old spot below `labels`, because the
+    // agent env vars need `clipboard.wayland` and container env is immutable
+    // after create — there is no later chance to add `WAYLAND_DISPLAY`.
+    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
+    let mut extra_env = build_extra_env(
+        daemon_env,
+        env_fwd,
+        cfg.remote_env,
+        managed,
+        settings.clipboard.wayland,
+    );
     // When `remoteEnv` contains `${containerEnv:VAR}` tokens, phase-1
     // substitution collapses them to `""` (container env is unavailable at
     // parse time).  Injecting those phase-1 values into the compose service
@@ -1390,7 +1400,6 @@ async fn build_override_and_start(
     // running primary service, matching the single-container path.
     labels.insert("devcontainer.metadata".to_string(), metadata_label);
 
-    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     cella_tool_install::ensure_tool_config_paths(&settings);
     // Container env is immutable after create, so the config sync opt-in must
     // be baked into the compose override here (mirrors the single-container
@@ -1402,24 +1411,7 @@ async fn build_override_and_start(
     // Resolved rather than parsed from the raw `-f` files, so file merging,
     // `extends`, profiles and interpolation are already applied. A failure to
     // resolve degrades to no mapping, exactly like a volume-backed workspace.
-    let workspace_bind = {
-        let (dp, dcp) = cfg.docker_binaries();
-        let resolver = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
-        match resolver.config().await {
-            Ok(resolved) => resolved
-                .services
-                .get(&project.primary_service)
-                .and_then(|svc| {
-                    crate::parse::workspace_bind_for_service(svc, &project.workspace_folder)
-                }),
-            Err(e) => {
-                debug!(
-                    "compose: cannot resolve the workspace bind ({e}); projectPath untranslated"
-                );
-                None
-            }
-        }
-    };
+    let workspace_bind = resolve_workspace_bind(cfg, project).await;
     extra_env.extend(cella_tool_install::tool_config_env_vars(
         &settings,
         remote_user,
@@ -1702,17 +1694,44 @@ fn build_compose_labels(
 /// etc.), user-specified `remote_env` overrides, and — when the backend has a
 /// managed agent — the agent env vars (notably `BROWSER=/cella/bin/cella-browser`)
 /// in precedence order.
+/// Resolves the primary service's workspace bind, for translating `projectPath`.
+///
+/// Read from the resolved compose config rather than the raw `-f` files, so file
+/// merging, `extends`, profiles and interpolation are already applied. A
+/// volume-backed workspace yields no pair, and a resolution failure degrades to
+/// the same — `projectPath` is simply left untranslated.
+async fn resolve_workspace_bind(
+    cfg: &ComposeUpConfig<'_>,
+    project: &ComposeProject,
+) -> Option<(String, String)> {
+    let (dp, dcp) = cfg.docker_binaries();
+    let resolver = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
+    match resolver.config().await {
+        Ok(resolved) => resolved
+            .services
+            .get(&project.primary_service)
+            .and_then(|svc| {
+                crate::parse::workspace_bind_for_service(svc, &project.workspace_folder)
+            }),
+        Err(e) => {
+            debug!("compose: cannot resolve the workspace bind ({e}); projectPath untranslated");
+            None
+        }
+    }
+}
+
 fn build_extra_env(
     daemon_env: Vec<String>,
     env_fwd: &cella_env::EnvForwarding,
     remote_env: &[String],
     managed_agent: bool,
+    wayland_clipboard: bool,
 ) -> Vec<String> {
     let mut extra_env = daemon_env;
     extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
     extra_env.extend(remote_env.iter().cloned());
     if managed_agent {
-        extra_env.extend(agent_env_vars());
+        extra_env.extend(agent_env_vars(wayland_clipboard));
     }
     extra_env
 }
@@ -2026,7 +2045,7 @@ mod tests {
     #[test]
     fn build_extra_env_injects_browser_when_managed_agent() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], true);
+        let extra = build_extra_env(vec![], &env_fwd, &[], true, true);
         assert!(
             extra
                 .iter()
@@ -2040,9 +2059,33 @@ mod tests {
     }
 
     #[test]
+    fn build_extra_env_injects_wayland_display_when_clipboard_enabled() {
+        let env_fwd = cella_env::EnvForwarding::default();
+        let extra = build_extra_env(vec![], &env_fwd, &[], true, true);
+        assert!(
+            extra.iter().any(|v| v
+                == &format!(
+                    "WAYLAND_DISPLAY={}",
+                    cella_protocol::WAYLAND_CLIPBOARD_SOCKET
+                )),
+            "clipboard.wayland=true must inject WAYLAND_DISPLAY; got {extra:?}"
+        );
+    }
+
+    #[test]
+    fn build_extra_env_omits_wayland_display_when_clipboard_disabled() {
+        let env_fwd = cella_env::EnvForwarding::default();
+        let extra = build_extra_env(vec![], &env_fwd, &[], true, false);
+        assert!(
+            !extra.iter().any(|v| v.starts_with("WAYLAND_DISPLAY=")),
+            "clipboard.wayland=false must NOT inject WAYLAND_DISPLAY; got {extra:?}"
+        );
+    }
+
+    #[test]
     fn build_extra_env_omits_browser_when_not_managed() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], false);
+        let extra = build_extra_env(vec![], &env_fwd, &[], false, true);
         assert!(
             !extra.iter().any(|v| v.starts_with("BROWSER=")),
             "managed_agent=false must NOT inject BROWSER; got {extra:?}"
@@ -2379,6 +2422,7 @@ mod tests {
             vec!["CELLA_DAEMON_ADDR=h:1".to_string()],
             &env_fwd,
             &["USER_KEY=user_val".to_string()],
+            true,
             true,
         );
         let daemon_idx = extra

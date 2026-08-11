@@ -1229,7 +1229,9 @@ impl EnsureUpContext<'_> {
             if create_opts.env.is_empty() {
                 create_opts.env = image_env.to_vec();
             }
-            create_opts.env.extend(agent_env_vars());
+            create_opts
+                .env
+                .extend(agent_env_vars(settings.clipboard.wayland));
         } else {
             self.progress.warn(
                 "Selected backend does not support managed agent provisioning; port forwarding and BROWSER interception are disabled.",
