@@ -12,7 +12,7 @@ use cella_wayland::{
     ClipboardSource, MAX_CLIPBOARD_SIZE, ServerHandle, SourceError, WaylandClipboardServer,
 };
 use tokio::runtime::Handle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::clipboard::{request_clipboard_paste, send_clipboard_copy};
 
@@ -75,12 +75,28 @@ fn parse_targets_response(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Whether this container was created with cella's clipboard socket enabled.
+///
+/// `settings.clipboard.wayland` lives on the host, and the agent never sees the
+/// config — `WAYLAND_DISPLAY` is the only channel. Requiring it to match the
+/// socket path exactly means turning the setting off actually stops the socket
+/// being served, rather than only hiding it, and it leaves a container that
+/// points at some other compositor alone.
+fn should_serve(display_env: Option<&str>) -> bool {
+    display_env == Some(cella_protocol::WAYLAND_CLIPBOARD_SOCKET)
+}
+
 /// Binds and starts the clipboard socket, returning the handle that keeps it alive.
 ///
 /// A bind failure is logged and swallowed on purpose: port forwarding, the
 /// credential helper and the CLI shims must keep working even when the socket
 /// cannot be served.
 pub fn start(handle: Handle) -> Option<ServerHandle> {
+    let display_env = std::env::var("WAYLAND_DISPLAY").ok();
+    if !should_serve(display_env.as_deref()) {
+        debug!("clipboard.wayland is off for this container; not serving the socket");
+        return None;
+    }
     let path = Path::new(cella_protocol::WAYLAND_CLIPBOARD_SOCKET);
     let source = Arc::new(DaemonClipboardSource::new(handle));
     let server = match WaylandClipboardServer::bind(path, source) {
@@ -137,6 +153,25 @@ mod tests {
             source.publish("image/png", &too_big),
             Err(SourceError::TooLarge { .. })
         ));
+    }
+
+    /// Regression: the socket used to be served unconditionally, so turning
+    /// `clipboard.wayland` off only stopped `WAYLAND_DISPLAY` being injected —
+    /// the endpoint stayed live and reachable regardless of the setting.
+    #[test]
+    fn does_not_serve_when_the_container_was_created_with_the_setting_off() {
+        assert!(!should_serve(None));
+    }
+
+    #[test]
+    fn does_not_hijack_a_container_pointed_at_another_compositor() {
+        assert!(!should_serve(Some("wayland-1")));
+        assert!(!should_serve(Some("/run/user/1000/wayland-0")));
+    }
+
+    #[test]
+    fn serves_when_the_container_was_created_with_the_setting_on() {
+        assert!(should_serve(Some(cella_protocol::WAYLAND_CLIPBOARD_SOCKET)));
     }
 
     /// Names the child half of the live round trip below.
