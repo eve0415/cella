@@ -28,6 +28,7 @@ mod reconnecting_client;
 mod ssh_agent_bridge;
 mod state;
 mod tunnel;
+mod wayland;
 
 use std::time::Duration;
 
@@ -288,6 +289,13 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let poll_interval = Duration::from_millis(poll_interval_ms);
 
     maybe_start_forward_proxy(proxy_config_json).await;
+
+    // Bind before the standalone branch below returns: the socket has to exist
+    // whether or not a daemon is reachable, so an arboard client sees an empty
+    // clipboard rather than a missing compositor. Held for the process
+    // lifetime — dropping the handle would stop the server and unlink the
+    // socket.
+    let _wayland_clipboard = wayland::start(tokio::runtime::Handle::current());
 
     // Publish Disconnected early so an in-container `cella doctor` run before
     // the handshake completes can tell the process is alive and still trying.

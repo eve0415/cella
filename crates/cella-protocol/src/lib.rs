@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 /// message; with it, the mismatch is rejected cleanly at the handshake.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Absolute path of the Wayland clipboard socket served by the in-container agent.
+///
+/// Baked into `WAYLAND_DISPLAY` at container create time, so it must stay
+/// deterministic — Docker env vars are immutable after creation and no runtime
+/// fallback is possible. `/tmp` is the one location guaranteed to exist and be
+/// writable however the agent was launched.
+pub const WAYLAND_CLIPBOARD_SOCKET: &str = "/tmp/cella/wayland-0";
+
 /// Which forwarded Claude Code document a sync message or codec call refers to.
 ///
 /// All three are gated by the single `AgentHello.claude_config_sync` opt-in:
