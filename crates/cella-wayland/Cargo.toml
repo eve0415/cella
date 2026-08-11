@@ -15,6 +15,7 @@ wayland-server.workspace = true
 [dev-dependencies]
 arboard = { workspace = true, features = ["wayland-data-control"] }
 wayland-client.workspace = true
+wayland-protocols = { workspace = true, features = ["client"] }
 wl-clipboard-rs.workspace = true
 
 [lints]

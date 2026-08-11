@@ -34,6 +34,23 @@ pub trait ClipboardSource: Send + Sync + 'static {
     fn publish(&self, mime_type: &str, data: &[u8]) -> Result<(), SourceError>;
 }
 
+/// Lets a caller keep a handle on a source it has already shared — the server
+/// takes ownership, so without this a test or a caller that wants to inspect
+/// the source afterwards would have no way to hold onto it.
+impl<T: ClipboardSource + ?Sized> ClipboardSource for std::sync::Arc<T> {
+    fn targets(&self) -> Result<Vec<String>, SourceError> {
+        (**self).targets()
+    }
+
+    fn fetch(&self, mime_type: &str) -> Result<Vec<u8>, SourceError> {
+        (**self).fetch(mime_type)
+    }
+
+    fn publish(&self, mime_type: &str, data: &[u8]) -> Result<(), SourceError> {
+        (**self).publish(mime_type, data)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error("clipboard bridge unavailable: {0}")]

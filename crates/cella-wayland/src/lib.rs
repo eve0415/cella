@@ -7,10 +7,14 @@
 //! graphical. Clipboard bytes come from a [`ClipboardSource`], which
 //! `cella-agent` implements against the daemon control channel.
 
+mod dispatch;
 mod server;
 mod source;
 #[cfg(test)]
 mod stubs;
+#[cfg(test)]
+mod testclient;
 
-pub use server::{MAX_WAYLAND_CLIENTS, ServerError, WaylandClipboardServer};
+pub use dispatch::MAX_CLIPBOARD_SIZE;
+pub use server::{MAX_WAYLAND_CLIENTS, ServerError, ServerHandle, WaylandClipboardServer};
 pub use source::{ClipboardSource, SourceError};

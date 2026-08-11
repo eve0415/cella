@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{Timespec, epoll};
 use tracing::{debug, info, warn};
+use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1;
+use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason, InitError, ObjectId};
+use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{Display, ListeningSocket};
 
 use crate::ClipboardSource;
@@ -63,7 +66,7 @@ pub enum ServerError {
 /// The host clipboard's mime types, refreshed at most once per
 /// [`TARGETS_CACHE_TTL`].
 #[derive(Default)]
-pub(crate) struct TargetsCache {
+pub struct TargetsCache {
     entry: Option<(Instant, Vec<String>)>,
     /// Whether the last refresh failed, so an outage logs once rather than
     /// once per connection.
@@ -105,7 +108,7 @@ impl TargetsCache {
 
 /// Everything the dispatch impls need. One instance per server, shared across
 /// all connected clients.
-pub(crate) struct ServerState {
+pub struct ServerState {
     pub(crate) source: Arc<dyn ClipboardSource>,
     pub(crate) targets: TargetsCache,
     /// Mime types each live data source has offered, keyed by the source
@@ -150,19 +153,21 @@ impl WaylandClipboardServer {
     /// server — `bind_absolute` takes an flock on a sibling lock file, so a
     /// stale socket from a crashed run is cleaned up automatically while a
     /// running one is refused.
-    pub fn bind(path: PathBuf, source: Arc<dyn ClipboardSource>) -> Result<Self, ServerError> {
-        prepare_socket_dir(&path)?;
+    pub fn bind(path: &Path, source: Arc<dyn ClipboardSource>) -> Result<Self, ServerError> {
+        prepare_socket_dir(path)?;
 
-        let socket =
-            ListeningSocket::bind_absolute(path.clone()).map_err(|source| ServerError::Bind {
-                path: path.clone(),
+        let socket = ListeningSocket::bind_absolute(path.to_path_buf()).map_err(|source| {
+            ServerError::Bind {
+                path: path.to_path_buf(),
                 source,
-            })?;
-        if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(0o666)) {
+            }
+        })?;
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o666)) {
             warn!("could not relax permissions on {}: {err}", path.display());
         }
 
         let mut display = Display::<ServerState>::new().map_err(ServerError::Display)?;
+        create_globals(&display);
         let epoll = build_epoll(&socket, &mut display)?;
 
         Ok(Self {
@@ -210,7 +215,7 @@ impl WaylandClipboardServer {
                 warn!("wayland clipboard event loop poll failed: {err}");
                 return;
             }
-            for event in events.drain(..) {
+            for event in &events {
                 match event.data.u64() {
                     EPOLL_SOCKET => self.accept_pending(),
                     EPOLL_DISPLAY => {
@@ -221,13 +226,14 @@ impl WaylandClipboardServer {
                     other => debug!("unexpected wayland epoll event {other}"),
                 }
             }
+            events.clear();
             if let Err(err) = self.display.flush_clients() {
                 debug!("wayland clipboard flush failed: {err}");
             }
         }
     }
 
-    fn accept_pending(&mut self) {
+    fn accept_pending(&self) {
         loop {
             match self.socket.accept() {
                 Ok(Some(stream)) => {
@@ -272,7 +278,7 @@ impl Drop for ServerHandle {
     }
 }
 
-fn prepare_socket_dir(path: &PathBuf) -> Result<(), ServerError> {
+fn prepare_socket_dir(path: &Path) -> Result<(), ServerError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -286,6 +292,19 @@ fn prepare_socket_dir(path: &PathBuf) -> Result<(), ServerError> {
         warn!("could not set mode 0755 on {}: {err}", parent.display());
     }
     Ok(())
+}
+
+/// Advertises the clipboard endpoint and nothing else.
+///
+/// No `wl_compositor`, `wl_shm`, or outputs — this is not a compositor. The wlr
+/// manager is pinned to version 1 on purpose: version 2 promises a primary
+/// selection channel, and clients that bind it then expect a
+/// `primary_selection` event cella never sends.
+fn create_globals(display: &Display<ServerState>) {
+    let dh = display.handle();
+    dh.create_global::<ServerState, WlSeat, _>(2, ());
+    dh.create_global::<ServerState, ExtDataControlManagerV1, _>(1, ());
+    dh.create_global::<ServerState, ZwlrDataControlManagerV1, _>(1, ());
 }
 
 fn build_epoll(
@@ -328,8 +347,7 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         let server =
-            WaylandClipboardServer::bind(path.clone(), Arc::new(StubSource::with_targets(&[])))
-                .unwrap();
+            WaylandClipboardServer::bind(&path, Arc::new(StubSource::with_targets(&[]))).unwrap();
         assert!(path.exists(), "socket should exist after bind");
         drop(server);
         assert!(!path.exists(), "socket should be cleaned up on drop");
