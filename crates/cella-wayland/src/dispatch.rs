@@ -419,6 +419,34 @@ mod tests {
         );
     }
 
+    /// Regression for the cached-format bug: a client that connected while the
+    /// host held text must not make the *next* client see text after the host
+    /// switched to an image. This is the exact sequence a user performs when
+    /// they copy a screenshot and immediately paste it in the container.
+    #[test]
+    fn a_new_device_sees_the_host_clipboard_as_it_is_now() {
+        let source = Arc::new(StubSource::with_targets(&["text/plain"]));
+        let (_server, path) = test_server(Arc::clone(&source));
+
+        let mut first = TestClient::connect(&path);
+        let _ = first.get_device();
+        assert_eq!(
+            first.selection_mimes(),
+            Some(vec!["text/plain".to_string()])
+        );
+
+        source.replace_contents(vec![("image/png".to_string(), b"\x89PNG".to_vec())]);
+
+        let mut second = TestClient::connect(&path);
+        let _ = second.get_device();
+        assert_eq!(
+            second.selection_mimes(),
+            Some(vec!["image/png".to_string()]),
+            "a device opened right after the host clipboard changed must see the new format"
+        );
+        assert_eq!(second.receive("image/png"), b"\x89PNG");
+    }
+
     #[test]
     fn receive_writes_payload_then_closes_fd() {
         let (_server, path) = test_server(StubSource::new(vec![(

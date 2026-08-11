@@ -9,6 +9,11 @@
 //! makes `env::set_var` unsafe while this workspace denies `unsafe_code`. Each
 //! parent test therefore binds a server and re-execs this same test binary,
 //! running one named child test, with the env var set on the child.
+//!
+//! Linux-only: the server it drives is a Wayland endpoint, and `arboard`'s
+//! `SetExtLinux` does not exist on macOS. The workspace clippy job builds every
+//! target on macOS too, so this has to compile away rather than fail there.
+#![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

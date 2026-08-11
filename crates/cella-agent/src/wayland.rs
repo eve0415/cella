@@ -175,6 +175,7 @@ mod tests {
     }
 
     /// Names the child half of the live round trip below.
+    #[cfg(target_os = "linux")]
     const LIVE_CHILD: &str = "CELLA_WAYLAND_LIVE_CHILD";
 
     /// Drives the real `arboard` against a socket backed by the real daemon.
@@ -184,6 +185,9 @@ mod tests {
     /// `DaemonClipboardSource`, the control channel, and the host pasteboard —
     /// so it is also the only one that can catch a break between them. Skips
     /// when no daemon is reachable, which is the normal case in CI.
+    ///
+    /// Linux-only: it binds the Wayland endpoint the agent serves in-container.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn live_arboard_round_trip_against_the_daemon() {
         if std::env::var(LIVE_CHILD).is_ok() {
@@ -226,6 +230,7 @@ mod tests {
 
     /// The child half: runs inside the re-execed process with `WAYLAND_DISPLAY`
     /// set. Kept as its own test so the parent can name it with `--exact`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_arboard_child() {
         let Ok(targets) = std::env::var(LIVE_CHILD) else {

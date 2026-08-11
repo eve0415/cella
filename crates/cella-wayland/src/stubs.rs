@@ -8,7 +8,7 @@ use crate::{ClipboardSource, SourceError};
 /// A source that serves a fixed set of mime types and payloads, and records
 /// everything published back to it.
 pub struct StubSource {
-    entries: Vec<(String, Vec<u8>)>,
+    entries: Mutex<Vec<(String, Vec<u8>)>>,
     available: bool,
     published: Mutex<Vec<(String, Vec<u8>)>>,
 }
@@ -16,7 +16,7 @@ pub struct StubSource {
 impl StubSource {
     pub fn new(entries: Vec<(String, Vec<u8>)>) -> Self {
         Self {
-            entries,
+            entries: Mutex::new(entries),
             available: true,
             published: Mutex::new(Vec::new()),
         }
@@ -34,7 +34,7 @@ impl StubSource {
     /// A source whose bridge is down — every call fails with `Unavailable`.
     pub fn unavailable() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Mutex::new(Vec::new()),
             available: false,
             published: Mutex::new(Vec::new()),
         }
@@ -43,6 +43,12 @@ impl StubSource {
     pub fn published(&self) -> Vec<(String, Vec<u8>)> {
         self.published.lock().unwrap().clone()
     }
+
+    /// Replaces what the "host clipboard" holds, the way a user copying
+    /// something else on the host would.
+    pub fn replace_contents(&self, entries: Vec<(String, Vec<u8>)>) {
+        *self.entries.lock().unwrap() = entries;
+    }
 }
 
 impl ClipboardSource for StubSource {
@@ -50,7 +56,13 @@ impl ClipboardSource for StubSource {
         if !self.available {
             return Err(SourceError::Unavailable("stub is down".to_string()));
         }
-        Ok(self.entries.iter().map(|(m, _)| m.clone()).collect())
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect())
     }
 
     fn fetch(&self, mime_type: &str) -> Result<Vec<u8>, SourceError> {
@@ -59,6 +71,8 @@ impl ClipboardSource for StubSource {
         }
         Ok(self
             .entries
+            .lock()
+            .unwrap()
             .iter()
             .find(|(m, _)| m == mime_type)
             .map(|(_, d)| d.clone())

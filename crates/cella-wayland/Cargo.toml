@@ -13,10 +13,15 @@ wayland-protocols-wlr = { workspace = true, features = ["server"] }
 wayland-server.workspace = true
 
 [dev-dependencies]
-arboard = { workspace = true, features = ["wayland-data-control"] }
 wayland-client.workspace = true
 wayland-protocols = { workspace = true, features = ["client"] }
 wl-clipboard-rs.workspace = true
 
 [lints]
 workspace = true
+
+# `arboard` drives tests/arboard_client.rs, which is Linux-only: it exercises a
+# Wayland endpoint and uses arboard's `SetExtLinux`. Keeping it off the macOS
+# build means the workspace clippy job there never compiles it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }

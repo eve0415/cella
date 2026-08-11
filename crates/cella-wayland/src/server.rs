@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-use rustix::event::{Timespec, epoll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tracing::{debug, info, warn};
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
@@ -27,22 +26,15 @@ use crate::ClipboardSource;
 /// high is a leaking client, and the refusal log is how it becomes visible.
 pub const MAX_WAYLAND_CLIENTS: usize = 64;
 
-/// How long a `TARGETS` result stays fresh.
+/// How long the loop blocks in `poll` before re-checking the shutdown flag.
 ///
-/// One Ctrl+V in an `arboard` client opens three connections in quick
-/// succession — the primary-selection probe, `file_list()`, and `get_image()` —
-/// and each uncached refresh costs a host round trip. Only the format list is
-/// cached; payload fetches never are.
-const TARGETS_CACHE_TTL: Duration = Duration::from_millis(500);
-
-/// How long the loop blocks in `epoll` before re-checking the shutdown flag.
+/// `poll(2)` rather than `epoll(7)`: only two descriptors are ever watched, so
+/// epoll buys nothing, and it does not exist outside Linux. The workspace's
+/// clippy job runs on macOS, where `rustix::event::epoll` is not compiled.
 const POLL_TIMEOUT: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 200_000_000,
 };
-
-const EPOLL_SOCKET: u64 = 0;
-const EPOLL_DISPLAY: u64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -65,29 +57,29 @@ pub enum ServerError {
     EventLoop(#[source] std::io::Error),
 }
 
-/// The host clipboard's mime types, refreshed at most once per
-/// [`TARGETS_CACHE_TTL`].
+/// Reads the host clipboard's mime types, one round trip per data device.
+///
+/// Deliberately *not* cached. A 500ms TTL was tried and measurably broke the
+/// case this whole feature exists for: copy an image on the host, paste in the
+/// container within the TTL, and the stale `text/plain` offer makes
+/// `get_image()` return "no image on clipboard" while the PNG sits right there.
+/// A fresh probe costs ~57ms against a live daemon, which is far cheaper than a
+/// silent wrong answer on a user-initiated paste.
 #[derive(Default)]
-pub struct TargetsCache {
-    entry: Option<(Instant, Vec<String>)>,
-    /// Whether the last refresh failed, so an outage logs once rather than
-    /// once per connection.
+pub struct TargetsProbe {
+    /// Whether the last probe failed, so an outage logs once rather than once
+    /// per connection.
     down: bool,
 }
 
-impl TargetsCache {
-    /// Returns the host clipboard's mime types, refreshing at most once per TTL.
+impl TargetsProbe {
+    /// Returns the host clipboard's mime types.
     ///
-    /// A failed refresh yields an empty list rather than an error: the caller's
+    /// A failed probe yields an empty list rather than an error: the caller's
     /// only recourse is to omit the selection event, and that is the documented
     /// degradation path.
     pub(crate) fn get(&mut self, source: &dyn ClipboardSource) -> Vec<String> {
-        if let Some((at, mimes)) = &self.entry
-            && at.elapsed() < TARGETS_CACHE_TTL
-        {
-            return mimes.clone();
-        }
-        let mimes = match source.targets() {
+        match source.targets() {
             Ok(mimes) => {
                 if self.down {
                     info!("clipboard bridge recovered");
@@ -102,9 +94,7 @@ impl TargetsCache {
                 }
                 Vec::new()
             }
-        };
-        self.entry = Some((Instant::now(), mimes.clone()));
-        mimes
+        }
     }
 }
 
@@ -112,7 +102,7 @@ impl TargetsCache {
 /// all connected clients.
 pub struct ServerState {
     pub(crate) source: Arc<dyn ClipboardSource>,
-    pub(crate) targets: TargetsCache,
+    pub(crate) targets: TargetsProbe,
     /// Mime types each live data source has offered, keyed by the source
     /// resource. Populated by `offer` requests, read when the client commits
     /// the selection.
@@ -135,7 +125,9 @@ pub struct WaylandClipboardServer {
     socket: ListeningSocket,
     display: Display<ServerState>,
     state: ServerState,
-    epoll: OwnedFd,
+    /// Owned dup of the backend's readiness fd, so polling it does not keep a
+    /// borrow of `display` alive across `dispatch_clients`.
+    display_fd: OwnedFd,
     clients: Arc<AtomicUsize>,
 }
 
@@ -172,17 +164,21 @@ impl WaylandClipboardServer {
 
         let mut display = Display::<ServerState>::new().map_err(ServerError::Display)?;
         create_globals(&display);
-        let epoll = build_epoll(&socket, &mut display)?;
+        let display_fd = display
+            .backend()
+            .poll_fd()
+            .try_clone_to_owned()
+            .map_err(ServerError::EventLoop)?;
 
         Ok(Self {
             socket,
             display,
             state: ServerState {
                 source,
-                targets: TargetsCache::default(),
+                targets: TargetsProbe::default(),
                 pending_sources: HashMap::new(),
             },
-            epoll,
+            display_fd,
             clients: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -209,32 +205,38 @@ impl WaylandClipboardServer {
     }
 
     fn run(mut self, shutdown: &AtomicBool) {
-        let mut events = Vec::with_capacity(4);
         while !shutdown.load(Ordering::Relaxed) {
-            if let Err(err) = epoll::wait(
-                &self.epoll,
-                rustix::buffer::spare_capacity(&mut events),
-                Some(&POLL_TIMEOUT),
-            ) {
-                warn!("wayland clipboard event loop poll failed: {err}");
-                return;
-            }
-            for event in &events {
-                match event.data.u64() {
-                    EPOLL_SOCKET => self.accept_pending(),
-                    EPOLL_DISPLAY => {
-                        if let Err(err) = self.display.dispatch_clients(&mut self.state) {
-                            warn!("wayland clipboard dispatch failed: {err}");
-                        }
-                    }
-                    other => debug!("unexpected wayland epoll event {other}"),
+            let (socket_ready, display_ready) = match self.wait_for_readiness() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!("wayland clipboard event loop poll failed: {err}");
+                    return;
                 }
+            };
+            if socket_ready {
+                self.accept_pending();
             }
-            events.clear();
+            if display_ready && let Err(err) = self.display.dispatch_clients(&mut self.state) {
+                warn!("wayland clipboard dispatch failed: {err}");
+            }
             if let Err(err) = self.display.flush_clients() {
                 debug!("wayland clipboard flush failed: {err}");
             }
         }
+    }
+
+    /// Blocks until the listening socket or a client has something for us, or
+    /// [`POLL_TIMEOUT`] elapses so the shutdown flag gets re-checked.
+    fn wait_for_readiness(&self) -> rustix::io::Result<(bool, bool)> {
+        let mut fds = [
+            PollFd::new(&self.socket, PollFlags::IN),
+            PollFd::new(&self.display_fd, PollFlags::IN),
+        ];
+        poll(&mut fds, Some(&POLL_TIMEOUT))?;
+        Ok((
+            fds[0].revents().intersects(PollFlags::IN),
+            fds[1].revents().intersects(PollFlags::IN),
+        ))
     }
 
     fn accept_pending(&self) {
@@ -358,32 +360,6 @@ fn create_globals(display: &Display<ServerState>) {
     dh.create_global::<ServerState, ZwlrDataControlManagerV1, _>(1, ());
 }
 
-fn build_epoll(
-    socket: &ListeningSocket,
-    display: &mut Display<ServerState>,
-) -> Result<OwnedFd, ServerError> {
-    let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(io_err)?;
-    epoll::add(
-        &epoll,
-        socket,
-        epoll::EventData::new_u64(EPOLL_SOCKET),
-        epoll::EventFlags::IN,
-    )
-    .map_err(io_err)?;
-    epoll::add(
-        &epoll,
-        display.backend().poll_fd(),
-        epoll::EventData::new_u64(EPOLL_DISPLAY),
-        epoll::EventFlags::IN,
-    )
-    .map_err(io_err)?;
-    Ok(epoll)
-}
-
-fn io_err(err: rustix::io::Errno) -> ServerError {
-    ServerError::EventLoop(std::io::Error::from(err))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,16 +448,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Regression: a 500ms TTL on this list meant that copying an image on the
+    /// host and pasting within the window served the previous `text/plain`
+    /// offer, so `get_image()` reported an empty clipboard while the PNG was
+    /// already there. Every data device must see the clipboard as it is now.
     #[test]
-    fn targets_cache_collapses_repeated_calls_within_ttl() {
+    fn every_probe_refetches_the_host_target_list() {
         let source = Arc::new(CountingSource::default());
-        let mut cache = TargetsCache::default();
-        let _ = cache.get(source.as_ref());
-        let _ = cache.get(source.as_ref());
+        let mut probe = TargetsProbe::default();
+        let _ = probe.get(source.as_ref());
+        let _ = probe.get(source.as_ref());
         assert_eq!(
             source.calls(),
-            1,
-            "second call within TTL must hit the cache"
+            2,
+            "the format list must never be served from a cache"
         );
     }
 }
