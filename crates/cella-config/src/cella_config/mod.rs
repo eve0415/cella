@@ -12,7 +12,7 @@ pub use cli::{Cli, CliBuild, OutputFormat, PullPolicy};
 pub use error::CellaConfigError;
 pub use security::{Security, SecurityMode};
 
-use crate::settings::{Credentials, Network, Shell, Tools};
+use crate::settings::{Clipboard, Credentials, Network, Shell, Tools};
 
 use self::format::load_layer;
 use self::merge::merge_layers;
@@ -37,6 +37,9 @@ pub struct CellaConfig {
 
     #[serde(default)]
     pub cli: Cli,
+
+    #[serde(default)]
+    pub clipboard: Clipboard,
 }
 
 impl CellaConfig {

@@ -1,5 +1,6 @@
 mod ai_credentials;
 mod claude_code;
+mod clipboard;
 mod codex;
 mod credentials;
 mod gemini;
@@ -11,6 +12,7 @@ mod tools;
 
 pub use ai_credentials::AiCredentials;
 pub use claude_code::ClaudeCode;
+pub use clipboard::Clipboard;
 pub use codex::Codex;
 pub use credentials::{Credentials, CustomCredentialProvider};
 pub use gemini::Gemini;

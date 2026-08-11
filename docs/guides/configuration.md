@@ -287,6 +287,25 @@ Build-specific CLI defaults.
 no_cache = false
 ```
 
+### `[clipboard]`
+
+Host clipboard integration.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `wayland` | bool | `true` | Serve a Wayland clipboard socket in the container and set `WAYLAND_DISPLAY` |
+
+```toml
+[clipboard]
+wayland = true
+```
+
+cella bridges the host clipboard two ways. The `/cella/bin` shims (`xclip`, `xsel`, `wl-copy`, `wl-paste`) cover tools that shell out. The Wayland socket covers tools that speak the protocol directly — anything built on `arboard` or `wl-clipboard-rs`, which never exec anything and so cannot see the shims.
+
+Turn `wayland` off if a GUI toolkit in your container misbehaves when it believes a compositor is present. cella advertises only clipboard globals — a seat and the two data-control managers — never `wl_compositor` or `wl_shm`. The shims keep working either way.
+
+`WAYLAND_DISPLAY` is baked in at container create time, so changing this setting takes effect on the next `cella up`, not on a restart. `DISPLAY` is never set.
+
 ## Validation
 
 All config sections use strict validation — unknown fields are rejected. A typo like `[securityy]` or `enbled = true` produces an error at load time rather than being silently ignored.
