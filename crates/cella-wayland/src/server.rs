@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -52,6 +52,8 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("refusing to serve the wayland clipboard socket from {path}: {reason}")]
+    UntrustedDirectory { path: PathBuf, reason: String },
     #[error("failed to bind the wayland clipboard socket at {path}: {source:?}")]
     Bind {
         path: PathBuf,
@@ -142,17 +144,19 @@ impl WaylandClipboardServer {
     ///
     /// The parent directory is created `0755` and the socket itself is left
     /// world-writable (`0666`) so the container's non-root remote user can
-    /// connect. Squatting is prevented by ordering rather than by permissions:
-    /// the agent daemon runs from the container entrypoint before `exec "$@"`
-    /// starts any user process, so the directory already exists and is
-    /// root-owned by the time anything else could try to create it.
+    /// connect. Squatting is prevented by the directory, not by the socket
+    /// mode: once `/tmp/cella` is root-owned and not group/other-writable, no
+    /// other container process can unlink or replace what is inside it. That
+    /// property is checked rather than assumed — see [`validate_socket_dir`].
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::Bind`] if the socket is already held by a live
-    /// server — `bind_absolute` takes an flock on a sibling lock file, so a
-    /// stale socket from a crashed run is cleaned up automatically while a
-    /// running one is refused.
+    /// Returns [`ServerError::UntrustedDirectory`] if the parent directory is a
+    /// symlink, is owned by another user, or is writable by anyone else, and
+    /// [`ServerError::Bind`] if the socket is already held by a live server —
+    /// `bind_absolute` takes an flock on a sibling lock file, so a stale socket
+    /// from a crashed run is cleaned up automatically while a running one is
+    /// refused.
     pub fn bind(path: &Path, source: Arc<dyn ClipboardSource>) -> Result<Self, ServerError> {
         prepare_socket_dir(path)?;
 
@@ -282,14 +286,61 @@ fn prepare_socket_dir(path: &Path) -> Result<(), ServerError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
+    // A no-op when the path already exists — including when it exists as a
+    // symlink, which is what `validate_socket_dir` is here to catch.
     fs::create_dir_all(parent).map_err(|source| ServerError::Directory {
         path: parent.to_path_buf(),
         source,
     })?;
+    // Validate *before* chmod, never after: `chmod(2)` follows symlinks, so
+    // relaxing the mode first would hand an attacker-planted link a
+    // root-privileged permission change on a directory of their choosing.
+    validate_socket_dir(parent)?;
     if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o755)) {
         // Not fatal on its own: if the directory is genuinely unusable, the
         // bind below reports the real reason.
         warn!("could not set mode 0755 on {}: {err}", parent.display());
+    }
+    Ok(())
+}
+
+/// Refuses to serve out of a directory another user could have prepared.
+///
+/// The socket lives under `/tmp`, which cella deliberately leaves mode 1777, and
+/// the agent is restarted as root long after container processes are running —
+/// every `cella up` calls `restart_agent_in_container`. So "the daemon starts
+/// before any user process" holds only for a container's very first start, and
+/// cannot be the sole defence. Three properties make the path trustworthy:
+/// it is a real directory rather than a symlink, it is owned by root or by us,
+/// and no one else can write to it.
+fn validate_socket_dir(dir: &Path) -> Result<(), ServerError> {
+    let untrusted = |reason: &str| ServerError::UntrustedDirectory {
+        path: dir.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    // `symlink_metadata` deliberately does not follow the final component.
+    let meta = fs::symlink_metadata(dir).map_err(|source| ServerError::Directory {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(untrusted("it is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(untrusted("it is not a directory"));
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(untrusted(&format!(
+            "it is owned by uid {} rather than root or uid {euid}",
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(untrusted(&format!(
+            "it is group- or world-writable (mode {:04o})",
+            meta.mode() & 0o7777
+        )));
     }
     Ok(())
 }
@@ -351,6 +402,74 @@ mod tests {
         assert!(path.exists(), "socket should exist after bind");
         drop(server);
         assert!(!path.exists(), "socket should be cleaned up on drop");
+    }
+
+    /// Regression: `/tmp` is mode 1777 in cella containers, and the agent is
+    /// restarted as root long after user processes exist (every `cella up`
+    /// calls `restart_agent_in_container`). A container process could plant
+    /// `/tmp/cella` as a symlink; `chmod(2)` follows it, so the old code
+    /// relaxed the mode of an attacker-chosen directory as root.
+    #[test]
+    fn refuses_a_socket_dir_that_is_a_symlink() {
+        let root = std::env::temp_dir().join("cella-wayland-test-symlink");
+        let _ = fs::remove_dir_all(&root);
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o700)).unwrap();
+        let planted = root.join("planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let err = WaylandClipboardServer::bind(
+            &planted.join("wayland-0"),
+            Arc::new(StubSource::with_targets(&[])),
+        )
+        .err()
+        .expect("must refuse to bind through a symlinked socket dir");
+        assert!(
+            matches!(err, ServerError::UntrustedDirectory { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the symlink target's mode must be untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A group- or world-writable socket directory lets any container process
+    /// unlink the socket and bind its own in its place.
+    #[test]
+    fn refuses_a_world_writable_socket_dir() {
+        let dir = std::env::temp_dir().join("cella-wayland-test-loose-dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = WaylandClipboardServer::bind(
+            &dir.join("wayland-0"),
+            Arc::new(StubSource::with_targets(&[])),
+        )
+        .err()
+        .expect("must refuse a world-writable socket dir");
+        assert!(
+            matches!(err, ServerError::UntrustedDirectory { .. }),
+            "got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_a_socket_dir_it_owns_with_tight_permissions() {
+        let dir = std::env::temp_dir().join("cella-wayland-test-good-dir");
+        let _ = fs::remove_dir_all(&dir);
+        let server = WaylandClipboardServer::bind(
+            &dir.join("wayland-0"),
+            Arc::new(StubSource::with_targets(&[])),
+        )
+        .expect("a freshly created dir must be accepted");
+        drop(server);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

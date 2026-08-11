@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 thiserror.workspace = true
 tracing.workspace = true
 wayland-protocols = { workspace = true, features = ["server", "staging"] }
