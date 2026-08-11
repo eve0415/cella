@@ -834,6 +834,7 @@ name = "cella-wayland"
 version = "0.7.1"
 dependencies = [
  "arboard",
+ "cella-protocol",
  "rustix",
  "thiserror 2.0.19",
  "tracing",

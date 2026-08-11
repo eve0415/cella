@@ -162,6 +162,14 @@ where
     drop(theirs);
 
     match read_capped(&mut ours) {
+        // A source that offered a mime and then wrote nothing is an abandoned
+        // copy — a client killed mid-transfer, or one whose serving thread
+        // died. Publishing the empty result would wipe whatever the user had
+        // on the host clipboard, which is the same thing the `set_selection
+        // None` arm refuses to do.
+        Ok(bytes) if bytes.is_empty() => {
+            debug!("client offered {mime} but wrote nothing; leaving the host clipboard alone");
+        }
         Ok(bytes) => {
             if let Err(err) = state.source.publish(mime, &bytes) {
                 warn!("could not publish {mime} to the host clipboard: {err}");
@@ -513,6 +521,24 @@ mod tests {
         assert!(
             client.receive("image/png").is_empty(),
             "never truncate — a short PNG is worse than no PNG"
+        );
+    }
+
+    /// Regression: a client that offered a mime and then closed the fd without
+    /// writing had its empty result published, silently wiping whatever the
+    /// user had copied on the host.
+    #[test]
+    fn a_client_that_writes_nothing_does_not_wipe_the_host_clipboard() {
+        let source = Arc::new(StubSource::with_targets(&["text/plain"]));
+        let (_server, path) = test_server(Arc::clone(&source) as Arc<dyn ClipboardSource>);
+        let mut client = TestClient::connect(&path);
+        let device = client.get_device();
+
+        client.copy(&device, &["text/plain"], Vec::new());
+
+        assert!(
+            source.published().is_empty(),
+            "an abandoned copy must leave the host clipboard untouched"
         );
     }
 

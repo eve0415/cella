@@ -1731,7 +1731,7 @@ fn build_extra_env(
     extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
     extra_env.extend(remote_env.iter().cloned());
     if managed_agent {
-        extra_env.extend(agent_env_vars(wayland_clipboard));
+        extra_env.extend(agent_env_vars(wayland_clipboard, &extra_env));
     }
     extra_env
 }
@@ -2069,6 +2069,27 @@ mod tests {
                     cella_protocol::WAYLAND_CLIPBOARD_SOCKET
                 )),
             "clipboard.wayland=true must inject WAYLAND_DISPLAY; got {extra:?}"
+        );
+    }
+
+    #[test]
+    fn build_extra_env_yields_to_a_user_supplied_wayland_display() {
+        let env_fwd = cella_env::EnvForwarding::default();
+        let extra = build_extra_env(
+            vec![],
+            &env_fwd,
+            &["WAYLAND_DISPLAY=wayland-0".to_string()],
+            true,
+            true,
+        );
+        let displays: Vec<_> = extra
+            .iter()
+            .filter(|v| v.starts_with("WAYLAND_DISPLAY="))
+            .collect();
+        assert_eq!(
+            displays,
+            vec!["WAYLAND_DISPLAY=wayland-0"],
+            "a remoteEnv compositor must survive; got {extra:?}"
         );
     }
 
