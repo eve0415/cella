@@ -18,7 +18,7 @@ const DEFAULT_MIME_TYPE: &str = "text/plain";
 /// container forever, and the Wayland server would inherit the same stall.
 pub const CLIPBOARD_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum ClipboardOp {
     Copy { mime_type: String },
     Paste { mime_type: String },
@@ -335,6 +335,42 @@ mod tests {
             start.elapsed()
         );
         assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    // Claude Code shells out to these exact invocations rather than speaking
+    // the Wayland protocol, so the shims — not the socket — are what it
+    // depends on. Pinned here so a future refactor of the arg parsers cannot
+    // break it silently.
+
+    #[test]
+    fn parses_claude_code_targets_probe() {
+        let args = ["-selection", "clipboard", "-t", "TARGETS", "-o"].map(String::from);
+        assert_eq!(
+            parse_xclip_args(&args),
+            ClipboardOp::Paste {
+                mime_type: "TARGETS".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_claude_code_image_fetch() {
+        let args = ["-selection", "clipboard", "-t", "image/png", "-o"].map(String::from);
+        assert_eq!(
+            parse_xclip_args(&args),
+            ClipboardOp::Paste {
+                mime_type: "image/png".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_claude_code_wl_paste_fallbacks() {
+        assert!(parse_wl_paste_args(&["-l".to_string()]).list_types);
+        assert_eq!(
+            parse_wl_paste_args(&["--type".to_string(), "image/png".to_string()]).mime_type,
+            "image/png"
+        );
     }
 
     #[test]
