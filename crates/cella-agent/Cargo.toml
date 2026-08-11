@@ -38,6 +38,7 @@ uuid.workspace = true
 tokio-stream.workspace = true
 
 [dev-dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
 divan.workspace = true
 tempfile.workspace = true
 

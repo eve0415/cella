@@ -138,4 +138,72 @@ mod tests {
             Err(SourceError::TooLarge { .. })
         ));
     }
+
+    /// Names the child half of the live round trip below.
+    const LIVE_CHILD: &str = "CELLA_WAYLAND_LIVE_CHILD";
+
+    /// Drives the real `arboard` against a socket backed by the real daemon.
+    ///
+    /// Everything else in this crate stubs the host away. This is the only test
+    /// that exercises the whole chain — arboard, the Wayland socket,
+    /// `DaemonClipboardSource`, the control channel, and the host pasteboard —
+    /// so it is also the only one that can catch a break between them. Skips
+    /// when no daemon is reachable, which is the normal case in CI.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_arboard_round_trip_against_the_daemon() {
+        if std::env::var(LIVE_CHILD).is_ok() {
+            return;
+        }
+        if crate::control::resolve_daemon_connection().is_err() {
+            eprintln!("skipping: no cella daemon reachable from this container");
+            return;
+        }
+        // Probe with the async API rather than `source.targets()`: this test
+        // body runs on a tokio worker, and `ClipboardSource` blocks. In
+        // production every caller is a plain `std::thread`, which is the whole
+        // reason `spawn()` does not use a tokio task.
+        let Ok(raw) = request_clipboard_paste(TARGETS_SENTINEL).await else {
+            eprintln!("skipping: daemon reachable but the clipboard bridge did not answer");
+            return;
+        };
+        let targets = parse_targets_response(&raw);
+        let source = DaemonClipboardSource::new(Handle::current());
+
+        let dir = std::env::temp_dir().join("cella-wayland-live");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("wayland-{}", std::process::id()));
+        let server = WaylandClipboardServer::bind(&path, Arc::new(source)).unwrap();
+        let _running = server.spawn().unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wayland::tests::live_arboard_child",
+                "--nocapture",
+            ])
+            .env(LIVE_CHILD, targets.join(","))
+            .env("WAYLAND_DISPLAY", &path)
+            .env_remove("DISPLAY")
+            .status()
+            .unwrap();
+        assert!(status.success(), "arboard failed against the live socket");
+    }
+
+    /// The child half: runs inside the re-execed process with `WAYLAND_DISPLAY`
+    /// set. Kept as its own test so the parent can name it with `--exact`.
+    #[test]
+    fn live_arboard_child() {
+        let Ok(targets) = std::env::var(LIVE_CHILD) else {
+            return;
+        };
+        let mut clipboard =
+            arboard::Clipboard::new().expect("Clipboard::new() against the live cella socket");
+        if targets.split(',').any(|t| t == "image/png") {
+            let image = clipboard.get_image().expect("get_image() from the host");
+            assert!(image.width > 0 && image.height > 0);
+            eprintln!("live image: {}x{}", image.width, image.height);
+        } else if targets.split(',').any(|t| t.starts_with("text/")) {
+            eprintln!("live text: {} bytes", clipboard.get_text().unwrap().len());
+        }
+    }
 }

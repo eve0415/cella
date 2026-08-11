@@ -336,6 +336,7 @@ dependencies = [
 name = "cella-agent"
 version = "0.7.1"
 dependencies = [
+ "arboard",
  "base64 0.23.0",
  "bytes",
  "cella-env",
