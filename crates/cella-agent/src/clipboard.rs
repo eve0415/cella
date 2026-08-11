@@ -3,12 +3,10 @@ use std::time::Duration;
 
 use base64::Engine;
 use cella_port::CellaPortError;
-use cella_protocol::{AgentMessage, DaemonMessage};
+use cella_protocol::{AgentMessage, DaemonMessage, MAX_CLIPBOARD_SIZE};
 use tracing::{debug, warn};
 
 use crate::control::ControlClient;
-
-pub use cella_wayland::MAX_CLIPBOARD_SIZE;
 
 const DEFAULT_MIME_TYPE: &str = "text/plain";
 
@@ -204,24 +202,11 @@ async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), Cella
     }
 }
 
-/// Wraps one clipboard round trip in [`CLIPBOARD_RPC_TIMEOUT`].
-async fn with_rpc_timeout<F, T>(what: &str, fut: F) -> Result<T, CellaPortError>
-where
-    F: Future<Output = Result<T, CellaPortError>>,
-{
-    tokio::time::timeout(CLIPBOARD_RPC_TIMEOUT, fut)
-        .await
-        .unwrap_or_else(|_| {
-            Err(CellaPortError::ControlSocket {
-                message: format!("clipboard {what} timed out after {CLIPBOARD_RPC_TIMEOUT:?}"),
-            })
-        })
-}
-
 pub async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
-    with_rpc_timeout(
-        "copy",
+    crate::control::with_timeout(
+        "clipboard copy",
+        CLIPBOARD_RPC_TIMEOUT,
         send_clipboard_copy_at(&addr, &token, data, mime_type),
     )
     .await
@@ -249,8 +234,9 @@ async fn send_clipboard_copy_at(
 
 pub async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
-    with_rpc_timeout(
-        "paste",
+    crate::control::with_timeout(
+        "clipboard paste",
+        CLIPBOARD_RPC_TIMEOUT,
         request_clipboard_paste_at(&addr, &token, mime_type),
     )
     .await
@@ -305,8 +291,9 @@ mod tests {
     async fn paste_against_a_silent_daemon_times_out() {
         let addr = silent_daemon().await;
         let start = std::time::Instant::now();
-        let err = with_rpc_timeout(
-            "paste",
+        let err = crate::control::with_timeout(
+            "clipboard paste",
+            CLIPBOARD_RPC_TIMEOUT,
             request_clipboard_paste_at(&addr, "token", "text/plain"),
         )
         .await
@@ -323,8 +310,9 @@ mod tests {
     async fn copy_against_a_silent_daemon_times_out() {
         let addr = silent_daemon().await;
         let start = std::time::Instant::now();
-        let err = with_rpc_timeout(
-            "copy",
+        let err = crate::control::with_timeout(
+            "clipboard copy",
+            CLIPBOARD_RPC_TIMEOUT,
             send_clipboard_copy_at(&addr, "token", b"data", "text/plain"),
         )
         .await

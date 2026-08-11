@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use cella_protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
-use tokio::time::timeout;
 
 use crate::control::ControlClient;
 
@@ -23,11 +22,7 @@ async fn recv_timeout(
     client: &mut ControlClient,
     dur: Duration,
 ) -> Result<DaemonMessage, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(timeout(dur, client.recv()).await.map_err(
-        |_| -> Box<dyn std::error::Error + Send + Sync> {
-            "timed out waiting for response from daemon".into()
-        },
-    )??)
+    Ok(crate::control::with_timeout("response from daemon", dur, client.recv()).await?)
 }
 
 /// In-container CLI commands.

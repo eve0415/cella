@@ -1,5 +1,7 @@
 //! TCP client for communicating with the host daemon.
 
+use std::time::Duration;
+
 use cella_port::CellaPortError;
 use cella_protocol::{AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -242,6 +244,27 @@ async fn run_reader_loop(
 
 /// Resolve daemon connection info: `.daemon_addr` file first (authoritative),
 /// env vars as fallback (may be stale after container restart).
+/// Bounds one daemon round trip, turning an elapsed timeout into a domain error.
+///
+/// The single home for daemon timeout policy: the in-container CLI commands and
+/// the clipboard paths both go through here, so a change to how a timeout is
+/// reported cannot drift between them.
+///
+/// # Errors
+///
+/// Returns the future's own error, or [`CellaPortError::ControlSocket`] naming
+/// `what` if `dur` elapses first.
+pub async fn with_timeout<F, T>(what: &str, dur: Duration, fut: F) -> Result<T, CellaPortError>
+where
+    F: Future<Output = Result<T, CellaPortError>>,
+{
+    tokio::time::timeout(dur, fut).await.unwrap_or_else(|_| {
+        Err(CellaPortError::ControlSocket {
+            message: format!("{what} timed out after {dur:?}"),
+        })
+    })
+}
+
 pub fn resolve_daemon_connection() -> Result<(String, String), CellaPortError> {
     if let Some(info) = read_daemon_addr_file() {
         return Ok((info.addr, info.token));

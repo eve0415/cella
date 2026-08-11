@@ -30,7 +30,7 @@ use crate::{ClipboardSource, ServerHandle, WaylandClipboardServer};
 ///
 /// The tests always need a *running* server: a bound-but-unpolled socket makes
 /// every roundtrip hang instead of fail, which is far worse to debug.
-pub fn test_server<S: ClipboardSource>(source: S) -> (ServerHandle, PathBuf) {
+pub fn test_server(source: Arc<dyn ClipboardSource>) -> (ServerHandle, PathBuf) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join("cella-wayland-tests");
     std::fs::create_dir_all(&dir).unwrap();
@@ -39,7 +39,7 @@ pub fn test_server<S: ClipboardSource>(source: S) -> (ServerHandle, PathBuf) {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst)
     ));
-    let server = WaylandClipboardServer::bind(&path, Arc::new(source)).unwrap();
+    let server = WaylandClipboardServer::bind(&path, source).unwrap();
     (server.spawn().unwrap(), path)
 }
 

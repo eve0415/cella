@@ -28,14 +28,10 @@ use wayland_server::backend::ClientId;
 use wayland_server::protocol::wl_seat::{self, WlSeat};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
+use cella_protocol::MAX_CLIPBOARD_SIZE;
+
 use crate::ClipboardSource;
 use crate::server::ServerState;
-
-/// Largest clipboard payload moved in either direction.
-///
-/// Shared with the CLI shims: `cella-agent` uses this constant rather than
-/// keeping its own, so the socket and `xclip` can never disagree about the cap.
-pub const MAX_CLIPBOARD_SIZE: usize = 10 * 1024 * 1024;
 
 /// How long a copy waits for the owning client to write its payload.
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -387,7 +383,7 @@ mod tests {
 
     #[test]
     fn advertises_seat_and_both_managers() {
-        let (_server, path) = test_server(StubSource::with_targets(&["text/plain"]));
+        let (_server, path) = test_server(Arc::new(StubSource::with_targets(&["text/plain"])));
         let globals = TestClient::connect(&path).state.globals;
         assert!(
             globals.iter().any(|(i, v)| i == "wl_seat" && *v >= 2),
@@ -409,7 +405,10 @@ mod tests {
 
     #[test]
     fn get_data_device_emits_offer_with_host_mimes_in_first_roundtrip() {
-        let (_server, path) = test_server(StubSource::with_targets(&["image/png", "text/plain"]));
+        let (_server, path) = test_server(Arc::new(StubSource::with_targets(&[
+            "image/png",
+            "text/plain",
+        ])));
         let mut client = TestClient::connect(&path);
         let _device = client.get_device();
         assert_eq!(
@@ -426,7 +425,7 @@ mod tests {
     #[test]
     fn a_new_device_sees_the_host_clipboard_as_it_is_now() {
         let source = Arc::new(StubSource::with_targets(&["text/plain"]));
-        let (_server, path) = test_server(Arc::clone(&source));
+        let (_server, path) = test_server(Arc::clone(&source) as Arc<dyn ClipboardSource>);
 
         let mut first = TestClient::connect(&path);
         let _ = first.get_device();
@@ -449,10 +448,10 @@ mod tests {
 
     #[test]
     fn receive_writes_payload_then_closes_fd() {
-        let (_server, path) = test_server(StubSource::new(vec![(
+        let (_server, path) = test_server(Arc::new(StubSource::new(vec![(
             "image/png".to_string(),
             b"\x89PNG-bytes".to_vec(),
-        )]));
+        )])));
         let mut client = TestClient::connect(&path);
         let _device = client.get_device();
         assert_eq!(client.receive("image/png"), b"\x89PNG-bytes");
@@ -460,7 +459,7 @@ mod tests {
 
     #[test]
     fn no_selection_event_when_source_is_unavailable() {
-        let (_server, path) = test_server(StubSource::unavailable());
+        let (_server, path) = test_server(Arc::new(StubSource::unavailable()));
         let mut client = TestClient::connect(&path);
         let _device = client.get_device();
         assert!(
@@ -472,7 +471,7 @@ mod tests {
 
     #[test]
     fn empty_host_clipboard_emits_no_selection_event() {
-        let (_server, path) = test_server(StubSource::with_targets(&[]));
+        let (_server, path) = test_server(Arc::new(StubSource::with_targets(&[])));
         let mut client = TestClient::connect(&path);
         let _device = client.get_device();
         assert!(!client.state.saw_selection_event);
@@ -481,7 +480,7 @@ mod tests {
     #[test]
     fn set_selection_publishes_preferred_mime_then_cancels_source() {
         let source = Arc::new(StubSource::with_targets(&["text/plain"]));
-        let (_server, path) = test_server(Arc::clone(&source));
+        let (_server, path) = test_server(Arc::clone(&source) as Arc<dyn ClipboardSource>);
         let mut client = TestClient::connect(&path);
         let device = client.get_device();
 
@@ -505,8 +504,10 @@ mod tests {
     #[test]
     fn payload_over_cap_serves_nothing() {
         let oversized = vec![0u8; MAX_CLIPBOARD_SIZE + 1];
-        let (_server, path) =
-            test_server(StubSource::new(vec![("image/png".to_string(), oversized)]));
+        let (_server, path) = test_server(Arc::new(StubSource::new(vec![(
+            "image/png".to_string(),
+            oversized,
+        )])));
         let mut client = TestClient::connect(&path);
         let _device = client.get_device();
         assert!(
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn copy_over_cap_is_not_published() {
         let source = Arc::new(StubSource::with_targets(&["text/plain"]));
-        let (_server, path) = test_server(Arc::clone(&source));
+        let (_server, path) = test_server(Arc::clone(&source) as Arc<dyn ClipboardSource>);
         let mut client = TestClient::connect(&path);
         let device = client.get_device();
 

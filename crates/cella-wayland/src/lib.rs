@@ -15,6 +15,5 @@ mod stubs;
 #[cfg(test)]
 mod testclient;
 
-pub use dispatch::MAX_CLIPBOARD_SIZE;
 pub use server::{MAX_WAYLAND_CLIENTS, ServerError, ServerHandle, WaylandClipboardServer};
 pub use source::{ClipboardSource, SourceError};

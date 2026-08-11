@@ -1,5 +1,5 @@
 //! The Wayland event loop: socket binding, client admission, and the host
-//! `TARGETS` cache that the dispatch layer reads for every new data device.
+//! `TARGETS` probe the dispatch layer runs for every new data device.
 
 use std::collections::HashMap;
 use std::fs;
@@ -53,8 +53,8 @@ pub enum ServerError {
     },
     #[error("failed to initialise the wayland display: {0:?}")]
     Display(InitError),
-    #[error("failed to set up the wayland event loop: {0}")]
-    EventLoop(#[source] std::io::Error),
+    #[error("failed to duplicate the wayland readiness descriptor: {0}")]
+    PollFd(#[source] std::io::Error),
 }
 
 /// Reads the host clipboard's mime types, one round trip per data device.
@@ -168,7 +168,7 @@ impl WaylandClipboardServer {
             .backend()
             .poll_fd()
             .try_clone_to_owned()
-            .map_err(ServerError::EventLoop)?;
+            .map_err(ServerError::PollFd)?;
 
         Ok(Self {
             socket,
@@ -219,7 +219,11 @@ impl WaylandClipboardServer {
             if display_ready && let Err(err) = self.display.dispatch_clients(&mut self.state) {
                 warn!("wayland clipboard dispatch failed: {err}");
             }
-            if let Err(err) = self.display.flush_clients() {
+            // Nothing was read or accepted on a bare timeout wakeup, so there
+            // is nothing queued to flush.
+            if (socket_ready || display_ready)
+                && let Err(err) = self.display.flush_clients()
+            {
                 debug!("wayland clipboard flush failed: {err}");
             }
         }

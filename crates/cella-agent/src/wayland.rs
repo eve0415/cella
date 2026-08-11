@@ -8,9 +8,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use cella_wayland::{
-    ClipboardSource, MAX_CLIPBOARD_SIZE, ServerHandle, SourceError, WaylandClipboardServer,
-};
+use cella_protocol::MAX_CLIPBOARD_SIZE;
+use cella_wayland::{ClipboardSource, ServerHandle, SourceError, WaylandClipboardServer};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -78,10 +77,15 @@ fn parse_targets_response(raw: &[u8]) -> Vec<String> {
 /// Whether this container was created with cella's clipboard socket enabled.
 ///
 /// `settings.clipboard.wayland` lives on the host, and the agent never sees the
-/// config — `WAYLAND_DISPLAY` is the only channel. Requiring it to match the
-/// socket path exactly means turning the setting off actually stops the socket
-/// being served, rather than only hiding it, and it leaves a container that
-/// points at some other compositor alone.
+/// config — `WAYLAND_DISPLAY` is the only channel. Matching it against the
+/// socket path exactly means a container created with the setting off never
+/// serves the endpoint at all, rather than merely hiding it, and it leaves a
+/// container pointed at some other compositor alone.
+///
+/// Reads the setting as it was *at container create time*, which is the only
+/// thing the agent can see: Docker env is immutable afterwards, so flipping the
+/// setting and re-running `cella up` without a recreate leaves the socket as it
+/// was — the same rebuild-required behaviour as every other baked-in env var.
 fn should_serve(display_env: Option<&str>) -> bool {
     display_env == Some(cella_protocol::WAYLAND_CLIPBOARD_SOCKET)
 }
