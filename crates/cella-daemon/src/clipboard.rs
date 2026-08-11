@@ -264,12 +264,64 @@ impl ClipboardBackend for XclipBackend {
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        if mime_type == "TARGETS" {
+            let output = run_command(
+                "xclip",
+                &["-selection", "clipboard", "-target", "TARGETS", "-o"],
+            )?;
+            return Ok((x11_targets_to_mimes(&output), "text/plain".to_string()));
+        }
         let output = run_command(
             "xclip",
             &["-selection", "clipboard", "-target", mime_type, "-o"],
         )?;
         Ok((output, mime_type.to_string()))
     }
+}
+
+/// Turns X11 selection target atoms into the mime-type list the agent expects.
+///
+/// `xclip -target TARGETS -o` answers with X11 atoms, which are not mime types:
+/// alongside real ones like `image/png` it lists protocol machinery
+/// (`TIMESTAMP`, `MULTIPLE`, `SAVE_TARGETS`) and legacy text atoms
+/// (`UTF8_STRING`, `STRING`). Passing those straight through would have the
+/// Wayland bridge advertise `TIMESTAMP` as an offerable type, and a client that
+/// takes the first offer would paste binary junk.
+fn x11_targets_to_mimes(raw: &[u8]) -> Vec<u8> {
+    /// X11 protocol machinery — never a payload.
+    const PSEUDO: [&str; 4] = ["TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS"];
+    /// Legacy text atoms, all of which mean "plain text" to a mime-type client.
+    const TEXT_ATOMS: [&str; 5] = [
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+        "COMPOUND_TEXT",
+        "TEXT/PLAIN",
+    ];
+
+    let mut mimes: Vec<String> = Vec::new();
+    let mut push = |mime: String| {
+        if !mimes.contains(&mime) {
+            mimes.push(mime);
+        }
+    };
+    for atom in String::from_utf8_lossy(raw).lines().map(str::trim) {
+        if atom.is_empty() || PSEUDO.contains(&atom) {
+            continue;
+        }
+        if TEXT_ATOMS.contains(&atom.to_uppercase().as_str()) {
+            push("text/plain".to_string());
+        } else if atom.contains('/') {
+            push(atom.to_string());
+        }
+        // Anything else is an application-specific atom with no mime meaning.
+    }
+    let mut out = String::from("TARGETS\n");
+    for mime in mimes {
+        out.push_str(&mime);
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 struct Osc52Backend;
@@ -337,6 +389,36 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: `XclipBackend` was the one backend with no `TARGETS` branch,
+    /// so raw X11 atoms reached the agent and the Wayland bridge advertised
+    /// `TIMESTAMP`/`MULTIPLE` as offerable mime types. A client taking the
+    /// first offer would then paste binary junk.
+    #[test]
+    fn x11_targets_drop_pseudo_atoms_and_normalize_text() {
+        let raw = b"TIMESTAMP\nTARGETS\nMULTIPLE\nSAVE_TARGETS\nUTF8_STRING\nCOMPOUND_TEXT\nSTRING\ntext/plain\nimage/png\n";
+        assert_eq!(
+            String::from_utf8(x11_targets_to_mimes(raw)).unwrap(),
+            "TARGETS\ntext/plain\nimage/png\n"
+        );
+    }
+
+    #[test]
+    fn x11_targets_drop_application_specific_atoms() {
+        let raw = b"TARGETS\n_SOME_APP_ATOM\nimage/png\n";
+        assert_eq!(
+            String::from_utf8(x11_targets_to_mimes(raw)).unwrap(),
+            "TARGETS\nimage/png\n"
+        );
+    }
+
+    #[test]
+    fn x11_targets_on_an_empty_clipboard_list_nothing() {
+        assert_eq!(
+            String::from_utf8(x11_targets_to_mimes(b"TARGETS\nTIMESTAMP\n")).unwrap(),
+            "TARGETS\n"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

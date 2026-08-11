@@ -17,6 +17,22 @@ use serde::{Deserialize, Serialize};
 /// message; with it, the mismatch is rejected cleanly at the handshake.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Absolute path of the Wayland clipboard socket served by the in-container agent.
+///
+/// Baked into `WAYLAND_DISPLAY` at container create time, so it must stay
+/// deterministic — Docker env vars are immutable after creation and no runtime
+/// fallback is possible. `/tmp` is the one location guaranteed to exist and be
+/// writable however the agent was launched.
+pub const WAYLAND_CLIPBOARD_SOCKET: &str = "/tmp/cella/wayland-0";
+
+/// Largest clipboard payload carried by `ClipboardCopy`/`ClipboardPaste`.
+///
+/// A bound on the agent↔daemon RPC, not on any one front end: the `/cella/bin`
+/// shims and the Wayland socket both enforce it, so they can never disagree
+/// about what fits. Lives here rather than in either front end because the
+/// shims predate the socket and have nothing to do with Wayland.
+pub const MAX_CLIPBOARD_SIZE: usize = 10 * 1024 * 1024;
+
 /// Which forwarded Claude Code document a sync message or codec call refers to.
 ///
 /// All three are gated by the single `AgentHello.claude_config_sync` opt-in:

@@ -1,16 +1,22 @@
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use base64::Engine;
 use cella_port::CellaPortError;
-use cella_protocol::{AgentMessage, DaemonMessage};
+use cella_protocol::{AgentMessage, DaemonMessage, MAX_CLIPBOARD_SIZE};
 use tracing::{debug, warn};
 
 use crate::control::ControlClient;
 
-const MAX_CLIPBOARD_SIZE: usize = 10 * 1024 * 1024;
 const DEFAULT_MIME_TYPE: &str = "text/plain";
 
-#[cfg_attr(test, derive(Debug))]
+/// Ceiling on one clipboard round trip to the host daemon.
+///
+/// Without this a wedged `osascript` on the host hangs `xclip -o` in the
+/// container forever, and the Wayland server would inherit the same stall.
+pub const CLIPBOARD_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum ClipboardOp {
     Copy { mime_type: String },
     Paste { mime_type: String },
@@ -196,10 +202,28 @@ async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), Cella
     }
 }
 
-async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPortError> {
+pub async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
+    crate::control::with_timeout(
+        "clipboard copy",
+        CLIPBOARD_RPC_TIMEOUT,
+        send_clipboard_copy_at(&addr, &token, data, mime_type),
+    )
+    .await
+}
+
+/// The transport half of a copy, with the daemon address injected.
+///
+/// Split out from [`send_clipboard_copy`] so tests can point it at a listener
+/// that never answers, which is the only way to exercise the timeout.
+async fn send_clipboard_copy_at(
+    addr: &str,
+    token: &str,
+    data: &[u8],
+    mime_type: &str,
+) -> Result<(), CellaPortError> {
     let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
-    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token, true).await?;
+    let (mut client, _hello) = ControlClient::connect(addr, &name, token, true).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     let msg = AgentMessage::ClipboardCopy {
         data: encoded,
@@ -208,10 +232,24 @@ async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPo
     client.send(&msg).await
 }
 
-async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortError> {
+pub async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
+    crate::control::with_timeout(
+        "clipboard paste",
+        CLIPBOARD_RPC_TIMEOUT,
+        request_clipboard_paste_at(&addr, &token, mime_type),
+    )
+    .await
+}
+
+/// The transport half of a paste, with the daemon address injected.
+async fn request_clipboard_paste_at(
+    addr: &str,
+    token: &str,
+    mime_type: &str,
+) -> Result<Vec<u8>, CellaPortError> {
     let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
-    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token, true).await?;
+    let (mut client, _hello) = ControlClient::connect(addr, &name, token, true).await?;
     let msg = AgentMessage::ClipboardPaste {
         mime_type: Some(mime_type.to_string()),
     };
@@ -233,6 +271,95 @@ async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener that accepts and then never answers the handshake.
+    ///
+    /// Deliberately a real socket rather than a blackhole address: routing
+    /// differs per machine, and an instant `EHOSTUNREACH` would fail this test
+    /// for the wrong reason. Here the timeout is the only thing that can fire.
+    async fn silent_daemon() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn paste_against_a_silent_daemon_times_out() {
+        let addr = silent_daemon().await;
+        let start = std::time::Instant::now();
+        let err = crate::control::with_timeout(
+            "clipboard paste",
+            CLIPBOARD_RPC_TIMEOUT,
+            request_clipboard_paste_at(&addr, "token", "text/plain"),
+        )
+        .await
+        .expect_err("must not hang");
+        assert!(
+            start.elapsed() < CLIPBOARD_RPC_TIMEOUT * 2,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn copy_against_a_silent_daemon_times_out() {
+        let addr = silent_daemon().await;
+        let start = std::time::Instant::now();
+        let err = crate::control::with_timeout(
+            "clipboard copy",
+            CLIPBOARD_RPC_TIMEOUT,
+            send_clipboard_copy_at(&addr, "token", b"data", "text/plain"),
+        )
+        .await
+        .expect_err("must not hang");
+        assert!(
+            start.elapsed() < CLIPBOARD_RPC_TIMEOUT * 2,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    // Claude Code shells out to these exact invocations rather than speaking
+    // the Wayland protocol, so the shims — not the socket — are what it
+    // depends on. Pinned here so a future refactor of the arg parsers cannot
+    // break it silently.
+
+    #[test]
+    fn parses_claude_code_targets_probe() {
+        let args = ["-selection", "clipboard", "-t", "TARGETS", "-o"].map(String::from);
+        assert_eq!(
+            parse_xclip_args(&args),
+            ClipboardOp::Paste {
+                mime_type: "TARGETS".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_claude_code_image_fetch() {
+        let args = ["-selection", "clipboard", "-t", "image/png", "-o"].map(String::from);
+        assert_eq!(
+            parse_xclip_args(&args),
+            ClipboardOp::Paste {
+                mime_type: "image/png".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_claude_code_wl_paste_fallbacks() {
+        assert!(parse_wl_paste_args(&["-l".to_string()]).list_types);
+        assert_eq!(
+            parse_wl_paste_args(&["--type".to_string(), "image/png".to_string()]).mime_type,
+            "image/png"
+        );
+    }
 
     #[test]
     fn parse_xsel_defaults_to_output() {

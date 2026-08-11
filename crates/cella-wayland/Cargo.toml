@@ -1,0 +1,28 @@
+[package]
+name = "cella-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cella-protocol.workspace = true
+rustix = { workspace = true, features = ["process"] }
+thiserror.workspace = true
+tracing.workspace = true
+wayland-protocols = { workspace = true, features = ["server", "staging"] }
+wayland-protocols-wlr = { workspace = true, features = ["server"] }
+wayland-server.workspace = true
+
+[dev-dependencies]
+wayland-client.workspace = true
+wayland-protocols = { workspace = true, features = ["client"] }
+wl-clipboard-rs.workspace = true
+
+[lints]
+workspace = true
+
+# `arboard` drives tests/arboard_client.rs, which is Linux-only: it exercises a
+# Wayland endpoint and uses arboard's `SetExtLinux`. Keeping it off the macOS
+# build means the workspace clippy job there never compiles it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }

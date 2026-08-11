@@ -17,6 +17,7 @@ cella-network.workspace = true
 cella-port.workspace = true
 miette.workspace = true
 cella-protocol.workspace = true
+cella-wayland.workspace = true
 nix.workspace = true
 notify.workspace = true
 rcgen.workspace = true
@@ -39,6 +40,10 @@ tokio-stream.workspace = true
 [dev-dependencies]
 divan.workspace = true
 tempfile.workspace = true
+
+# Only the Linux-gated live clipboard round trip uses arboard.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
 
 [[bench]]
 name = "frame_payload"
