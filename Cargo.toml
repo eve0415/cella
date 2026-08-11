@@ -176,6 +176,8 @@ zeroize = "=1.9.0"
 # wayland-backend's pure-Rust server is the default; `server_system` (libwayland)
 # is opt-in, so nothing here adds a C dependency to the static agent binary.
 wayland-server = "=0.31.14"
+# epoll for the server loop; already in the tree via wayland-backend.
+rustix = { version = "=1.1.4", features = ["event"] }
 wayland-protocols = "=0.32.13"
 wayland-protocols-wlr = "=0.3.12"
 
