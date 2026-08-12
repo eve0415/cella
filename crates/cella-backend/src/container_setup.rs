@@ -509,7 +509,97 @@ pub async fn inject_cella_path(
         &[".bashrc", ".zshrc"],
     )
     .await;
+    // Completions are versioned rather than additive: a changed snippet must
+    // replace the old block, not sit beside it. Same profiles as TITLE_SNIPPETS
+    // — dash reads `.profile` and has no completion system to feed.
+    inject_managed_block(
+        client,
+        container_id,
+        &home,
+        COMPLETION_SNIPPETS,
+        &[".bashrc", ".zshrc"],
+    )
+    .await;
 }
+
+/// Append a snippet, first deleting any earlier version of the same block.
+///
+/// [`inject_snippets`] is purely additive — its guard means "already present,
+/// leave it alone", so a container that has an old block never gets the new
+/// one. This variant guards on the *versioned* opening marker and, when it does
+/// not match, deletes everything between the unversioned start and end markers
+/// before appending. Bumping the version in the guard therefore replaces the
+/// block in every existing container.
+///
+/// Best-effort, like its sibling: on an image whose `sed` lacks `-i` the delete
+/// fails, the append still runs behind the same `grep` guard, and the result is
+/// the additive behaviour we had before. Errors are discarded either way.
+async fn inject_managed_block(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    home: &str,
+    snippets: &[(&str, &str)],
+    profiles: &[&str],
+) {
+    for (guard, snippet) in snippets {
+        for profile in profiles {
+            let cmd = managed_block_command(&format!("{home}/{profile}"), guard, snippet);
+            let _ = client
+                .exec_command(
+                    container_id,
+                    &ExecOptions {
+                        cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
+                        user: Some("root".to_string()),
+                        working_dir: None,
+                        env: None,
+                    },
+                )
+                .await;
+        }
+    }
+}
+
+/// The `sh -c` program [`inject_managed_block`] runs against one profile.
+///
+/// Split out so the shell logic can be exercised against real files instead of
+/// only read — the delete-then-append sequence is the part that can corrupt an
+/// rc file if it is wrong.
+fn managed_block_command(path: &str, guard: &str, snippet: &str) -> String {
+    format!(
+        "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
+         sed -i '/{start}/,/{end}/d' '{path}' 2>/dev/null; \
+         printf '%s\\n' '{escaped}' >> '{path}'; fi",
+        start = COMPLETION_BLOCK_START_PATTERN,
+        end = COMPLETION_BLOCK_END_PATTERN,
+        escaped = snippet.replace('\'', "'\\''"),
+    )
+}
+
+/// `sed` address matching the opening marker of *any* version of the block.
+const COMPLETION_BLOCK_START_PATTERN: &str = "# >>> cella shell completion";
+/// `sed` address matching the closing marker.
+const COMPLETION_BLOCK_END_PATTERN: &str = "# <<< cella shell completion";
+
+/// Source the generated completion scripts from the shells that have one.
+///
+/// The snippet is as thin as physically possible, and that is architectural.
+/// Even with a versioned guard, the block in a given container is rewritten
+/// only when the version changes; the script files under `/cella/share` are
+/// replaced wholesale on every volume repopulation. So all logic — including
+/// zsh's `compinit` guard — belongs in the versioned files, and this holds
+/// nothing but shell detection and a `.`.
+const COMPLETION_SNIPPETS: &[(&str, &str)] = &[(
+    "# >>> cella shell completion v1 >>>",
+    r#"
+# >>> cella shell completion v1 >>>
+if [ -n "$BASH_VERSION" ]; then
+    [ -r /cella/share/completions/cella.bash ] && . /cella/share/completions/cella.bash
+elif [ -n "$ZSH_VERSION" ]; then
+    [ -r /cella/share/completions/cella.zsh ] && . /cella/share/completions/cella.zsh
+fi
+# <<< cella shell completion <<<
+"#,
+)];
 
 const PATH_SNIPPETS: &[(&str, &str)] = &[
     (
@@ -715,6 +805,210 @@ mod tests {
             "TITLE_SNIPPETS must be valid bash syntax: {}",
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    // ── COMPLETION_SNIPPETS ───────────────────────────────────────────────
+
+    fn shell_parses(shell: &str, snippet: &str) -> Result<(), String> {
+        let output = std::process::Command::new(shell)
+            .args(["-n", "-c", snippet])
+            .output()
+            .map_err(|e| format!("{shell} must be available: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    #[test]
+    fn completion_snippet_is_valid_bash() {
+        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        shell_parses("bash", snippet).expect("COMPLETION_SNIPPETS must be valid bash");
+    }
+
+    #[test]
+    fn completion_snippet_is_valid_zsh() {
+        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        shell_parses("zsh", snippet).expect("COMPLETION_SNIPPETS must be valid zsh");
+    }
+
+    /// The block is replaced rather than skipped when it changes, which only
+    /// works if the guard carries a version to compare against.
+    #[test]
+    fn completion_guard_is_versioned() {
+        assert!(COMPLETION_SNIPPETS[0].0.contains("v1"));
+    }
+
+    /// `inject_managed_block` deletes from the opening marker to the closing
+    /// one, so both must be present and the guard must be the opening marker.
+    #[test]
+    fn completion_snippet_is_delimited_by_its_guard() {
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        assert!(snippet.contains(guard), "snippet must open with its guard");
+        assert!(
+            snippet.contains(COMPLETION_BLOCK_END_PATTERN),
+            "snippet must close with the end marker"
+        );
+    }
+
+    /// The snippet only sources; every piece of logic lives in the files under
+    /// `/cella/share`, which are replaced on every volume repopulation. A block
+    /// already written into an rc file is only rewritten when its version bumps.
+    #[test]
+    fn completion_snippet_sources_both_generated_scripts() {
+        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        assert!(snippet.contains("/cella/share/completions/cella.bash"));
+        assert!(snippet.contains("/cella/share/completions/cella.zsh"));
+        // `-r`, not `-f`: volume population failures are warned and tolerated,
+        // so an unreadable path must be a no-op rather than an error.
+        assert!(snippet.contains("[ -r "), "must guard on readability");
+    }
+
+    /// The whole point of the versioned guard: run the real `sh` program
+    /// against real files and check what lands in them.
+    fn run_injection(rc: &std::path::Path, guard: &str, snippet: &str) {
+        let cmd = managed_block_command(&rc.to_string_lossy(), guard, snippet);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .status()
+            .expect("sh must be available");
+        assert!(status.success(), "injection command failed: {cmd}");
+    }
+
+    fn blocks_in(rc: &std::path::Path) -> usize {
+        std::fs::read_to_string(rc)
+            .unwrap()
+            .matches(COMPLETION_BLOCK_START_PATTERN)
+            .count()
+    }
+
+    #[test]
+    fn injection_appends_then_stays_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(&rc, "export EDITOR=vi\n").unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+        assert_eq!(blocks_in(&rc), 1, "first run must append the block");
+
+        run_injection(&rc, guard, snippet);
+        assert_eq!(blocks_in(&rc), 1, "same version must not append again");
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert!(after.starts_with("export EDITOR=vi\n"), "{after}");
+        assert!(
+            after.contains("/cella/share/completions/cella.bash"),
+            "{after}"
+        );
+    }
+
+    /// A bumped version must *replace* the old block, not stack a second one —
+    /// the failure `inject_snippets`' additive guard cannot avoid.
+    #[test]
+    fn injection_replaces_an_older_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        let old = "# >>> cella shell completion v0 >>>\nold_and_wrong\n# <<< cella shell completion <<<\n";
+        std::fs::write(&rc, format!("export EDITOR=vi\n{old}alias l=ls\n")).unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert_eq!(blocks_in(&rc), 1, "exactly one block must remain: {after}");
+        assert!(
+            !after.contains("old_and_wrong"),
+            "old block survived: {after}"
+        );
+        assert!(after.contains("v1"), "new block missing: {after}");
+        assert!(
+            after.contains("export EDITOR=vi"),
+            "clobbered the file: {after}"
+        );
+        assert!(after.contains("alias l=ls"), "clobbered the file: {after}");
+    }
+
+    /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
+    /// container gets no PATH block either, so `cella` is not on PATH there.
+    #[test]
+    fn injection_skips_a_missing_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        assert!(!rc.exists(), "must not create the profile");
+    }
+
+    /// Assumption 2's fallback: on an image whose `sed` cannot edit in place the
+    /// delete fails, the append still runs, and the result degrades to exactly
+    /// the additive behaviour `inject_snippets` already has — the stale block
+    /// survives beside the new one. Never a corrupted or truncated file.
+    ///
+    /// Seeding a stale block first is what makes this test able to tell the
+    /// stub `sed` from the real one: with a working `sed` the answer is one
+    /// block, with a broken one it is two.
+    #[test]
+    fn a_sed_without_in_place_editing_degrades_to_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let stub = bin.join("sed");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'sed: unrecognized option -i' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x", &stub.to_string_lossy()])
+            .status()
+            .unwrap();
+
+        let rc = dir.path().join(".bashrc");
+        let stale =
+            "# >>> cella shell completion v0 >>>\nstale\n# <<< cella shell completion <<<\n";
+        std::fs::write(&rc, format!("export EDITOR=vi\n{stale}")).unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        let cmd = managed_block_command(&rc.to_string_lossy(), guard, snippet);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            // Prepended, not replaced: `sh`, `grep` and `printf` must still
+            // resolve — only `sed` is shadowed.
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .status()
+            .expect("sh must be available");
+        assert!(status.success(), "a broken sed must not fail the command");
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert_eq!(
+            blocks_in(&rc),
+            2,
+            "the stub sed must have been used, leaving both blocks: {after}"
+        );
+        assert!(after.contains("stale"), "stale block must survive: {after}");
+        assert!(after.contains("v1"), "new block must be appended: {after}");
+        assert!(
+            after.contains("export EDITOR=vi"),
+            "clobbered the file: {after}"
+        );
+    }
+
+    #[test]
+    fn completion_snippets_have_unique_guards() {
+        let guards: Vec<&str> = PATH_SNIPPETS
+            .iter()
+            .chain(TITLE_SNIPPETS)
+            .chain(COMPLETION_SNIPPETS)
+            .map(|(g, _)| *g)
+            .collect();
+        let unique: std::collections::HashSet<&str> = guards.iter().copied().collect();
+        assert_eq!(guards.len(), unique.len(), "guards must not collide");
     }
 
     // ── map_env_object ───────────────────────────────────────────────────
