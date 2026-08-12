@@ -86,3 +86,64 @@ fn a_completion_request_returns_real_candidates() {
         "`cella image <TAB>` must offer `update`, got {nested:?}"
     );
 }
+
+/// The same byte-identity check, but with `cella` invoked as a bare name off
+/// `PATH` — which is how every real installation runs it.
+///
+/// `completer_path()` reproduces a `clap_complete` internal, and that
+/// duplication is only licensed by a test that compares the two ends. The
+/// comparison above cannot cover the bare-name branch: `CARGO_BIN_EXE_cella` is
+/// absolute, so `components().count() > 1` always holds and the cwd-join branch
+/// is always the one taken. Copying the binary somewhere else does not help —
+/// that path is still multi-component. Only going through a shell, so argv[0]
+/// is literally `cella`, exercises the other half.
+#[test]
+fn a_bare_name_invocation_emits_the_same_hook() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let on_path = dir.path().join("cella");
+    std::fs::copy(env!("CARGO_BIN_EXE_cella"), &on_path).expect("copy cella");
+
+    let run = |script: &str| -> String {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env_remove("CELLA_COMPLETE")
+            // A predictable cwd, so a cwd-join regression shows up as a diff
+            // rather than as an unstable string.
+            .current_dir(dir.path())
+            .output()
+            .expect("run sh");
+        assert!(
+            out.status.success(),
+            "`{script}` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("UTF-8")
+    };
+
+    for shell in clap_complete::env::Shells::builtins().names() {
+        let via_sub = run(&format!("cella completion {shell}"));
+        let via_env = run(&format!("CELLA_COMPLETE={shell} cella"));
+        assert_eq!(
+            via_env, via_sub,
+            "bare-name entry points must agree for {shell}"
+        );
+        assert!(
+            via_sub.contains("\"cella\"")
+                || via_sub.contains("'cella'")
+                || via_sub.contains(" cella "),
+            "the hook must invoke the bare name, not an absolute path:\n{via_sub}"
+        );
+        assert!(
+            !via_sub.contains(&dir.path().display().to_string()),
+            "a bare-name invocation must not bake an absolute path into the hook:\n{via_sub}"
+        );
+    }
+}
