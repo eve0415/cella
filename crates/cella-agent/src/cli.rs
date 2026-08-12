@@ -273,7 +273,7 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
                         eprintln!(
                             "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
                         );
-                        return CliCommand::Help;
+                        return CliCommand::UsageError;
                     }
                     labels.push(val.clone());
                     i += 2;
@@ -390,7 +390,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                         eprintln!(
                             "Error: --timeout requires a value in seconds (e.g., --timeout 300)"
                         );
-                        return CliCommand::Help;
+                        return CliCommand::UsageError;
                     }
                 } else if args[i].starts_with('-') {
                     eprintln!("Error: unknown flag '{}' for task run command", args[i]);
@@ -671,9 +671,13 @@ fn write_subcommand_entry(
         .map_or_else(|| synopsis.clone(), |rest| rest.trim_start().to_owned());
     writeln!(out, "  {leaf}")?;
     writeln!(out, "      {}", sub.about)?;
-    for opt in sub.options.iter().filter(|o| o.long != "--help") {
-        writeln!(out, "      {:22}  {}", option_label(opt), opt.help)?;
-    }
+    let rows: Vec<(String, &'static str)> = sub
+        .options
+        .iter()
+        .filter(|o| o.long != "--help")
+        .map(|opt| (format!("    {}", option_label(opt)), opt.help))
+        .collect();
+    write_table(out, &rows)?;
     writeln!(out)
 }
 
@@ -1971,6 +1975,29 @@ mod tests {
         }
     }
 
+    /// Every path that prints an `Error:` must exit non-zero, not just the ones
+    /// the first sweep happened to reach — two multi-line `eprintln!`s were
+    /// missed, so `--timeout abc` printed an error and still exited 0.
+    #[test]
+    fn every_reported_misuse_exits_non_zero() {
+        let cases: &[&[&str]] = &[
+            &["cella", "list", "--jsno"],
+            &["cella", "task", "run", "b", "--timeout", "abc", "--", "x"],
+            &["cella", "branch", "b", "--label", "dev.cella.x=1"],
+            &["cella", "branch", "b", "--base"],
+            &["cella", "down", "b", "--volumes"],
+            &["cella", "prune", "--older-than"],
+            &["cella", "up", "b", "--bogus"],
+        ];
+        for argv in cases {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            assert!(
+                matches!(parse_cli_args(&owned), CliCommand::UsageError),
+                "{argv:?} must be a usage error, not a zero-exit help"
+            );
+        }
+    }
+
     /// The concrete regression: a typo'd flag used to parse as a plain `list`
     /// and silently produce non-JSON output.
     #[test]
@@ -2433,7 +2460,7 @@ mod tests {
         .map(ToString::to_string)
         .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]

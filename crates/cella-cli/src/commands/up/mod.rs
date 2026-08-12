@@ -2169,7 +2169,8 @@ pub async fn inject_post_start(
     .await;
 }
 
-/// Add `/cella/bin` to PATH in the container's shell profile.
+/// Install cella's shell integration (PATH, terminal title, completions) into
+/// the container's shell profiles.
 async fn inject_shell_integration(
     client: &dyn ContainerBackend,
     container_id: &str,

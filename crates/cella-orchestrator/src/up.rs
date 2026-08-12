@@ -447,7 +447,7 @@ impl EnsureUpContext<'_> {
         // Only seed when the container was NOT created by cella. Cella-managed
         // containers already have these files; overwriting them would clear the
         // real oncreate state and reset the content-hash gate.
-        if container.labels.contains_key("dev.cella.workspace_path") {
+        if is_cella_managed(container) {
             return;
         }
 
@@ -2439,7 +2439,8 @@ fn append_extra_mounts(
 /// Whether cella created this container, rather than attaching to one made by
 /// VS Code or the official devcontainer CLI.
 ///
-/// Same label `seed_external_lifecycle_markers` keys on. It gates rewriting the
+/// Shared with `seed_external_lifecycle_markers`, which needs the same
+/// distinction for the opposite reason. It gates rewriting the
 /// container's shell profiles: healing a container cella owns is the point, but
 /// a container the user merely pointed cella at once should not come away with
 /// cella blocks in its rc files — they would outlive cella's involvement, and

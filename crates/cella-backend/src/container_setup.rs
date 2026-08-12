@@ -464,6 +464,7 @@ struct ManagedBlock {
 /// for [`PATH_SNIPPETS`] and [`TITLE_SNIPPETS`], whose bodies are stable, and
 /// is why completions use [`managed_block_command`] instead.
 fn append_if_absent_command(path: &str, guard: &str, snippet: &str) -> String {
+    let path = shell_single_quote_escape(path);
     format!(
         "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
          printf '%s\\n' '{escaped}' >> '{path}'; fi",
@@ -598,6 +599,7 @@ const STRIP_BLOCK_AWK: &str = concat!(
 /// If `awk` is missing the command substitution fails, the `if` skips the
 /// rewrite, and the append still happens — degrading to purely additive.
 fn managed_block_command(path: &str, block: &ManagedBlock) -> String {
+    let path = shell_single_quote_escape(path);
     format!(
         "if [ -f '{path}' ] \
          && ! {{ grep -q '{guard}' '{path}' && grep -q '{end}' '{path}'; }}; then \
@@ -614,6 +616,10 @@ fn managed_block_command(path: &str, block: &ManagedBlock) -> String {
 }
 
 /// Escape `'` so a value can sit inside single quotes in a POSIX shell string.
+///
+/// Applies to the *paths* as well as the bodies: `home` is built from
+/// `remote_user`, which comes verbatim out of a repo's devcontainer.json with no
+/// charset validation, and the program it lands in runs as root.
 fn shell_single_quote_escape(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
@@ -633,12 +639,20 @@ const COMPLETION_BLOCKS: &[ManagedBlock] = &[ManagedBlock {
     start: "# >>> cella shell completion",
     end: "# <<< cella shell completion",
     profiles: &[".bashrc", ".zshrc"],
+    // `if` rather than `[ -r … ] && .` — the block is the last thing in the rc
+    // file, so a false `&&` would leave `$?` = 1 in every interactive shell
+    // whose container has no completion scripts, and prompts that render the
+    // last exit status would show a permanent error.
     body: r#"
 # >>> cella shell completion v1 >>>
 if [ -n "$BASH_VERSION" ]; then
-    [ -r /cella/share/completions/cella.bash ] && . /cella/share/completions/cella.bash
+    if [ -r /cella/share/completions/cella.bash ]; then
+        . /cella/share/completions/cella.bash
+    fi
 elif [ -n "$ZSH_VERSION" ]; then
-    [ -r /cella/share/completions/cella.zsh ] && . /cella/share/completions/cella.zsh
+    if [ -r /cella/share/completions/cella.zsh ]; then
+        . /cella/share/completions/cella.zsh
+    fi
 fi
 # <<< cella shell completion <<<
 "#,
@@ -898,8 +912,8 @@ mod tests {
         assert!(COMPLETION_BLOCKS[0].guard.contains("v1"));
     }
 
-    /// `inject_managed_block` deletes from the opening marker to the closing
-    /// one, so both must be present and the guard must be the opening marker.
+    /// `managed_block_command` strips from the opening marker to the closing
+    /// one, so both must be present and the guard must extend the opening one.
     #[test]
     fn completion_snippet_is_delimited_by_its_guard() {
         let block = &COMPLETION_BLOCKS[0];
@@ -928,6 +942,54 @@ mod tests {
         // `-r`, not `-f`: volume population failures are warned and tolerated,
         // so an unreadable path must be a no-op rather than an error.
         assert!(snippet.contains("[ -r "), "must guard on readability");
+    }
+
+    /// The block is the last thing in the rc file. If it ends on a false test,
+    /// every interactive shell in a container without the completion scripts
+    /// starts with `$?` = 1, and any prompt showing the last status shows an
+    /// error the user cannot explain.
+    #[test]
+    fn the_completion_block_leaves_a_clean_exit_status() {
+        let body = COMPLETION_BLOCKS[0]
+            .body
+            .replace("/cella/share/completions", "/nonexistent");
+        for shell in ["bash", "zsh", "sh"] {
+            let out = std::process::Command::new(shell)
+                .args(["-c", &format!("{body}\nexit $?")])
+                .status()
+                .unwrap_or_else(|e| panic!("{shell} must be available: {e}"));
+            assert!(
+                out.success(),
+                "{shell}: a missing completion script must leave $? = 0"
+            );
+        }
+    }
+
+    /// `remote_user` is read verbatim from a repo's devcontainer.json and ends
+    /// up inside single quotes in a program that runs as root. A quote in it
+    /// must terminate as data, not close the quoting and start a command.
+    #[test]
+    fn a_quote_in_the_home_path_cannot_break_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        // The shape a malicious `"remoteUser"` would take.
+        let hostile = format!(
+            "{}/x'; touch '{}'; '",
+            dir.path().display(),
+            marker.display()
+        );
+
+        let program = shell_integration_program(&hostile);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &program])
+            .status()
+            .expect("sh must be available");
+
+        assert!(status.success(), "program must still parse: {program}");
+        assert!(
+            !marker.exists(),
+            "injected command executed — the path was not escaped:\n{program}"
+        );
     }
 
     /// The batched program is what actually runs in the container: every block,
@@ -1057,7 +1119,7 @@ mod tests {
     }
 
     /// A bumped version must *replace* the old block, not stack a second one —
-    /// the failure `inject_snippets`' additive guard cannot avoid.
+    /// the failure an additive guard cannot avoid.
     #[test]
     fn injection_replaces_an_older_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -1295,7 +1357,7 @@ mod tests {
 
     /// Fallback on an image with no usable `awk`: the strip cannot run, the
     /// append still does, and the result degrades to exactly the additive
-    /// behaviour `inject_snippets` already has — the stale block survives
+    /// behaviour `append_if_absent_command` already has — the stale block survives
     /// beside the new one. Never a corrupted, truncated, or emptied file.
     ///
     /// Seeding a stale block first is what makes this test able to tell the
