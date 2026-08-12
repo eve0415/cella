@@ -7,7 +7,7 @@ use miette::IntoDiagnostic as _;
 
 use cella_oci::{TagCache, TagSource};
 
-use super::candidates::{self, AxisSet, Candidates};
+use super::candidates::{self, AxisSet, Candidates, Limitation};
 use super::jsonc_edit;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
 use crate::commands::{OutputFormat, boxed_err_to_report};
@@ -488,6 +488,9 @@ fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
             "current": found.current,
             "versionBump": found.version_bump,
             "pin": found.pin,
+            // The CI path is exactly where silently accepting a shortened
+            // list costs something, so the degradation travels with it.
+            "limitation": found.limitation.as_ref().map(Limitation::message),
             "moves": moves,
         }
     }))
@@ -730,6 +733,7 @@ mod tests {
         assert_eq!(value["image"]["moves"][0]["to"], "trixie");
         assert_eq!(value["image"]["moves"][0]["axes"][0], "release");
         assert_eq!(value["image"]["pin"], serde_json::Value::Null);
+        assert_eq!(value["image"]["limitation"], serde_json::Value::Null);
     }
 
     /// `--yes` may take a move only when every axis it changes is allowed.
@@ -856,6 +860,28 @@ mod tests {
                 .as_deref(),
             Some("5.0.3-24-trixie")
         );
+    }
+
+    /// A `--output json` consumer is the one most likely to accept a short
+    /// list without noticing, so the degradation has to reach it too.
+    #[test]
+    fn json_carries_the_degradation_message() {
+        let found = Candidates {
+            current: "5.0.3-trixie".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: Vec::new(),
+            limitation: Some(Limitation::UnresolvedAlias("5.0.3-trixie".to_owned())),
+        };
+        let rendered = render_json("mcr.microsoft.com/devcontainers/typescript-node", &found)
+            .expect("json must render");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        let message = value["image"]["limitation"]
+            .as_str()
+            .expect("the limitation must survive into json");
+        assert!(message.contains("5.0.3-trixie"), "got: {message}");
+        assert!(message.contains("could not resolve"), "got: {message}");
     }
 
     #[test]

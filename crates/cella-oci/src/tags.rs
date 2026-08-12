@@ -628,6 +628,45 @@ mod tests {
         }
     }
 
+    /// `cella init`'s pin wizard passes a template's `imageVariant` proposal
+    /// straight into `pinnable_tags`, so what this returns is what the wizard
+    /// offers. Guarded here because nothing else in the tree asserts it.
+    #[test]
+    fn the_init_wizard_still_gets_offers_for_real_selections() {
+        let rust = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-rust-tags.json"
+        ));
+        let rust_refs: Vec<&str> = rust.iter().map(String::as_str).collect();
+
+        // The plain line still offers, and now stays on its own line: the
+        // revision line `2.0.14-1-trixie` is a different variant.
+        let trixie = pinnable_tags(&rust_refs, "trixie");
+        assert!(
+            !trixie.is_empty(),
+            "a trixie proposal must still offer tags"
+        );
+        assert!(trixie.contains(&"2.0.14-trixie"));
+        assert!(
+            !trixie.iter().any(|t| t.ends_with("-1-trixie")),
+            "a pin stays on its own tag line: {trixie:?}"
+        );
+
+        // The revision line is reachable by proposing it directly.
+        let revision = pinnable_tags(&rust_refs, "1-trixie");
+        assert!(revision.contains(&"2.0.14-1-trixie"), "got {revision:?}");
+
+        // The 1924-tag list, where one release has three spellings. Each is
+        // its own variant and each still offers its own tags.
+        let base = fixture_tags(include_str!("../testdata/mcr-devcontainers-base-tags.json"));
+        let base_refs: Vec<&str> = base.iter().map(String::as_str).collect();
+        for spelling in ["bookworm", "debian-12", "debian12"] {
+            assert!(
+                !pinnable_tags(&base_refs, spelling).is_empty(),
+                "{spelling} must still offer tags to the wizard"
+            );
+        }
+    }
+
     #[test]
     fn pinnable_tags_truncates_to_max() {
         let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)

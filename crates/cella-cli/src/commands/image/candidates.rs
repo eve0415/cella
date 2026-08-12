@@ -299,7 +299,7 @@ fn limitation_for(
     match runtime_of(prefix) {
         Runtime::Opaque(_) => Some(Limitation::UndecomposableVariant),
         Runtime::Alias
-            if alias_runtime.is_none() && has_runtime_siblings(grammar, tags, selection) =>
+            if alias_runtime.is_none() && !probe_candidates(grammar, tags, current).is_empty() =>
         {
             Some(Limitation::UnresolvedAlias(current.to_owned()))
         }
@@ -307,19 +307,46 @@ fn limitation_for(
     }
 }
 
-/// Whether the image publishes explicit-runtime variants alongside this
-/// alias line, i.e. whether a digest probe has anything to compare against.
-fn has_runtime_siblings(grammar: &TagGrammar, tags: &[&str], selection: &str) -> bool {
-    let Some((_, _, release)) = distro_of(selection) else {
-        return false;
+/// The `(runtime, tag)` pairs whose digests would identify which runtime an
+/// alias line points at.
+///
+/// Empty when the pin already names a runtime, when no runtime-ful variant
+/// shares its release, or when none of those variants publishes a tag
+/// comparable with this pin — in each case there is nothing to probe, which
+/// is a different thing from a probe that failed.
+fn probe_candidates(grammar: &TagGrammar, tags: &[&str], current: &str) -> Vec<(String, String)> {
+    let Some(parsed) = grammar.parse(current) else {
+        return Vec::new();
     };
+    let Some((prefix, _, release)) = distro_of(parsed.variant) else {
+        return Vec::new();
+    };
+    if !matches!(runtime_of(prefix), Runtime::Alias) {
+        return Vec::new();
+    }
+
+    let published: BTreeSet<&str> = tags.iter().copied().collect();
     published_variants(grammar, tags)
         .into_iter()
-        .any(|variant| {
-            distro_of(variant).is_some_and(|(prefix, _, candidate_release)| {
-                candidate_release == release && matches!(runtime_of(prefix), Runtime::Explicit(..))
-            })
+        .filter_map(|variant| {
+            let (candidate_prefix, _, candidate_release) = distro_of(variant)?;
+            if candidate_release != release {
+                return None;
+            }
+            let Runtime::Explicit(runtime, _) = runtime_of(candidate_prefix) else {
+                return None;
+            };
+            // Compare like with like: a versioned pin against the same version
+            // on the explicit line, a floating pin against the bare variant.
+            let tag = parsed.version.map_or_else(
+                || variant.to_owned(),
+                |version| format!("{version}-{variant}"),
+            );
+            published
+                .contains(tag.as_str())
+                .then(|| (runtime.to_owned(), tag))
         })
+        .collect()
 }
 
 /// Whether the pin sits on an alias line whose runtime can be identified by
@@ -331,34 +358,7 @@ fn has_runtime_siblings(grammar: &TagGrammar, tags: &[&str], selection: &str) ->
 pub fn alias_probe(tags: &[String], current: &str) -> Option<AliasProbe> {
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
     let grammar = TagGrammar::from_tags(&refs);
-    let parsed = grammar.parse(current)?;
-    let (prefix, _, release) = distro_of(parsed.variant)?;
-    if !matches!(runtime_of(prefix), Runtime::Alias) {
-        return None;
-    }
-
-    let published: std::collections::HashSet<&str> = refs.iter().copied().collect();
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    for variant in published_variants(&grammar, &refs) {
-        let Some((candidate_prefix, _, candidate_release)) = distro_of(variant) else {
-            continue;
-        };
-        if candidate_release != release {
-            continue;
-        }
-        let Runtime::Explicit(runtime, _) = runtime_of(candidate_prefix) else {
-            continue;
-        };
-        // Compare like with like: a versioned pin against the same version on
-        // the explicit line, a floating pin against the bare variant.
-        let tag = parsed.version.map_or_else(
-            || variant.to_owned(),
-            |version| format!("{version}-{variant}"),
-        );
-        if published.contains(tag.as_str()) {
-            candidates.push((runtime.to_owned(), tag));
-        }
-    }
+    let candidates = probe_candidates(&grammar, &refs, current);
 
     (!candidates.is_empty()).then(|| AliasProbe {
         pin: current.to_owned(),
@@ -1020,6 +1020,26 @@ mod tests {
         assert_eq!(
             c.limitation,
             Some(Limitation::UnresolvedAlias("5.0.3-trixie".to_owned()))
+        );
+    }
+
+    /// Regression: the limitation and the probe must agree on whether a probe
+    /// was even possible. `2.0.2-trixie` has runtime-ful siblings published
+    /// (`24-trixie` and friends) but no `2.0.2-24-trixie` to compare against,
+    /// so nothing is probed — and reporting "could not resolve" would be a
+    /// failure notice for something that was never attempted.
+    #[test]
+    fn no_probe_means_no_failure_to_report() {
+        let tags = typescript_node_tags();
+        assert_eq!(
+            alias_probe(&tags, "2.0.2-trixie"),
+            None,
+            "no versioned sibling exists to compare digests against"
+        );
+        assert_eq!(
+            compute(&tags, "2.0.2-trixie", None).unwrap().limitation,
+            None,
+            "a probe that never ran cannot have failed"
         );
     }
 
