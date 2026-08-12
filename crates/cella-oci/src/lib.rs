@@ -22,8 +22,8 @@ pub use limits::{
 pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
 pub use tag_cache::TagCache;
 pub use tags::{
-    FetchedTags, MAX_PINNED_TAGS, TagSource, VersionKey, fetch_image_tags, pinnable_tags,
-    split_tag, version_key,
+    FetchedTags, MAX_PINNED_TAGS, ParsedTag, TagGrammar, TagSource, VersionKey, fetch_image_tags,
+    pinnable_tags, split_tag, version_key,
 };
 
 use oci_client::secrets::RegistryAuth;
