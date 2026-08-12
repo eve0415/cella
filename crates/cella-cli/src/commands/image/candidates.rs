@@ -515,6 +515,14 @@ fn moves_for(
         if current_key.is_some_and(|current| &key < current) {
             continue;
         }
+        // Every offered tag carries a version, so moving off a *floating* pin
+        // freezes it as well as moving it. That is the same lasting change
+        // `pin` is gated on, and it must not ride in on a runtime flag alone.
+        let axes = if current_key.is_none() {
+            axes | AxisSet::SHAPE
+        } else {
+            axes
+        };
         let runtime_rank = match runtime_of(candidate_prefix) {
             Runtime::Explicit(_, key) | Runtime::Resolved(key) => Some(key),
             Runtime::Alias | Runtime::Opaque(_) => None,
@@ -573,13 +581,19 @@ fn runtime_only_moves(
         if current_key.is_some_and(|current| &key < current) {
             continue;
         }
+        // As in `moves_for`: moving off a floating pin also freezes it.
+        let axes = if current_key.is_none() {
+            AxisSet::RUNTIME | AxisSet::SHAPE
+        } else {
+            AxisSet::RUNTIME
+        };
         moves.push((
             target,
             VariantMove {
                 tag: tag.to_owned(),
                 from: selection.to_owned(),
                 to: candidate.to_owned(),
-                axes: AxisSet::RUNTIME,
+                axes,
             },
         ));
     }
@@ -711,6 +725,43 @@ mod tests {
                 "{pin} must be pinned on its own runtime line"
             );
         }
+    }
+
+    /// Regression: every offered tag carries a version, so a move off a
+    /// floating pin freezes it as well as moving it. Labelling such a move
+    /// `runtime`-only let `--yes --allow-runtime-change` turn a tag that
+    /// tracked upstream into a frozen one, which is exactly what `--allow-pin`
+    /// exists to gate.
+    #[test]
+    fn a_move_off_a_floating_pin_is_also_a_pin() {
+        let tags = typescript_node_tags();
+        for pin in ["20-trixie", "22-trixie", "22-bookworm"] {
+            let c = compute(&tags, pin, None).unwrap();
+            assert!(!c.moves.is_empty(), "{pin} should have somewhere to go");
+            for m in &c.moves {
+                assert!(
+                    m.axes.contains(AxisSet::SHAPE),
+                    "{pin}: move freezes a floating tag without saying so: {m:?}"
+                );
+            }
+        }
+
+        // Bare-runtime variants take the same path.
+        let bare = compute(&tags, "22", None).unwrap();
+        assert!(!bare.moves.is_empty());
+        assert!(bare.moves.iter().all(|m| m.axes.contains(AxisSet::SHAPE)));
+
+        // A versioned pin is already frozen, so its moves carry no shape
+        // change on this account.
+        let versioned = compute(&tags, "5.0.3-22-bookworm", None).unwrap();
+        assert!(
+            versioned
+                .moves
+                .iter()
+                .all(|m| !m.axes.contains(AxisSet::SHAPE)),
+            "a versioned pin is not re-pinned: {:?}",
+            versioned.moves
+        );
     }
 
     /// A bare codename is an alias line: it too gets pinned, and to the
