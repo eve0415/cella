@@ -27,7 +27,10 @@ cella-git.workspace = true
 cella-protocol.workspace = true
 chrono.workspace = true
 clap.workspace = true
-clap_complete.workspace = true
+# `unstable-dynamic` gates `clap_complete::env::CompleteEnv` — the runtime
+# completion engine. cella prints a registration hook instead of a static
+# script, so completions cannot go stale between upgrades.
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 hex.workspace = true
 inquire.workspace = true
 miette.workspace = true
