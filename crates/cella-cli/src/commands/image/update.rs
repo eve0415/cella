@@ -7,27 +7,66 @@ use miette::IntoDiagnostic as _;
 
 use cella_oci::{TagCache, TagSource};
 
-use super::candidates::{self, Candidates};
+use super::candidates::{self, AxisSet, Candidates, Limitation};
 use super::jsonc_edit;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
 use crate::commands::{OutputFormat, boxed_err_to_report};
 use crate::style;
 
+/// Which axes `--yes` may change without being asked again.
+///
+/// One struct rather than three loose flags: together they are a single
+/// decision — how far an unattended run may move the pin — and they map
+/// one-to-one onto [`AxisSet`].
+#[derive(Args)]
+pub struct AllowFlags {
+    /// Allow moving to a newer OS release, not just a newer version.
+    #[arg(long)]
+    pub allow_os_change: bool,
+
+    /// Allow pinning a floating tag, and making an implicit pin explicit.
+    ///
+    /// A floating tag re-resolves on every rebuild, so freezing one in CI is
+    /// a lasting behaviour change rather than an update.
+    #[arg(long)]
+    pub allow_pin: bool,
+
+    /// Allow moving to a newer runtime major, e.g. Node 22 to Node 24.
+    #[arg(long)]
+    pub allow_runtime_change: bool,
+}
+
+impl AllowFlags {
+    /// The axes these flags permit.
+    fn axes(&self) -> AxisSet {
+        let mut allowed = AxisSet::default();
+        if self.allow_pin {
+            allowed |= AxisSet::SHAPE;
+        }
+        if self.allow_runtime_change {
+            allowed |= AxisSet::RUNTIME;
+        }
+        if self.allow_os_change {
+            allowed |= AxisSet::RELEASE;
+        }
+        allowed
+    }
+}
+
 /// How much the command may do to the config without being asked again.
 ///
-/// Grouped rather than left loose on [`UpdateArgs`]: these three are one
+/// Grouped rather than left loose on [`UpdateArgs`]: these are one
 /// decision — report, prompt, or apply — expressed as the flags the official
 /// CLI surface expects.
 #[derive(Args)]
 pub struct ApplyFlags {
     /// Apply the update without prompting. Takes the version bump only
-    /// unless --allow-os-change is also given.
+    /// unless the matching --allow-* flag is also given.
     #[arg(long)]
     pub yes: bool,
 
-    /// Allow moving to a newer OS release, not just a newer version.
-    #[arg(long)]
-    pub allow_os_change: bool,
+    #[command(flatten)]
+    pub allow: AllowFlags,
 
     /// Only report; don't apply.
     #[arg(long)]
@@ -47,7 +86,9 @@ pub struct UpdateArgs {
     ///
     /// Naming a tag is itself the consent, so --allow-os-change is neither
     /// needed nor accepted alongside it, and --check would contradict it.
-    #[arg(long, conflicts_with_all = ["yes", "check", "allow_os_change"])]
+    #[arg(long, conflicts_with_all = [
+        "yes", "check", "allow_os_change", "allow_pin", "allow_runtime_change",
+    ])]
     pub to: Option<String>,
 
     /// Ignore the cached tag list.
@@ -122,18 +163,39 @@ impl UpdateArgs {
             );
         }
 
-        let computed = candidates::compute(&fetched.tags, &tag);
+        // An alias line names no runtime, so which one it points at can only
+        // be learned from the registry. Probed only when the image actually
+        // publishes runtime-ful lines beside it: 1-4 requests, or none.
+        let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
+            Some(probe) => {
+                // The tag list is fetched under the normalized reference, so
+                // the resolver must use it too — `org/image` shorthand would
+                // otherwise parse `org` as a registry and every probe fail.
+                // The user's own spelling is still what gets written back.
+                let resolver =
+                    cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
+                candidates::resolve_alias_runtime(&resolver, &probe).await
+            }
+            None => None,
+        };
+
+        let computed = candidates::compute(&fetched.tags, &tag, alias_runtime.as_deref());
         if self.stop_at_floating(computed.as_ref()) {
             eprintln!("{tag} tracks latest — nothing to pin");
             return Ok(());
         }
-        let found = computed.unwrap_or_else(|| Candidates::floating(&tag));
+        let found = computed.unwrap_or_else(|| Candidates::unrankable(&tag));
 
         // `nothing_to_do` implies `reports_only`, so the JSON case falls
         // through to the single render below rather than repeating it here.
         let json_output = matches!(self.output.resolve(), OutputFormat::Json);
         if self.nothing_to_do(&found) && !json_output {
             eprintln!("Base image is up to date.");
+            // "Up to date" over an unevaluated axis is only half the answer,
+            // so the gap is reported even when nothing else is.
+            if let Some(limitation) = &found.limitation {
+                eprintln!("  ({})", limitation.message());
+            }
             return Ok(());
         }
 
@@ -194,9 +256,10 @@ impl UpdateArgs {
 
     /// Whether an unrankable current tag ends the run.
     ///
-    /// `latest` and bare codenames have no version to advance, so there is
-    /// nothing to compute — but `--to` names a target outright, and applying
-    /// it is exactly how a user pins a floating tag for the first time.
+    /// `latest` names no variant at all, so there is nothing to compute —
+    /// but `--to` names a target outright, and applying it is exactly how a
+    /// user pins such a tag for the first time. A bare codename does name a
+    /// variant and is handled as a pin instead of stopping here.
     const fn stop_at_floating(&self, computed: Option<&Candidates>) -> bool {
         computed.is_none() && self.to.is_none()
     }
@@ -227,17 +290,21 @@ impl UpdateArgs {
             return Ok(self.auto_choice(found));
         }
 
-        let mut options: Vec<String> = Vec::with_capacity(found.os_moves.len() + 2);
+        let mut options: Vec<String> = Vec::with_capacity(found.moves.len() + 2);
         if let Some(bump) = &found.version_bump {
             options.push(bump.clone());
         }
-        for os_move in &found.os_moves {
+        if let Some(pin) = &found.pin {
+            options.push(pin.clone());
+        }
+        for variant_move in &found.moves {
             options.push(format!(
-                "{}   {} {} {}",
-                os_move.tag,
-                os_move.from,
+                "{}   {} {} {}  [{}]",
+                variant_move.tag,
+                variant_move.from,
                 style::hint_arrow(),
-                os_move.to
+                variant_move.to,
+                variant_move.axes.names().join(", ")
             ));
         }
         let keep = format!("keep {}", found.current);
@@ -255,20 +322,76 @@ impl UpdateArgs {
     }
 
     /// The non-interactive choice under `--yes`.
+    ///
+    /// A move may be taken only when *every* axis it changes has been
+    /// allowed; a partially-allowed move is refused outright rather than
+    /// approximated by a smaller one the user did not ask for.
     fn auto_choice(&self, found: &Candidates) -> Option<String> {
-        if self.apply.allow_os_change
-            && let Some(best) = found.os_moves.first()
-        {
+        let allowed = self.apply.allow.axes();
+
+        if let Some(best) = found.moves.iter().find(|m| allowed.contains(m.axes)) {
             return Some(best.tag.clone());
         }
-        if !found.os_moves.is_empty() {
-            eprintln!(
-                "({} OS move(s) available; pass --allow-os-change)",
-                found.os_moves.len()
-            );
+        report_blocked(found.moves.iter().map(|m| m.axes), allowed);
+
+        // Pinning a floating tag is itself a shape change: the tag stops
+        // tracking upstream. It needs the same consent an explicit move does.
+        if let Some(pin) = &found.pin {
+            if self.apply.allow.allow_pin {
+                return Some(pin.clone());
+            }
+            eprintln!("(a pin is available; pass --allow-pin)");
+            return None;
         }
+
         found.version_bump.clone()
     }
+}
+
+/// How many not-yet-given flags a move still needs.
+fn missing_count(axes: AxisSet, allowed: AxisSet) -> usize {
+    describe_axes(axes, allowed).len()
+}
+
+/// The flags a move needs that have not been given.
+fn describe_axes(axes: AxisSet, allowed: AxisSet) -> Vec<&'static str> {
+    [
+        (AxisSet::SHAPE, "--allow-pin"),
+        (AxisSet::RUNTIME, "--allow-runtime-change"),
+        (AxisSet::RELEASE, "--allow-os-change"),
+    ]
+    .into_iter()
+    .filter(|(axis, _)| axes.contains(*axis) && !allowed.contains(*axis))
+    .map(|(_, flag)| flag)
+    .collect()
+}
+
+/// Those flags as a printable list.
+fn describe(axes: AxisSet, allowed: AxisSet) -> String {
+    describe_axes(axes, allowed).join(" ")
+}
+
+/// Tell the user which flag would unlock the moves that were withheld.
+fn report_blocked(axes: impl Iterator<Item = AxisSet>, allowed: AxisSet) {
+    let mut blocked = 0;
+    let mut cheapest = AxisSet::default();
+    for axis in axes.filter(|a| !allowed.contains(*a)) {
+        blocked += 1;
+        // Fewest additional flags wins, so the advice unlocks the narrowest
+        // move rather than the broadest.
+        if cheapest.is_empty() || missing_count(axis, allowed) < missing_count(cheapest, allowed) {
+            cheapest = axis;
+        }
+    }
+    if blocked == 0 {
+        return;
+    }
+
+    // Name the *cheapest* move's flags, not the union across unrelated
+    // alternatives: advising both flags for a release-only and a runtime-only
+    // option would land the user on the move that changes both.
+    let flags = describe(cheapest, allowed);
+    eprintln!("({blocked} move(s) available; pass {flags})");
 }
 
 /// Read the `"image"` value, or explain which other base-image shape this
@@ -332,7 +455,10 @@ fn unknown_tag_error(requested: &str, found: &Candidates) -> String {
     if let Some(bump) = &found.version_bump {
         known.push(bump);
     }
-    known.extend(found.os_moves.iter().map(|m| m.tag.as_str()));
+    if let Some(pin) = &found.pin {
+        known.push(pin);
+    }
+    known.extend(found.moves.iter().map(|m| m.tag.as_str()));
 
     if known.is_empty() {
         return format!("tag not published: {requested}");
@@ -349,14 +475,23 @@ fn display_candidates(reference: &str, found: &Candidates) {
     if let Some(bump) = &found.version_bump {
         eprintln!("  {bump}   (version)");
     }
-    for os_move in &found.os_moves {
+    if let Some(pin) = &found.pin {
+        eprintln!("  {pin}   (pin)");
+    }
+    for variant_move in &found.moves {
         eprintln!(
-            "  {}   ({} {} {})",
-            os_move.tag,
-            os_move.from,
+            "  {}   ({} {} {}: {})",
+            variant_move.tag,
+            variant_move.from,
             style::hint_arrow(),
-            os_move.to
+            variant_move.to,
+            variant_move.axes.names().join(", ")
         );
+    }
+    // Said out loud rather than silently emitting a shorter list: the user
+    // cannot otherwise tell a complete offer from a truncated one.
+    if let Some(limitation) = &found.limitation {
+        eprintln!("  ({})", limitation.message());
     }
 }
 
@@ -365,10 +500,17 @@ fn display_candidates(reference: &str, found: &Candidates) {
 /// Deliberately its own shape rather than an addition to `cella outdated`,
 /// whose output mirrors the official CLI's `loadVersionInfo` contract.
 fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
-    let os_moves: Vec<serde_json::Value> = found
-        .os_moves
+    let moves: Vec<serde_json::Value> = found
+        .moves
         .iter()
-        .map(|m| serde_json::json!({"tag": m.tag, "from": m.from, "to": m.to}))
+        .map(|m| {
+            serde_json::json!({
+                "tag": m.tag,
+                "from": m.from,
+                "to": m.to,
+                "axes": m.axes.names(),
+            })
+        })
         .collect();
 
     serde_json::to_string_pretty(&serde_json::json!({
@@ -376,7 +518,11 @@ fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
             "reference": reference,
             "current": found.current,
             "versionBump": found.version_bump,
-            "osMoves": os_moves,
+            "pin": found.pin,
+            // The CI path is exactly where silently accepting a shortened
+            // list costs something, so the degradation travels with it.
+            "limitation": found.limitation.as_ref().map(Limitation::message),
+            "moves": moves,
         }
     }))
     .into_diagnostic()
@@ -498,7 +644,7 @@ mod tests {
             }
         );
         // `latest` has no leading version, so nothing is offered.
-        assert!(candidates::compute(&["24.04".to_owned()], "latest").is_none());
+        assert!(candidates::compute(&["24.04".to_owned()], "latest", None).is_none());
     }
 
     /// Regression: `--to` was swallowed by the "up to date" early return, so
@@ -508,7 +654,9 @@ mod tests {
         let up_to_date = Candidates {
             current: "2.0.14-1-trixie".to_owned(),
             version_bump: None,
-            os_moves: Vec::new(),
+            pin: None,
+            moves: Vec::new(),
+            limitation: None,
         };
         assert!(up_to_date.is_empty());
 
@@ -529,7 +677,7 @@ mod tests {
     #[test]
     fn an_explicit_target_survives_a_floating_current_tag() {
         assert!(
-            candidates::compute(&["24.04".to_owned()], "latest").is_none(),
+            candidates::compute(&["24.04".to_owned()], "latest", None).is_none(),
             "precondition: a floating tag computes nothing"
         );
 
@@ -551,7 +699,9 @@ mod tests {
         let bump = Candidates {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
-            os_moves: Vec::new(),
+            pin: None,
+            moves: Vec::new(),
+            limitation: None,
         };
 
         assert!(
@@ -583,7 +733,9 @@ mod tests {
         let found = Candidates {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
-            os_moves: Vec::new(),
+            pin: None,
+            moves: Vec::new(),
+            limitation: None,
         };
         let err = unknown_tag_error("9.9.9-trixie", &found);
         assert!(err.contains("9.9.9-trixie"));
@@ -595,18 +747,172 @@ mod tests {
         let found = Candidates {
             current: "2.0.2-bookworm".to_owned(),
             version_bump: Some("2.0.14-1-bookworm".to_owned()),
-            os_moves: vec![candidates::OsMove {
+            pin: None,
+            moves: vec![candidates::VariantMove {
                 tag: "2.0.14-1-trixie".to_owned(),
                 from: "bookworm".to_owned(),
                 to: "trixie".to_owned(),
+                axes: AxisSet::RELEASE,
             }],
+            limitation: None,
         };
         let rendered = render_json("mcr.microsoft.com/devcontainers/rust", &found).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["image"]["current"], "2.0.2-bookworm");
         assert_eq!(value["image"]["versionBump"], "2.0.14-1-bookworm");
-        assert_eq!(value["image"]["osMoves"][0]["to"], "trixie");
+        assert_eq!(value["image"]["moves"][0]["to"], "trixie");
+        assert_eq!(value["image"]["moves"][0]["axes"][0], "release");
+        assert_eq!(value["image"]["pin"], serde_json::Value::Null);
+        assert_eq!(value["image"]["limitation"], serde_json::Value::Null);
+    }
+
+    /// `--yes` may take a move only when every axis it changes is allowed.
+    /// A partially-allowed move must be refused, not approximated.
+    #[test]
+    fn yes_takes_a_move_only_when_every_axis_is_allowed() {
+        let found = Candidates {
+            current: "5.0.3-22-bookworm".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![
+                candidates::VariantMove {
+                    tag: "5.0.3-24-trixie".to_owned(),
+                    from: "22-bookworm".to_owned(),
+                    to: "24-trixie".to_owned(),
+                    axes: AxisSet::RUNTIME | AxisSet::RELEASE,
+                },
+                candidates::VariantMove {
+                    tag: "5.0.3-22-trixie".to_owned(),
+                    from: "22-bookworm".to_owned(),
+                    to: "22-trixie".to_owned(),
+                    axes: AxisSet::RELEASE,
+                },
+            ],
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None,
+            "bare --yes must not change the OS or the runtime"
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-os-change"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-22-trixie"),
+            "only the release-only move is fully allowed"
+        );
+        assert_eq!(
+            parse_update(&[
+                "cella",
+                "image",
+                "update",
+                "--yes",
+                "--allow-os-change",
+                "--allow-runtime-change",
+            ])
+            .auto_choice(&found)
+            .as_deref(),
+            Some("5.0.3-24-trixie"),
+            "with both axes allowed the newest reachable move wins"
+        );
+    }
+
+    /// A shape-only move is digest-identical, so nothing about the resulting
+    /// image changes — but it freezes a tag that was tracking upstream, and
+    /// that needs consent.
+    #[test]
+    fn a_shape_only_move_needs_allow_pin() {
+        let found = Candidates {
+            current: "5.0.3-trixie".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![candidates::VariantMove {
+                tag: "5.0.3-24-trixie".to_owned(),
+                from: "trixie".to_owned(),
+                to: "24-trixie".to_owned(),
+                axes: AxisSet::SHAPE,
+            }],
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None,
+            "bare --yes must not rewrite tag shape in CI"
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-pin"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
+    /// Freezing a floating tag is a lasting behaviour change, so `--yes`
+    /// alone leaves it floating.
+    #[test]
+    fn pinning_a_floating_tag_needs_allow_pin() {
+        let found = Candidates {
+            current: "24-trixie".to_owned(),
+            version_bump: None,
+            pin: Some("5.0.3-24-trixie".to_owned()),
+            moves: Vec::new(),
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-pin"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
+    /// A plain version bump is what `--yes` is for and needs no flag.
+    #[test]
+    fn yes_alone_still_takes_a_version_bump() {
+        let found = Candidates {
+            current: "4.0.10-24-trixie".to_owned(),
+            version_bump: Some("5.0.3-24-trixie".to_owned()),
+            pin: None,
+            moves: Vec::new(),
+            limitation: None,
+        };
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
+    /// A `--output json` consumer is the one most likely to accept a short
+    /// list without noticing, so the degradation has to reach it too.
+    #[test]
+    fn json_carries_the_degradation_message() {
+        let found = Candidates {
+            current: "5.0.3-trixie".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: Vec::new(),
+            limitation: Some(Limitation::UnresolvedAlias("5.0.3-trixie".to_owned())),
+        };
+        let rendered = render_json("mcr.microsoft.com/devcontainers/typescript-node", &found)
+            .expect("json must render");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        let message = value["image"]["limitation"]
+            .as_str()
+            .expect("the limitation must survive into json");
+        assert!(message.contains("5.0.3-trixie"), "got: {message}");
+        assert!(message.contains("could not resolve"), "got: {message}");
     }
 
     #[test]
@@ -616,6 +922,22 @@ mod tests {
         assert!(
             crate::Cli::try_parse_from(["cella", "image", "update", "--yes", "--allow-os-change"])
                 .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from(["cella", "image", "update", "--yes", "--allow-pin"])
+                .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "cella",
+                "image",
+                "update",
+                "--yes",
+                "--allow-runtime-change",
+                "--allow-os-change",
+                "--allow-pin",
+            ])
+            .is_ok()
         );
         assert!(
             crate::Cli::try_parse_from(["cella", "image", "update", "--to", "2.0.14-trixie"])
@@ -633,6 +955,15 @@ mod tests {
             vec!["cella", "image", "update", "--to", "x", "--check"],
             vec!["cella", "image", "update", "--to", "x", "--yes"],
             vec!["cella", "image", "update", "--to", "x", "--allow-os-change"],
+            vec!["cella", "image", "update", "--to", "x", "--allow-pin"],
+            vec![
+                "cella",
+                "image",
+                "update",
+                "--to",
+                "x",
+                "--allow-runtime-change",
+            ],
         ] {
             assert!(
                 crate::Cli::try_parse_from(&conflicting).is_err(),
@@ -641,13 +972,39 @@ mod tests {
         }
     }
 
-    /// Guards the load-bearing assumption that OS moves never cross families.
+    /// Guards the load-bearing assumption that moves never cross families.
     #[test]
-    fn os_moves_never_cross_distro_families() {
+    fn moves_never_cross_distro_families() {
         let debian = release::parse_variant("bookworm").unwrap();
         let ubuntu = release::parse_variant("noble").unwrap();
         assert!(!ubuntu.is_newer_than(&debian));
         assert!(!debian.is_newer_than(&ubuntu));
+    }
+
+    /// The alias line resolved against the live registry, end to end: only a
+    /// digest can say which runtime `5.0.3-trixie` currently points at.
+    #[cella_testing::runtime_test(network)]
+    async fn resolves_the_real_alias_line_by_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TagCache::with_root(dir.path());
+        let reference = "mcr.microsoft.com/devcontainers/typescript-node";
+        let fetched = cella_oci::fetch_image_tags(&cache, reference, true)
+            .await
+            .unwrap();
+
+        let probe = candidates::alias_probe(&fetched.tags, "5.0.3-trixie")
+            .expect("trixie is an alias line upstream");
+        let resolver = cella_oci::RegistryResolver::new(reference);
+        let runtime = candidates::resolve_alias_runtime(&resolver, &probe)
+            .await
+            .expect("the alias must resolve to a published runtime");
+
+        let found = candidates::compute(&fetched.tags, "5.0.3-trixie", Some(&runtime)).unwrap();
+        assert!(
+            found.moves.iter().all(|m| m.axes.contains(AxisSet::SHAPE)),
+            "every move off an alias line makes the pin explicit: {:?}",
+            found.moves
+        );
     }
 
     #[cella_testing::runtime_test(network)]
@@ -658,7 +1015,7 @@ mod tests {
             cella_oci::fetch_image_tags(&cache, "mcr.microsoft.com/devcontainers/rust", true)
                 .await
                 .unwrap();
-        let found = candidates::compute(&fetched.tags, "2.0.2-trixie").unwrap();
+        let found = candidates::compute(&fetched.tags, "2.0.2-trixie", None).unwrap();
         let bump = found
             .version_bump
             .expect("a newer trixie tag must exist upstream");

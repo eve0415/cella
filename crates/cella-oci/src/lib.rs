@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod auth;
 pub mod cache;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod push;
 pub mod tag_cache;
 pub mod tags;
 
+pub use alias::{AliasResolver, MapResolver, RegistryResolver};
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
 pub use error::TagListError;
@@ -22,8 +24,8 @@ pub use limits::{
 pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
 pub use tag_cache::TagCache;
 pub use tags::{
-    FetchedTags, MAX_PINNED_TAGS, TagSource, VersionKey, fetch_image_tags, pinnable_tags,
-    split_tag, version_key,
+    FetchedTags, MAX_PINNED_TAGS, ParsedTag, TagGrammar, TagSource, VersionKey, fetch_image_tags,
+    pinnable_tags, split_tag, version_key,
 };
 
 use oci_client::secrets::RegistryAuth;

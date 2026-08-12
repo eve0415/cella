@@ -4,6 +4,8 @@
 //! `2.0.9-trixie` after `2.0.14-trixie`. Everything here exists so callers
 //! rank tags by version instead of by string.
 
+use std::collections::BTreeSet;
+
 use tracing::warn;
 
 use crate::tag_cache::TagCache;
@@ -11,60 +13,116 @@ use crate::tag_cache::TagCache;
 /// Maximum number of pinned tags to present to the user.
 pub const MAX_PINNED_TAGS: usize = 15;
 
-/// Select the tags that pin a variant selection to a specific image
-/// version, newest first.
+/// A repository's vocabulary of variants, learned from its published tags.
 ///
-/// A tag qualifies when it refines the selection in one of two ways:
+/// OCI tag shapes are repository-specific: the same numeric-looking prefix
+/// can be an image version in one repository and part of a floating variant
+/// in another. Keeping the vocabulary makes that distinction explicit.
+#[derive(Debug, Clone)]
+pub struct TagGrammar {
+    variants: BTreeSet<String>,
+}
+
+/// A tag interpreted using the variants published by its repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedTag<'a> {
+    /// `None` means the tag is floating: it names a variant with no image version.
+    pub version: Option<&'a str>,
+    /// The repository-defined variant, or an empty string for a numeric-only tag.
+    pub variant: &'a str,
+}
+
+impl TagGrammar {
+    /// Learn the variant vocabulary represented by a complete published tag list.
+    ///
+    /// A numeric version followed by a non-empty suffix is the only unambiguous
+    /// evidence that the suffix names a variant.
+    #[must_use]
+    pub fn from_tags(tags: &[&str]) -> Self {
+        let variants = tags
+            .iter()
+            .filter_map(|tag| {
+                let (version, variant) = tag.split_once('-')?;
+                (is_numeric_group(version) && !variant.is_empty()).then(|| variant.to_owned())
+            })
+            .collect();
+        Self { variants }
+    }
+
+    /// Interpret a tag using the repository's learned variant vocabulary.
+    ///
+    /// The longest published variant wins so composite variants remain intact,
+    /// and parsing borrows slices from `tag` without allocating.
+    #[must_use]
+    pub fn parse<'a>(&self, tag: &'a str) -> Option<ParsedTag<'a>> {
+        if self.variants.contains(tag) {
+            return Some(ParsedTag {
+                version: None,
+                variant: tag,
+            });
+        }
+
+        for (dash, _) in tag.match_indices('-') {
+            let version = &tag[..dash];
+            let variant = &tag[dash + 1..];
+            if self.variants.contains(variant) {
+                return is_numeric_group(version).then_some(ParsedTag {
+                    version: Some(version),
+                    variant,
+                });
+            }
+        }
+
+        is_numeric_group(tag).then_some(ParsedTag {
+            version: Some(tag),
+            variant: "",
+        })
+    }
+}
+
+/// Select the tags that pin a grammar-recognized selection to a more specific
+/// image version, newest first.
 ///
-/// - **Version prefix** — it ends with `-{selection}` and everything
-///   before that suffix is dot/dash-separated numbers: for `"24-trixie"`
-///   this matches `4.0.10-24-trixie` and `5-24-trixie`.
-/// - **Version extension** — it extends the selection's own leading
-///   version with more dotted segments: for `"24-trixie"` this matches
-///   `24.7.0-trixie` (node-style registries).
+/// A floating selection accepts versioned tags with the same variant. A
+/// versioned selection accepts tags with the same variant whose version adds
+/// dotted segments to the selected version. An unknown selection accepts
+/// nothing, because suffix overlap alone is not evidence of variant identity.
 ///
-/// Neither shape matches `dev-24-trixie`, the bare `24-trixie`, or
-/// another variant's `22-trixie`.
-///
-/// Tags are sorted by their version part descending, with more specific
+/// The selection itself has no added version specificity and is never
+/// offered. Tags are sorted by their version part descending, with more specific
 /// versions ranking above their aliases (`4.0.10` > `4.0` > `4`), and
 /// capped at [`MAX_PINNED_TAGS`].
 pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
+    let grammar = TagGrammar::from_tags(tags);
+    let Some(selection) = grammar.parse(selection) else {
+        return Vec::new();
+    };
     let mut keyed: Vec<(VersionKey, &'a str)> = tags
         .iter()
-        .filter_map(|&tag| Some((pin_version_key(tag, selection)?, tag)))
+        .filter_map(|&tag| Some((pin_version_key(&grammar, tag, selection)?, tag)))
         .collect();
     keyed.sort_unstable_by(|a, b| b.cmp(a));
     keyed.truncate(MAX_PINNED_TAGS);
     keyed.into_iter().map(|(_, tag)| tag).collect()
 }
 
-/// Compute the version sort key of a tag that refines `selection`, or
-/// `None` if it doesn't (see [`pinnable_tags`] for the accepted shapes).
-fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
-    // Version prefix: `{version}-{selection}`.
-    if let Some(prefix) = tag
-        .strip_suffix(selection)
-        .and_then(|rest| rest.strip_suffix('-'))
-        && let Some(key) = version_key(prefix)
-    {
-        return Some(key);
+/// Compute the sort key when `tag` refines the parsed `selection` under the
+/// repository grammar.
+fn pin_version_key(
+    grammar: &TagGrammar,
+    tag: &str,
+    selection: ParsedTag<'_>,
+) -> Option<VersionKey> {
+    let parsed = grammar.parse(tag)?;
+    if parsed.variant != selection.variant {
+        return None;
     }
 
-    // Version extension: the selection's leading numeric part grows more
-    // dotted segments (`24-trixie` → `24.7.0-trixie`, `22` → `22.12.0`).
-    let numeric_end = selection
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(selection.len());
-    let (head, rest) = selection.split_at(numeric_end);
-    if head.is_empty() {
-        return None;
+    let version = parsed.version?;
+    if let Some(selected_version) = selection.version {
+        version.strip_prefix(selected_version)?.strip_prefix('.')?;
     }
-    let extended = tag.strip_suffix(rest)?;
-    if !extended.strip_prefix(head)?.starts_with('.') {
-        return None;
-    }
-    version_key(extended)
+    version_key(version)
 }
 
 /// Split a tag into its leading numeric version and its trailing variant.
@@ -77,11 +135,7 @@ fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
 pub fn split_tag(tag: &str) -> Option<(&str, &str)> {
     let mut end = 0;
     for group in tag.split('-') {
-        let numeric = !group.is_empty()
-            && group
-                .split('.')
-                .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()));
-        if !numeric {
+        if !is_numeric_group(group) {
             break;
         }
         end += group.len() + 1;
@@ -90,6 +144,13 @@ pub fn split_tag(tag: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((&tag[..end - 1], tag.get(end..).unwrap_or("")))
+}
+
+fn is_numeric_group(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Sort key for a tag's version part.
@@ -192,6 +253,28 @@ pub async fn fetch_image_tags(
 mod tests {
     use super::*;
 
+    const TYPESCRIPT_NODE_SHAPED_TAGS: [&str; 6] = [
+        "5.0.3-24-trixie",
+        "24-trixie",
+        "5.0.3-trixie",
+        "trixie",
+        "dev-24-trixie",
+        "latest",
+    ];
+
+    fn typescript_node_grammar() -> TagGrammar {
+        TagGrammar::from_tags(&TYPESCRIPT_NODE_SHAPED_TAGS)
+    }
+
+    fn fixture_tags(raw: &str) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.as_str().unwrap().to_owned())
+            .collect()
+    }
+
     #[test]
     fn splits_version_from_variant() {
         assert_eq!(split_tag("2.0.14-trixie"), Some(("2.0.14", "trixie")));
@@ -206,6 +289,115 @@ mod tests {
         assert_eq!(split_tag("trixie"), None);
         assert_eq!(split_tag("dev-1-trixie"), None);
         assert_eq!(split_tag("bookworm"), None);
+    }
+
+    #[test]
+    fn grammar_parses_versioned_tag() {
+        assert_eq!(
+            typescript_node_grammar().parse("5.0.3-trixie"),
+            Some(ParsedTag {
+                version: Some("5.0.3"),
+                variant: "trixie",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_parses_composite_variant_as_floating() {
+        assert_eq!(
+            typescript_node_grammar().parse("24-trixie"),
+            Some(ParsedTag {
+                version: None,
+                variant: "24-trixie",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_parses_versioned_composite_variant() {
+        assert_eq!(
+            typescript_node_grammar().parse("5.0.3-24-trixie"),
+            Some(ParsedTag {
+                version: Some("5.0.3"),
+                variant: "24-trixie",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_parses_plain_variant_as_floating() {
+        assert_eq!(
+            typescript_node_grammar().parse("trixie"),
+            Some(ParsedTag {
+                version: None,
+                variant: "trixie",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_rejects_non_numeric_version_prefix() {
+        assert_eq!(typescript_node_grammar().parse("dev-24-trixie"), None);
+    }
+
+    #[test]
+    fn grammar_rejects_unknown_floating_tag() {
+        assert_eq!(typescript_node_grammar().parse("latest"), None);
+    }
+
+    #[test]
+    fn grammar_parses_numeric_tag_without_variant() {
+        assert_eq!(
+            typescript_node_grammar().parse("24.04"),
+            Some(ParsedTag {
+                version: Some("24.04"),
+                variant: "",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_preserves_rust_revision_variants() {
+        let tags = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-rust-tags.json"
+        ));
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        let grammar = TagGrammar::from_tags(&refs);
+
+        assert_eq!(
+            grammar.parse("2.0.14-1-trixie"),
+            Some(ParsedTag {
+                version: Some("2.0.14"),
+                variant: "1-trixie",
+            })
+        );
+        assert_eq!(
+            grammar.parse("2.0.14-trixie"),
+            Some(ParsedTag {
+                version: Some("2.0.14"),
+                variant: "trixie",
+            })
+        );
+    }
+
+    #[test]
+    fn grammar_derives_expected_base_variants() {
+        let tags = fixture_tags(include_str!("../testdata/mcr-devcontainers-base-tags.json"));
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+
+        assert_eq!(tags.len(), 1_924);
+        assert_eq!(TagGrammar::from_tags(&refs).variants.len(), 54);
+    }
+
+    #[test]
+    fn grammar_derives_expected_typescript_node_variants() {
+        let tags = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-typescript-node-tags.json"
+        ));
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+
+        assert_eq!(tags.len(), 942);
+        assert_eq!(TagGrammar::from_tags(&refs).variants.len(), 28);
     }
 
     #[test]
@@ -264,12 +456,28 @@ mod tests {
     fn pinnable_tags_specific_versions_rank_above_aliases_in_composite_tags() {
         // Regression: the flat numeric key ranked "4-24-trixie" ([4, 24])
         // above "4.0.10-24-trixie" ([4, 0, 10, 24]) because 24 > 0 at
-        // index 1. Dash groups must be compared before dot segments.
+        // index 1. Dash groups must be compared before dot segments. This list
+        // derives only {"24-trixie"} as its variant vocabulary, so "trixie" is
+        // not a variant here and cannot select these tags.
         let tags = vec!["4-24-trixie", "4.0-24-trixie", "4.0.10-24-trixie"];
         assert_eq!(
-            pinnable_tags(&tags, "trixie"),
+            pinnable_tags(&tags, "24-trixie"),
             vec!["4.0.10-24-trixie", "4.0-24-trixie", "4-24-trixie"]
         );
+    }
+
+    #[test]
+    fn pinnable_tags_typescript_node_codename_stays_on_its_variant() {
+        let tags = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-typescript-node-tags.json"
+        ));
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        let pinned = pinnable_tags(&refs, "trixie");
+
+        assert!(pinned.contains(&"5.0.3-trixie"));
+        for alias in ["24-trixie", "22-trixie", "20-trixie"] {
+            assert!(!pinned.contains(&alias), "offered node alias {alias}");
+        }
     }
 
     #[test]
@@ -417,6 +625,45 @@ mod tests {
                 .and_then(|(version, _)| version_key(version))
                 .unwrap();
             assert!(key <= newest_key, "{tag} outranks the reported newest");
+        }
+    }
+
+    /// `cella init`'s pin wizard passes a template's `imageVariant` proposal
+    /// straight into `pinnable_tags`, so what this returns is what the wizard
+    /// offers. Guarded here because nothing else in the tree asserts it.
+    #[test]
+    fn the_init_wizard_still_gets_offers_for_real_selections() {
+        let rust = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-rust-tags.json"
+        ));
+        let rust_refs: Vec<&str> = rust.iter().map(String::as_str).collect();
+
+        // The plain line still offers, and now stays on its own line: the
+        // revision line `2.0.14-1-trixie` is a different variant.
+        let trixie = pinnable_tags(&rust_refs, "trixie");
+        assert!(
+            !trixie.is_empty(),
+            "a trixie proposal must still offer tags"
+        );
+        assert!(trixie.contains(&"2.0.14-trixie"));
+        assert!(
+            !trixie.iter().any(|t| t.ends_with("-1-trixie")),
+            "a pin stays on its own tag line: {trixie:?}"
+        );
+
+        // The revision line is reachable by proposing it directly.
+        let revision = pinnable_tags(&rust_refs, "1-trixie");
+        assert!(revision.contains(&"2.0.14-1-trixie"), "got {revision:?}");
+
+        // The 1924-tag list, where one release has three spellings. Each is
+        // its own variant and each still offers its own tags.
+        let base = fixture_tags(include_str!("../testdata/mcr-devcontainers-base-tags.json"));
+        let base_refs: Vec<&str> = base.iter().map(String::as_str).collect();
+        for spelling in ["bookworm", "debian-12", "debian12"] {
+            assert!(
+                !pinnable_tags(&base_refs, spelling).is_empty(),
+                "{spelling} must still offer tags to the wizard"
+            );
         }
     }
 

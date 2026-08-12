@@ -695,6 +695,7 @@ name = "cella-oci"
 version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
+ "cella-testing",
  "dirs",
  "divan",
  "filetime",
