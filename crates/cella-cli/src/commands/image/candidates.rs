@@ -22,29 +22,36 @@ pub struct OsMove {
 pub struct Candidates {
     /// The tag currently pinned.
     pub current: String,
-    /// Newest tag in the current variant, if it is newer than `current`.
+    /// Newest tag in the current variant, when the pin already carries a
+    /// version and that tag is newer.
     pub version_bump: Option<String>,
+    /// Newest tag in the current variant, when the pin is floating.
+    ///
+    /// Mutually exclusive with [`Self::version_bump`] by construction: a pin
+    /// either has a version to advance or has none to begin with.
+    pub pin: Option<String>,
     /// Newest tag in each newer release of the same family, newest first.
     pub os_moves: Vec<OsMove>,
 }
 
 impl Candidates {
-    /// An empty candidate set for a tag cella cannot rank.
+    /// An empty candidate set for a tag cella cannot rank at all.
     ///
-    /// Used when the current tag is floating (`latest`, `trixie`) but the
-    /// user named a target explicitly — there is nothing to offer, yet there
-    /// is still something to apply.
-    pub fn floating(current: &str) -> Self {
+    /// Used when the current tag does not parse (`latest`, `dev-1-trixie`)
+    /// but the user named a target explicitly — there is nothing to offer,
+    /// yet there is still something to apply.
+    pub fn unrankable(current: &str) -> Self {
         Self {
             current: current.to_owned(),
             version_bump: None,
+            pin: None,
             os_moves: Vec::new(),
         }
     }
 
     /// Whether there is nothing to offer.
     pub const fn is_empty(&self) -> bool {
-        self.version_bump.is_none() && self.os_moves.is_empty()
+        self.version_bump.is_none() && self.pin.is_none() && self.os_moves.is_empty()
     }
 }
 
@@ -64,16 +71,25 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
 
     let parsed = grammar.parse(current)?;
     let selection = parsed.variant;
+
     // A floating pin names a variant but carries no image version, so there
-    // is nothing to advance from.
-    let current_version = parsed.version?;
+    // is nothing to advance from — only something to fix in place. Offering
+    // that is the whole point of a command that pins.
+    let Some(current_version) = parsed.version else {
+        return Some(Candidates {
+            current: current.to_owned(),
+            version_bump: None,
+            pin: newest_in_variant(&grammar, &refs, selection).map(|(_, tag)| tag.to_owned()),
+            os_moves: Vec::new(),
+        });
+    };
 
     // Ranking finds the newest tag sharing the pin's selection; it says
     // nothing about whether that tag beats the pin, so every candidate is
     // measured against this key before being offered. An unparseable pin
     // leaves nothing to measure against, so nothing is offered.
     let Some(current_key) = version_key(current_version) else {
-        return Some(Candidates::floating(current));
+        return Some(Candidates::unrankable(current));
     };
 
     let version_bump = newest_in_variant(&grammar, &refs, selection)
@@ -104,6 +120,7 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
     Some(Candidates {
         current: current.to_owned(),
         version_bump,
+        pin: None,
         os_moves,
     })
 }
@@ -262,15 +279,35 @@ mod tests {
 
     /// A floating pin has no image version, so it has nothing to bump — and
     /// must certainly not be bumped to a *different* runtime's floating tag.
+    /// What it gets instead is a pin onto its own line.
     #[test]
     fn a_floating_runtime_tag_is_not_bumped_to_another_runtime() {
         let tags = typescript_node_tags();
-        for pin in ["22-trixie", "20-trixie", "24-trixie"] {
-            assert!(
-                compute(&tags, pin).is_none(),
-                "{pin} is floating; it has no version to advance"
+        // Node 20 never received a 5.x image release, so its line tops out at
+        // 4.0.10. A pin stays on its own line even when that line is behind —
+        // offering 5.0.3-24-trixie here would change the runtime, not update.
+        for (pin, expected) in [
+            ("22-trixie", "5.0.3-22-trixie"),
+            ("20-trixie", "4.0.10-20-trixie"),
+            ("24-trixie", "5.0.3-24-trixie"),
+        ] {
+            let c = compute(&tags, pin).expect("a floating tag still names a variant");
+            assert_eq!(c.version_bump, None, "{pin} has no version to advance");
+            assert_eq!(
+                c.pin.as_deref(),
+                Some(expected),
+                "{pin} must be pinned on its own runtime line"
             );
         }
+    }
+
+    /// A bare codename is an alias line: it too gets pinned, and to the
+    /// newest version on its *own* variant rather than a runtime-ful one.
+    #[test]
+    fn a_bare_codename_pins_to_its_own_line() {
+        let c = compute(&typescript_node_tags(), "trixie").expect("trixie names a variant");
+        assert_eq!(c.pin.as_deref(), Some("5.0.3-trixie"));
+        assert_eq!(c.version_bump, None);
     }
 
     fn rust_tags() -> Vec<String> {
@@ -442,9 +479,15 @@ mod tests {
     }
 
     #[test]
-    fn floating_tags_produce_nothing() {
+    fn unparseable_tags_produce_nothing() {
+        // `latest` names no variant at all, so there is nothing to pin it to.
         assert!(compute(&rust_tags(), "latest").is_none());
-        assert!(compute(&rust_tags(), "trixie").is_none());
+
+        // A bare codename does name a variant, so it is pinnable — the one
+        // thing it is not is bumpable.
+        let trixie = compute(&rust_tags(), "trixie").expect("trixie is a published variant");
+        assert_eq!(trixie.version_bump, None);
+        assert_eq!(trixie.pin.as_deref(), Some(NEWEST_PLAIN_TRIXIE));
     }
 
     #[test]

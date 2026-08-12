@@ -127,7 +127,7 @@ impl UpdateArgs {
             eprintln!("{tag} tracks latest — nothing to pin");
             return Ok(());
         }
-        let found = computed.unwrap_or_else(|| Candidates::floating(&tag));
+        let found = computed.unwrap_or_else(|| Candidates::unrankable(&tag));
 
         // `nothing_to_do` implies `reports_only`, so the JSON case falls
         // through to the single render below rather than repeating it here.
@@ -194,9 +194,10 @@ impl UpdateArgs {
 
     /// Whether an unrankable current tag ends the run.
     ///
-    /// `latest` and bare codenames have no version to advance, so there is
-    /// nothing to compute — but `--to` names a target outright, and applying
-    /// it is exactly how a user pins a floating tag for the first time.
+    /// `latest` names no variant at all, so there is nothing to compute —
+    /// but `--to` names a target outright, and applying it is exactly how a
+    /// user pins such a tag for the first time. A bare codename does name a
+    /// variant and is handled as a pin instead of stopping here.
     const fn stop_at_floating(&self, computed: Option<&Candidates>) -> bool {
         computed.is_none() && self.to.is_none()
     }
@@ -230,6 +231,9 @@ impl UpdateArgs {
         let mut options: Vec<String> = Vec::with_capacity(found.os_moves.len() + 2);
         if let Some(bump) = &found.version_bump {
             options.push(bump.clone());
+        }
+        if let Some(pin) = &found.pin {
+            options.push(pin.clone());
         }
         for os_move in &found.os_moves {
             options.push(format!(
@@ -332,6 +336,9 @@ fn unknown_tag_error(requested: &str, found: &Candidates) -> String {
     if let Some(bump) = &found.version_bump {
         known.push(bump);
     }
+    if let Some(pin) = &found.pin {
+        known.push(pin);
+    }
     known.extend(found.os_moves.iter().map(|m| m.tag.as_str()));
 
     if known.is_empty() {
@@ -348,6 +355,9 @@ fn display_candidates(reference: &str, found: &Candidates) {
     eprintln!("{reference}:{} — updates available:", found.current);
     if let Some(bump) = &found.version_bump {
         eprintln!("  {bump}   (version)");
+    }
+    if let Some(pin) = &found.pin {
+        eprintln!("  {pin}   (pin)");
     }
     for os_move in &found.os_moves {
         eprintln!(
@@ -376,6 +386,7 @@ fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
             "reference": reference,
             "current": found.current,
             "versionBump": found.version_bump,
+            "pin": found.pin,
             "osMoves": os_moves,
         }
     }))
@@ -508,6 +519,7 @@ mod tests {
         let up_to_date = Candidates {
             current: "2.0.14-1-trixie".to_owned(),
             version_bump: None,
+            pin: None,
             os_moves: Vec::new(),
         };
         assert!(up_to_date.is_empty());
@@ -551,6 +563,7 @@ mod tests {
         let bump = Candidates {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
+            pin: None,
             os_moves: Vec::new(),
         };
 
@@ -583,6 +596,7 @@ mod tests {
         let found = Candidates {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
+            pin: None,
             os_moves: Vec::new(),
         };
         let err = unknown_tag_error("9.9.9-trixie", &found);
@@ -595,6 +609,7 @@ mod tests {
         let found = Candidates {
             current: "2.0.2-bookworm".to_owned(),
             version_bump: Some("2.0.14-1-bookworm".to_owned()),
+            pin: None,
             os_moves: vec![candidates::OsMove {
                 tag: "2.0.14-1-trixie".to_owned(),
                 from: "bookworm".to_owned(),
