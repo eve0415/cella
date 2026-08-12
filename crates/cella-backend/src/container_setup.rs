@@ -462,7 +462,7 @@ async fn inject_snippets(
                 "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then printf '%s\\n' '{escaped}' >> '{path}'; fi",
                 path = path,
                 guard = guard,
-                escaped = snippet.replace('\'', "'\\''"),
+                escaped = shell_single_quote_escape(snippet),
             );
             let _ = client
                 .exec_command(
@@ -583,23 +583,39 @@ const STRIP_BLOCK_AWK: &str = concat!(
 /// only read — the strip-then-append sequence is the part that can corrupt an
 /// rc file if it is wrong.
 ///
-/// The rewrite is `awk … > tmp && cat tmp > path`, not `mv`: `cat` into the
-/// existing file keeps its inode, mode and owner, which matters because this
-/// runs as root against a file the container user owns. If awk is missing or
-/// fails, `&&` leaves the original untouched and the append still happens —
-/// degrading to the additive behaviour of [`inject_snippets`].
+/// Three deliberate choices, each guarding a way this can go wrong when run as
+/// root against a file the container user owns:
+///
+/// * The stripped text is held in a shell variable, never a scratch file. A
+///   scratch path derived from the profile (`~/.bashrc.tmp`) sits in a
+///   directory that user controls, so they could pre-create it as a symlink to
+///   a root-owned target and have this redirect clobber it.
+/// * A symlinked profile is appended to but never rewritten, matching
+///   [`inject_snippets`] exactly. Truncate-and-rewrite through a symlink would
+///   be strictly worse than the behaviour we already had.
+/// * The rewrite runs only when a block is actually present, so the common
+///   first-install case never rewrites the file at all.
+///
+/// If `awk` is missing the command substitution fails, the `if` skips the
+/// rewrite, and the append still happens — degrading to the purely additive
+/// behaviour of [`inject_snippets`].
 fn managed_block_command(path: &str, guard: &str, snippet: &str) -> String {
     format!(
         "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
-         awk -v s='{start}' -v e='{end}' '{prog}' '{path}' > '{path}.cella-tmp' 2>/dev/null \
-         && cat '{path}.cella-tmp' > '{path}'; \
-         rm -f '{path}.cella-tmp'; \
+         if grep -q '{start}' '{path}' && [ ! -L '{path}' ] \
+         && stripped=$(awk -v s='{start}' -v e='{end}' '{prog}' '{path}' 2>/dev/null); then \
+         printf '%s\\n' \"$stripped\" > '{path}'; fi; \
          printf '%s\\n' '{escaped}' >> '{path}'; fi",
         start = COMPLETION_BLOCK_START_PATTERN,
         end = COMPLETION_BLOCK_END_PATTERN,
         prog = STRIP_BLOCK_AWK,
-        escaped = snippet.replace('\'', "'\\''"),
+        escaped = shell_single_quote_escape(snippet),
     )
+}
+
+/// Escape `'` so a value can sit inside single quotes in a POSIX shell string.
+fn shell_single_quote_escape(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 /// Opening marker of *any* version of the block.
@@ -1051,7 +1067,61 @@ mod tests {
         );
     }
 
-    /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
+    /// The rewrite must never route through a predictable scratch path in a
+    /// directory the container user owns: they could pre-create it as a symlink
+    /// to a root-owned file and have our root-run redirect clobber the target.
+    #[test]
+    fn injection_never_writes_a_predictable_scratch_path() {
+        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        let cmd = managed_block_command("/home/dev/.bashrc", COMPLETION_SNIPPETS[0].0, snippet);
+        assert!(
+            !cmd.contains(".bashrc."),
+            "no derived scratch path may appear in the command: {cmd}"
+        );
+        assert!(!cmd.contains("tmp"), "no scratch file at all: {cmd}");
+    }
+
+    /// A symlinked rc file falls back to append-only, exactly matching the
+    /// pre-existing `inject_snippets` behaviour. Truncating and rewriting
+    /// through a symlink as root would be strictly worse than what we had.
+    ///
+    /// The target is seeded with a *stale block* so the assertion can tell the
+    /// guard fired: with it, the strip is skipped and the stale block survives
+    /// beside the new one; without it, the stale block would be rewritten away.
+    #[test]
+    fn injection_does_not_rewrite_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-file");
+        std::fs::write(
+            &target,
+            "important\n# >>> cella shell completion v0 >>>\nstale\n\
+             # <<< cella shell completion <<<\n",
+        )
+        .unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::os::unix::fs::symlink(&target, &rc).unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(after.starts_with("important\n"), "{after}");
+        assert!(
+            after.contains("stale"),
+            "a symlinked rc must not be rewritten, only appended to: {after}"
+        );
+        assert_eq!(
+            blocks_in(&target),
+            2,
+            "append-only means both blocks: {after}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&rc).unwrap().is_symlink(),
+            "the symlink itself must survive"
+        );
+    }
+
+    /// Absent rc file: nothing is created,    /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
     /// container gets no PATH block either, so `cella` is not on PATH there.
     #[test]
     fn injection_skips_a_missing_profile() {
