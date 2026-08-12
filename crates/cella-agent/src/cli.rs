@@ -1519,6 +1519,316 @@ fn is_json_line(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ── CLI_SURFACE ↔ parse_cli_args parity ────────────────────────────────
+    //
+    // `CLI_SURFACE` is the single source for the help text above, for the
+    // shipped shell-completion scripts, and for nothing the compiler checks.
+    // These tests are what stop it drifting from the parser it describes.
+
+    /// The table path a parsed command corresponds to.
+    ///
+    /// Deliberately has no `_` arm: adding a `CliCommand` variant breaks this
+    /// test module's compilation until the author records the command in
+    /// `CLI_SURFACE`. A missing *command* is the drift that actually happened —
+    /// no amount of flag-scraping catches it.
+    fn surface_path(cmd: &CliCommand) -> Option<&'static str> {
+        match cmd {
+            CliCommand::Branch { .. } => Some("branch"),
+            CliCommand::List { .. } => Some("list"),
+            CliCommand::Down { .. } => Some("down"),
+            CliCommand::Up { .. } => Some("up"),
+            CliCommand::Exec { .. } => Some("exec"),
+            CliCommand::Prune { .. } => Some("prune"),
+            CliCommand::TaskRun { .. } => Some("task run"),
+            CliCommand::TaskList { .. } => Some("task list"),
+            CliCommand::TaskLogs { .. } => Some("task logs"),
+            CliCommand::TaskWait { .. } => Some("task wait"),
+            CliCommand::TaskStop { .. } => Some("task stop"),
+            CliCommand::Switch { .. } => Some("switch"),
+            CliCommand::Doctor { .. } => Some("doctor"),
+            CliCommand::Help | CliCommand::CommandHelp | CliCommand::Unsupported { .. } => None,
+        }
+    }
+
+    /// The shortest argv that should parse to `spec`, typed as `spelling`.
+    fn minimal_argv(spec: &CommandSpec, spelling: &str) -> Vec<String> {
+        let mut argv = vec!["cella".to_owned()];
+        let segments: Vec<&str> = spec.path.split(' ').collect();
+        let last = segments.len() - 1;
+        for (i, segment) in segments.iter().enumerate() {
+            argv.push(if i == last { spelling } else { segment }.to_owned());
+        }
+        for operand in spec.operands {
+            match operand {
+                OperandSpec::Required { .. } => argv.push("b".to_owned()),
+                OperandSpec::Optional { .. } => {}
+                OperandSpec::Trailing { .. } => {
+                    argv.push("--".to_owned());
+                    argv.push("echo".to_owned());
+                }
+            }
+        }
+        argv
+    }
+
+    /// `minimal_argv` with `flag` spliced in ahead of any `--` separator —
+    /// everything after `--` belongs to the user's own command.
+    fn argv_with_flag(spec: &CommandSpec, spelling: &str, flag: &str) -> Vec<String> {
+        let mut argv = minimal_argv(spec, spelling);
+        let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+        argv.insert(at, flag.to_owned());
+        argv
+    }
+
+    /// Every spelling a command answers to.
+    fn spellings(spec: &CommandSpec) -> Vec<&'static str> {
+        std::iter::once(spec.leaf())
+            .chain(spec.aliases.iter().copied())
+            .collect()
+    }
+
+    /// Every way an option can be typed.
+    fn option_spellings(opt: &OptionSpec) -> Vec<String> {
+        let mut out = vec![opt.long.to_owned()];
+        if let Some(short) = opt.short {
+            out.push(format!("-{short}"));
+        }
+        out
+    }
+
+    /// Layer (a): every table entry is reachable, under every spelling.
+    #[test]
+    fn every_surface_command_parses() {
+        for spec in CLI_SURFACE {
+            // A namespace like `task` is not a command of its own — the parser
+            // requires a subcommand and answers bare `cella task` with Help.
+            if cella_completion::subcommands_of(spec.path).next().is_some() {
+                continue;
+            }
+            for spelling in spellings(spec) {
+                let argv = minimal_argv(spec, spelling);
+                assert_eq!(
+                    surface_path(&parse_cli_args(&argv)),
+                    Some(spec.path),
+                    "argv {argv:?} must parse as `{}`",
+                    spec.path
+                );
+            }
+        }
+    }
+
+    /// Layer (a'): a command the table does not list is refused, not guessed at.
+    #[test]
+    fn a_command_outside_the_surface_is_unsupported() {
+        let argv: Vec<String> = ["cella", "build"].iter().map(ToString::to_string).collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::Unsupported { command } if command == "build")
+        );
+    }
+
+    type Check = fn(&CliCommand) -> bool;
+
+    /// Layer (b): every table flag, with the observable effect it must have.
+    ///
+    /// Asserting merely "did not fall through to Help" would pass against a
+    /// parser that accepted the flag and dropped it on the floor — which is
+    /// exactly what `cella list --jsno` used to do with a typo'd flag.
+    const FLAG_CASES: &[(&[&str], Check)] = &[
+        (
+            &["cella", "branch", "b", "--base", "main"],
+            |c| matches!(c, CliCommand::Branch { base: Some(b), .. } if b == "main"),
+        ),
+        (
+            &["cella", "branch", "b", "--label", "a=1", "--label", "c=2"],
+            |c| matches!(c, CliCommand::Branch { labels, .. } if labels.as_slice() == ["a=1", "c=2"]),
+        ),
+        (&["cella", "list", "--json"], |c| {
+            matches!(c, CliCommand::List { json: true })
+        }),
+        (
+            &["cella", "exec", "b", "--json", "--", "echo"],
+            |c| matches!(c, CliCommand::Exec { json: true, command, .. } if command.as_slice() == ["echo"]),
+        ),
+        (&["cella", "down", "b", "--rm"], |c| {
+            matches!(
+                c,
+                CliCommand::Down {
+                    rm: true,
+                    volumes: false,
+                    ..
+                }
+            )
+        }),
+        (&["cella", "down", "b", "--rm", "--volumes"], |c| {
+            matches!(
+                c,
+                CliCommand::Down {
+                    rm: true,
+                    volumes: true,
+                    ..
+                }
+            )
+        }),
+        (&["cella", "down", "b", "--force"], |c| {
+            matches!(c, CliCommand::Down { force: true, .. })
+        }),
+        (&["cella", "up", "b", "--rebuild"], |c| {
+            matches!(c, CliCommand::Up { rebuild: true, .. })
+        }),
+        (&["cella", "prune", "--dry-run"], |c| {
+            matches!(c, CliCommand::Prune { dry_run: true, .. })
+        }),
+        (&["cella", "prune", "--all"], |c| {
+            matches!(c, CliCommand::Prune { all: true, .. })
+        }),
+        (
+            &["cella", "prune", "--older-than", "7d"],
+            |c| matches!(c, CliCommand::Prune { older_than: Some(d), .. } if d == "7d"),
+        ),
+        (&["cella", "prune", "--missing-worktree"], |c| {
+            matches!(
+                c,
+                CliCommand::Prune {
+                    missing_worktree: true,
+                    ..
+                }
+            )
+        }),
+        (
+            &["cella", "prune", "--label", "a=1"],
+            |c| matches!(c, CliCommand::Prune { labels, .. } if labels.as_slice() == ["a=1"]),
+        ),
+        (
+            &["cella", "task", "run", "b", "--base", "main", "--", "echo"],
+            |c| matches!(c, CliCommand::TaskRun { base: Some(b), .. } if b == "main"),
+        ),
+        (
+            &[
+                "cella",
+                "task",
+                "run",
+                "b",
+                "--timeout",
+                "300",
+                "--",
+                "echo",
+            ],
+            |c| {
+                matches!(
+                    c,
+                    CliCommand::TaskRun {
+                        timeout_secs: Some(300),
+                        ..
+                    }
+                )
+            },
+        ),
+        (&["cella", "task", "list", "--json"], |c| {
+            matches!(c, CliCommand::TaskList { json: true })
+        }),
+        (
+            &["cella", "task", "logs", "-f", "b"],
+            |c| matches!(c, CliCommand::TaskLogs { follow: true, branch } if branch == "b"),
+        ),
+        (
+            &["cella", "task", "logs", "--follow", "b"],
+            |c| matches!(c, CliCommand::TaskLogs { follow: true, branch } if branch == "b"),
+        ),
+        (&["cella", "doctor", "--json"], |c| {
+            matches!(c, CliCommand::Doctor { json: true })
+        }),
+    ];
+
+    #[test]
+    fn flag_cases_have_expected_effect() {
+        for (argv, check) in FLAG_CASES {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            assert!(
+                check(&parse_cli_args(&owned)),
+                "argv {argv:?} did not have its expected effect"
+            );
+        }
+    }
+
+    /// The completeness gate for layer (b): adding a flag to `CLI_SURFACE`
+    /// without a behavioural case above fails here.
+    ///
+    /// `--help`/`-h` are excluded — the parser intercepts them before any
+    /// per-command parsing, and `every_command_accepts_help` covers them.
+    #[test]
+    fn flag_cases_cover_every_surface_flag() {
+        for spec in CLI_SURFACE {
+            let segments: Vec<&str> = spec.path.split(' ').collect();
+            for opt in spec.options {
+                if opt.long == "--help" {
+                    continue;
+                }
+                for spelling in option_spellings(opt) {
+                    assert!(
+                        FLAG_CASES.iter().any(|(argv, _)| {
+                            argv.len() > segments.len()
+                                && argv[1..=segments.len()] == segments[..]
+                                && argv.contains(&spelling.as_str())
+                        }),
+                        "no behavioural case covers `cella {} {spelling}`",
+                        spec.path
+                    );
+                }
+            }
+        }
+    }
+
+    /// `--help`/`-h` reach every command — `cli.rs`'s interception runs before
+    /// any per-command parsing, which is why the table lists them everywhere.
+    #[test]
+    fn every_command_accepts_help() {
+        for spec in CLI_SURFACE {
+            for spelling in spellings(spec) {
+                for flag in ["--help", "-h"] {
+                    let argv = argv_with_flag(spec, spelling, flag);
+                    assert!(
+                        matches!(parse_cli_args(&argv), CliCommand::CommandHelp),
+                        "argv {argv:?} must print help"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Commands that reject unknown flags today. `list`, `exec`, `switch`,
+    /// `doctor` and `task list|logs|wait|stop` scan for the flags they know and
+    /// ignore the rest, so an intruder there parses fine and this test would
+    /// fail against them. Widened to the whole table when they turn strict.
+    const STRICT_PATHS: &[&str] = &["branch", "down", "up", "prune", "task run"];
+
+    /// Layer (c): a flag a command does not accept must be refused, not ignored.
+    #[test]
+    fn unknown_flags_are_rejected() {
+        let every_spelling: Vec<String> = CLI_SURFACE
+            .iter()
+            .flat_map(|s| s.options)
+            .flat_map(option_spellings)
+            .collect();
+
+        for spec in CLI_SURFACE {
+            if !STRICT_PATHS.contains(&spec.path) {
+                continue;
+            }
+            let accepted: Vec<String> = spec.options.iter().flat_map(option_spellings).collect();
+            for intruder in &every_spelling {
+                if accepted.contains(intruder) {
+                    continue;
+                }
+                let argv = argv_with_flag(spec, spec.leaf(), intruder);
+                assert!(
+                    matches!(parse_cli_args(&argv), CliCommand::Help),
+                    "`cella {} {intruder}` must be rejected, got argv {argv:?}",
+                    spec.path
+                );
+            }
+        }
+    }
+
     fn rendered(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
         let mut buf = Vec::new();
         f(&mut buf).unwrap();
