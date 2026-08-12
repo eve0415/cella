@@ -570,6 +570,7 @@ version = "0.8.0"
 dependencies = [
  "bollard",
  "cella-backend",
+ "cella-completion",
  "cella-testing",
  "chrono",
  "crossterm",

@@ -832,6 +832,22 @@ mod tests {
         shell_parses("zsh", snippet).expect("COMPLETION_SNIPPETS must be valid zsh");
     }
 
+    /// A container with neither bash nor zsh still parses the block: both
+    /// branches are dead, but a parse error in an rc file is fatal to the
+    /// shell, so the body has to be POSIX-clean regardless.
+    #[test]
+    fn completion_snippet_is_valid_posix_sh() {
+        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        for shell in ["sh", "dash"] {
+            match shell_parses(shell, snippet) {
+                Ok(()) => {}
+                // Absent shell: nothing to assert, `sh` always exists.
+                Err(e) if e.contains("must be available") && shell != "sh" => {}
+                Err(e) => panic!("COMPLETION_SNIPPETS must parse under {shell}: {e}"),
+            }
+        }
+    }
+
     /// The block is replaced rather than skipped when it changes, which only
     /// works if the guard carries a version to compare against.
     #[test]
