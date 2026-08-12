@@ -524,13 +524,7 @@ impl EnsureUpContext<'_> {
             }
         }
 
-        if capabilities.managed_agent {
-            self.ensure_agent_registered(&container.id).await;
-            // Same heal as the restart path: attaching to an already-running
-            // container is the only `up` some long-lived containers ever see.
-            crate::container_setup::inject_cella_path(self.client, &container.id, remote_user)
-                .await;
-        }
+        self.heal_managed_agent(&container.id, remote_user).await;
 
         let (_probed_env, lifecycle_env) = self
             .prepare_container_env(&container.id, remote_user)
@@ -713,6 +707,21 @@ impl EnsureUpContext<'_> {
         }
     }
 
+    /// Re-register the agent and re-apply shell integration on a container that
+    /// is already up.
+    ///
+    /// Both are idempotent, and both need re-running because a container can
+    /// outlive many cella versions: the agent may be talking to a restarted
+    /// daemon, and the rc-file blocks may predate a block cella has since added.
+    async fn heal_managed_agent(&self, container_id: &str, remote_user: &str) {
+        if !self.client.capabilities().managed_agent {
+            return;
+        }
+        self.ensure_agent_registered(container_id).await;
+        crate::container_setup::inject_shell_integration(self.client, container_id, remote_user)
+            .await;
+    }
+
     /// Roll back a daemon pre-registration that was made before a failed start.
     async fn rollback_preregistration(&self) {
         if self.client.capabilities().managed_agent {
@@ -801,7 +810,7 @@ impl EnsureUpContext<'_> {
                     // container that predates a given block never gets it.
                     // Every guard is idempotent, so re-running on each restart
                     // costs nothing and retroactively heals old containers.
-                    crate::container_setup::inject_cella_path(
+                    crate::container_setup::inject_shell_integration(
                         self.client,
                         &container.id,
                         remote_user,
@@ -1365,7 +1374,8 @@ impl EnsureUpContext<'_> {
             restart_agent_in_container(self.client, container_id).await;
         }
 
-        crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
+        crate::container_setup::inject_shell_integration(self.client, container_id, remote_user)
+            .await;
 
         if settings.credentials.protect {
             self.setup_credential_protection(container_id, settings, remote_user)

@@ -436,50 +436,99 @@ async fn apply_git_config(
     }
 }
 
-/// Add `/cella/bin` and `~/.local/bin` to PATH in the container's shell
-/// profile.
+/// A block appended to a shell profile, replaced wholesale when its version
+/// changes.
 ///
-/// `/cella/bin` makes the cella CLI (symlinked to the agent binary)
-/// discoverable. `~/.local/bin` is the XDG-standard user-local binary
-/// directory used by `curl | bash` installers (Claude Code, uv, rustup,
-/// etc.) — without it, tools installed by `install_tools_and_probe_env`
-/// may not appear on PATH in worktree containers.
-///
-/// Each block has its own idempotency guard so the function is safe to
-/// re-run and also patches containers that were created before the
-/// `~/.local/bin` block existed.
-async fn inject_snippets(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-    home: &str,
-    snippets: &[(&str, &str)],
-    profiles: &[&str],
-) {
-    for (guard, snippet) in snippets {
-        for profile in profiles {
-            let path = format!("{home}/{profile}");
-            let cmd = format!(
-                "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then printf '%s\\n' '{escaped}' >> '{path}'; fi",
-                path = path,
-                guard = guard,
-                escaped = shell_single_quote_escape(snippet),
-            );
-            let _ = client
-                .exec_command(
-                    container_id,
-                    &ExecOptions {
-                        cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
-                        user: Some("root".to_string()),
-                        working_dir: None,
-                        env: None,
-                    },
-                )
-                .await;
-        }
-    }
+/// The markers travel with the body rather than being global constants: the
+/// strip step matches `start`…`end`, so a helper that hardcoded one block's
+/// markers while accepting any block as a parameter would happily strip the
+/// *wrong* block. Keeping them together makes that unrepresentable.
+struct ManagedBlock {
+    /// Versioned opening marker. Doubles as the "already current" guard.
+    guard: &'static str,
+    /// Opening marker without the version, matched when replacing an older
+    /// block.
+    start: &'static str,
+    /// Closing marker.
+    end: &'static str,
+    /// The block itself, including both markers.
+    body: &'static str,
+    /// Profiles this block belongs in.
+    profiles: &'static [&'static str],
 }
 
-pub async fn inject_cella_path(
+/// `sh` fragment appending `snippet` to `path` unless `guard` is already there.
+///
+/// Purely additive: the guard means "present, leave it alone", so a changed
+/// snippet never reaches a profile that already has the old one. That is fine
+/// for [`PATH_SNIPPETS`] and [`TITLE_SNIPPETS`], whose bodies are stable, and
+/// is why completions use [`managed_block_command`] instead.
+fn append_if_absent_command(path: &str, guard: &str, snippet: &str) -> String {
+    format!(
+        "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
+         printf '%s\\n' '{escaped}' >> '{path}'; fi",
+        escaped = shell_single_quote_escape(snippet),
+    )
+}
+
+/// The whole shell integration as one `sh` program.
+///
+/// Every block for every profile is concatenated and run in a single
+/// `exec_command`. Issuing one statement per (block, profile) instead meant ten
+/// Docker exec round trips — create + start + inspect, plus a process spawned
+/// inside the container, each — and since injection now also runs on the
+/// attach-to-running path, that cost landed on every `cella up` against a
+/// container that was already up. The guards make almost all of it a no-op, but
+/// a no-op still costs a full round trip to discover.
+fn shell_integration_program(home: &str) -> String {
+    let mut statements = Vec::new();
+
+    // PATH_SNIPPETS are POSIX-safe → all profiles including .profile.
+    for (guard, snippet) in PATH_SNIPPETS {
+        for profile in [".bashrc", ".zshrc", ".profile"] {
+            statements.push(append_if_absent_command(
+                &format!("{home}/{profile}"),
+                guard,
+                snippet,
+            ));
+        }
+    }
+    // TITLE_SNIPPETS contain zsh-specific syntax (precmd_functions+=) that dash
+    // cannot parse even inside a dead branch → .bashrc/.zshrc only.
+    for (guard, snippet) in TITLE_SNIPPETS {
+        for profile in [".bashrc", ".zshrc"] {
+            statements.push(append_if_absent_command(
+                &format!("{home}/{profile}"),
+                guard,
+                snippet,
+            ));
+        }
+    }
+    // Completions are versioned rather than additive: a changed snippet must
+    // replace the old block, not sit beside it.
+    for block in COMPLETION_BLOCKS {
+        for profile in block.profiles {
+            statements.push(managed_block_command(&format!("{home}/{profile}"), block));
+        }
+    }
+
+    statements.join("\n")
+}
+
+/// Install cella's shell integration into the container's profiles: `/cella/bin`
+/// and `~/.local/bin` on PATH, the terminal-title hook, and completions.
+///
+/// `/cella/bin` makes the cella CLI (symlinked to the agent binary)
+/// discoverable. `~/.local/bin` is the XDG-standard user-local binary directory
+/// used by `curl | bash` installers (Claude Code, uv, rustup, etc.) — without
+/// it, tools installed by `install_tools_and_probe_env` may not appear on PATH
+/// in worktree containers.
+///
+/// Every block carries its own idempotency guard, so this is safe to re-run and
+/// also patches containers created before a given block existed. Best-effort:
+/// the exec's result is discarded, as a container without the profile files is
+/// a normal outcome rather than a failure.
+pub async fn inject_shell_integration(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
@@ -490,73 +539,21 @@ pub async fn inject_cella_path(
         format!("/home/{remote_user}")
     };
 
-    // PATH_SNIPPETS are POSIX-safe → all profiles including .profile.
-    inject_snippets(
-        client,
-        container_id,
-        &home,
-        PATH_SNIPPETS,
-        &[".bashrc", ".zshrc", ".profile"],
-    )
-    .await;
-    // TITLE_SNIPPETS contain zsh-specific syntax (precmd_functions+=) that
-    // dash cannot parse even inside a dead branch → .bashrc/.zshrc only.
-    inject_snippets(
-        client,
-        container_id,
-        &home,
-        TITLE_SNIPPETS,
-        &[".bashrc", ".zshrc"],
-    )
-    .await;
-    // Completions are versioned rather than additive: a changed snippet must
-    // replace the old block, not sit beside it. Same profiles as TITLE_SNIPPETS
-    // — dash reads `.profile` and has no completion system to feed.
-    inject_managed_block(
-        client,
-        container_id,
-        &home,
-        COMPLETION_SNIPPETS,
-        &[".bashrc", ".zshrc"],
-    )
-    .await;
-}
-
-/// Append a snippet, first deleting any earlier version of the same block.
-///
-/// [`inject_snippets`] is purely additive — its guard means "already present,
-/// leave it alone", so a container that has an old block never gets the new
-/// one. This variant guards on the *versioned* opening marker and, when it does
-/// not match, deletes everything between the unversioned start and end markers
-/// before appending. Bumping the version in the guard therefore replaces the
-/// block in every existing container.
-///
-/// Best-effort, like its sibling: if the rewrite cannot run the append still
-/// does, and the result is the additive behaviour we had before. Errors are
-/// discarded either way.
-async fn inject_managed_block(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-    home: &str,
-    snippets: &[(&str, &str)],
-    profiles: &[&str],
-) {
-    for (guard, snippet) in snippets {
-        for profile in profiles {
-            let cmd = managed_block_command(&format!("{home}/{profile}"), guard, snippet);
-            let _ = client
-                .exec_command(
-                    container_id,
-                    &ExecOptions {
-                        cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
-                        user: Some("root".to_string()),
-                        working_dir: None,
-                        env: None,
-                    },
-                )
-                .await;
-        }
-    }
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    shell_integration_program(&home),
+                ],
+                user: Some("root".to_string()),
+                working_dir: None,
+                env: None,
+            },
+        )
+        .await;
 }
 
 /// Strip a complete `start … end` block, buffering so an *unterminated* one is
@@ -571,17 +568,19 @@ async fn inject_managed_block(
 ///
 /// awk is POSIX-mandated and present in busybox, so this costs no portability.
 const STRIP_BLOCK_AWK: &str = concat!(
-    r#"skip { buf = buf $0 "\n"; if (index($0, e)) { skip = 0; buf = "" } next } "#,
+    // A second start marker while buffering means the block we were in was
+    // never terminated. Flush it back verbatim and start over here, rather than
+    // running on to this block's end marker and swallowing the user's lines
+    // between the two.
+    r#"skip { if (index($0, s)) { printf "%s", buf; buf = $0 "\n"; next } "#,
+    r#"buf = buf $0 "\n"; if (index($0, e)) { skip = 0; buf = "" } next } "#,
     r#"index($0, s) { skip = 1; buf = $0 "\n"; next } "#,
     r#"{ print } "#,
+    // Hit EOF still buffering: unterminated, so put it back untouched.
     r#"END { if (skip) printf "%s", buf }"#,
 );
 
-/// The `sh -c` program [`inject_managed_block`] runs against one profile.
-///
-/// Split out so the shell logic can be exercised against real files instead of
-/// only read — the strip-then-append sequence is the part that can corrupt an
-/// rc file if it is wrong.
+/// `sh` fragment replacing any earlier version of `block` in `path`.
 ///
 /// Three deliberate choices, each guarding a way this can go wrong when run as
 /// root against a file the container user owns:
@@ -591,25 +590,25 @@ const STRIP_BLOCK_AWK: &str = concat!(
 ///   directory that user controls, so they could pre-create it as a symlink to
 ///   a root-owned target and have this redirect clobber it.
 /// * A symlinked profile is appended to but never rewritten, matching
-///   [`inject_snippets`] exactly. Truncate-and-rewrite through a symlink would
-///   be strictly worse than the behaviour we already had.
+///   [`append_if_absent_command`] exactly. Truncate-and-rewrite through a
+///   symlink would be strictly worse than the behaviour we already had.
 /// * The rewrite runs only when a block is actually present, so the common
 ///   first-install case never rewrites the file at all.
 ///
 /// If `awk` is missing the command substitution fails, the `if` skips the
-/// rewrite, and the append still happens — degrading to the purely additive
-/// behaviour of [`inject_snippets`].
-fn managed_block_command(path: &str, guard: &str, snippet: &str) -> String {
+/// rewrite, and the append still happens — degrading to purely additive.
+fn managed_block_command(path: &str, block: &ManagedBlock) -> String {
     format!(
         "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
          if grep -q '{start}' '{path}' && [ ! -L '{path}' ] \
          && stripped=$(awk -v s='{start}' -v e='{end}' '{prog}' '{path}' 2>/dev/null); then \
          printf '%s\\n' \"$stripped\" > '{path}'; fi; \
          printf '%s\\n' '{escaped}' >> '{path}'; fi",
-        start = COMPLETION_BLOCK_START_PATTERN,
-        end = COMPLETION_BLOCK_END_PATTERN,
+        guard = block.guard,
+        start = block.start,
+        end = block.end,
         prog = STRIP_BLOCK_AWK,
-        escaped = shell_single_quote_escape(snippet),
+        escaped = shell_single_quote_escape(block.body),
     )
 }
 
@@ -618,22 +617,22 @@ fn shell_single_quote_escape(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
-/// Opening marker of *any* version of the block.
-const COMPLETION_BLOCK_START_PATTERN: &str = "# >>> cella shell completion";
-/// Closing marker.
-const COMPLETION_BLOCK_END_PATTERN: &str = "# <<< cella shell completion";
-
 /// Source the generated completion scripts from the shells that have one.
 ///
-/// The snippet is as thin as physically possible, and that is architectural.
-/// Even with a versioned guard, the block in a given container is rewritten
-/// only when the version changes; the script files under `/cella/share` are
-/// replaced wholesale on every volume repopulation. So all logic — including
-/// zsh's `compinit` guard — belongs in the versioned files, and this holds
-/// nothing but shell detection and a `.`.
-const COMPLETION_SNIPPETS: &[(&str, &str)] = &[(
-    "# >>> cella shell completion v1 >>>",
-    r#"
+/// The body is as thin as physically possible, and that is architectural. Even
+/// with a versioned guard, the block in a given container is rewritten only
+/// when the version changes; the script files under `/cella/share` are replaced
+/// wholesale on every volume repopulation. So all logic — including zsh's
+/// `compinit` guard — belongs in the versioned files, and this holds nothing
+/// but shell detection and a `.`.
+///
+/// `.profile` is excluded: dash reads it and has no completion system to feed.
+const COMPLETION_BLOCKS: &[ManagedBlock] = &[ManagedBlock {
+    guard: "# >>> cella shell completion v1 >>>",
+    start: "# >>> cella shell completion",
+    end: "# <<< cella shell completion",
+    profiles: &[".bashrc", ".zshrc"],
+    body: r#"
 # >>> cella shell completion v1 >>>
 if [ -n "$BASH_VERSION" ]; then
     [ -r /cella/share/completions/cella.bash ] && . /cella/share/completions/cella.bash
@@ -642,7 +641,7 @@ elif [ -n "$ZSH_VERSION" ]; then
 fi
 # <<< cella shell completion <<<
 "#,
-)];
+}];
 
 const PATH_SNIPPETS: &[(&str, &str)] = &[
     (
@@ -850,7 +849,7 @@ mod tests {
         );
     }
 
-    // ── COMPLETION_SNIPPETS ───────────────────────────────────────────────
+    // ── COMPLETION_BLOCKS ────────────────────────────────────────────────
 
     fn shell_parses(shell: &str, snippet: &str) -> Result<(), String> {
         let output = std::process::Command::new(shell)
@@ -865,14 +864,14 @@ mod tests {
 
     #[test]
     fn completion_snippet_is_valid_bash() {
-        let (_, snippet) = COMPLETION_SNIPPETS[0];
-        shell_parses("bash", snippet).expect("COMPLETION_SNIPPETS must be valid bash");
+        let snippet = COMPLETION_BLOCKS[0].body;
+        shell_parses("bash", snippet).expect("COMPLETION_BLOCKS must be valid bash");
     }
 
     #[test]
     fn completion_snippet_is_valid_zsh() {
-        let (_, snippet) = COMPLETION_SNIPPETS[0];
-        shell_parses("zsh", snippet).expect("COMPLETION_SNIPPETS must be valid zsh");
+        let snippet = COMPLETION_BLOCKS[0].body;
+        shell_parses("zsh", snippet).expect("COMPLETION_BLOCKS must be valid zsh");
     }
 
     /// A container with neither bash nor zsh still parses the block: both
@@ -880,13 +879,13 @@ mod tests {
     /// shell, so the body has to be POSIX-clean regardless.
     #[test]
     fn completion_snippet_is_valid_posix_sh() {
-        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        let snippet = COMPLETION_BLOCKS[0].body;
         for shell in ["sh", "dash"] {
             match shell_parses(shell, snippet) {
                 Ok(()) => {}
                 // Absent shell: nothing to assert, `sh` always exists.
                 Err(e) if e.contains("must be available") && shell != "sh" => {}
-                Err(e) => panic!("COMPLETION_SNIPPETS must parse under {shell}: {e}"),
+                Err(e) => panic!("COMPLETION_BLOCKS must parse under {shell}: {e}"),
             }
         }
     }
@@ -895,18 +894,25 @@ mod tests {
     /// works if the guard carries a version to compare against.
     #[test]
     fn completion_guard_is_versioned() {
-        assert!(COMPLETION_SNIPPETS[0].0.contains("v1"));
+        assert!(COMPLETION_BLOCKS[0].guard.contains("v1"));
     }
 
     /// `inject_managed_block` deletes from the opening marker to the closing
     /// one, so both must be present and the guard must be the opening marker.
     #[test]
     fn completion_snippet_is_delimited_by_its_guard() {
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
-        assert!(snippet.contains(guard), "snippet must open with its guard");
+        let block = &COMPLETION_BLOCKS[0];
         assert!(
-            snippet.contains(COMPLETION_BLOCK_END_PATTERN),
-            "snippet must close with the end marker"
+            block.body.contains(block.guard),
+            "body must open with its versioned guard"
+        );
+        assert!(
+            block.body.contains(block.start),
+            "the versioned guard must extend the unversioned start marker"
+        );
+        assert!(
+            block.body.contains(block.end),
+            "body must close with the end marker"
         );
     }
 
@@ -915,7 +921,7 @@ mod tests {
     /// already written into an rc file is only rewritten when its version bumps.
     #[test]
     fn completion_snippet_sources_both_generated_scripts() {
-        let (_, snippet) = COMPLETION_SNIPPETS[0];
+        let snippet = COMPLETION_BLOCKS[0].body;
         assert!(snippet.contains("/cella/share/completions/cella.bash"));
         assert!(snippet.contains("/cella/share/completions/cella.zsh"));
         // `-r`, not `-f`: volume population failures are warned and tolerated,
@@ -923,10 +929,97 @@ mod tests {
         assert!(snippet.contains("[ -r "), "must guard on readability");
     }
 
+    /// The batched program is what actually runs in the container: every block,
+    /// every profile, one `sh -c`. Driving it against real files is the only
+    /// check that the concatenation of ten `if … fi` statements still parses
+    /// and still does each job.
+    #[test]
+    fn one_program_injects_every_block_into_every_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        for profile in [".bashrc", ".zshrc", ".profile"] {
+            std::fs::write(dir.path().join(profile), "export EDITOR=vi\n").unwrap();
+        }
+        let program = shell_integration_program(&dir.path().to_string_lossy());
+
+        let status = std::process::Command::new("sh")
+            .args(["-c", &program])
+            .status()
+            .expect("sh must be available");
+        assert!(status.success(), "program failed: {program}");
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+
+        // PATH blocks reach every profile, including `.profile`.
+        for profile in [".bashrc", ".zshrc", ".profile"] {
+            let text = read(profile);
+            for (guard, _) in PATH_SNIPPETS {
+                assert!(text.contains(guard), "{profile} missing `{guard}`");
+            }
+        }
+        // Title and completion blocks stay out of `.profile`, which dash reads.
+        for profile in [".bashrc", ".zshrc"] {
+            let text = read(profile);
+            assert!(
+                text.contains(TITLE_SNIPPETS[0].0),
+                "{profile} missing title"
+            );
+            assert!(
+                text.contains(COMPLETION_BLOCKS[0].guard),
+                "{profile} missing completions"
+            );
+        }
+        let profile_text = read(".profile");
+        assert!(
+            !profile_text.contains(COMPLETION_BLOCKS[0].guard),
+            "completions must not reach .profile: {profile_text}"
+        );
+        assert!(
+            !profile_text.contains(TITLE_SNIPPETS[0].0),
+            "title hook must not reach .profile: {profile_text}"
+        );
+    }
+
+    /// Re-running must change nothing — it runs on every `cella up`.
+    #[test]
+    fn the_program_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        for profile in [".bashrc", ".zshrc", ".profile"] {
+            std::fs::write(dir.path().join(profile), "export EDITOR=vi\n").unwrap();
+        }
+        let program = shell_integration_program(&dir.path().to_string_lossy());
+        let run = || {
+            std::process::Command::new("sh")
+                .args(["-c", &program])
+                .status()
+                .expect("sh must be available")
+        };
+
+        assert!(run().success());
+        let first: Vec<String> = [".bashrc", ".zshrc", ".profile"]
+            .iter()
+            .map(|p| std::fs::read_to_string(dir.path().join(p)).unwrap())
+            .collect();
+        assert!(run().success());
+        let second: Vec<String> = [".bashrc", ".zshrc", ".profile"]
+            .iter()
+            .map(|p| std::fs::read_to_string(dir.path().join(p)).unwrap())
+            .collect();
+
+        assert_eq!(first, second, "a second run must be a no-op");
+    }
+
+    /// The batched program has to parse as POSIX sh — it is handed to `sh -c`,
+    /// and a syntax error anywhere kills every block, not just one.
+    #[test]
+    fn the_program_is_valid_posix_sh() {
+        let program = shell_integration_program("/home/dev");
+        shell_parses("sh", &program).expect("shell_integration_program must parse under sh");
+    }
+
     /// The whole point of the versioned guard: run the real `sh` program
     /// against real files and check what lands in them.
-    fn run_injection(rc: &std::path::Path, guard: &str, snippet: &str) {
-        let cmd = managed_block_command(&rc.to_string_lossy(), guard, snippet);
+    fn run_injection(rc: &std::path::Path, block: &ManagedBlock) {
+        let cmd = managed_block_command(&rc.to_string_lossy(), block);
         let status = std::process::Command::new("sh")
             .args(["-c", &cmd])
             .status()
@@ -937,7 +1030,7 @@ mod tests {
     fn blocks_in(rc: &std::path::Path) -> usize {
         std::fs::read_to_string(rc)
             .unwrap()
-            .matches(COMPLETION_BLOCK_START_PATTERN)
+            .matches(COMPLETION_BLOCKS[0].start)
             .count()
     }
 
@@ -946,12 +1039,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join(".bashrc");
         std::fs::write(&rc, "export EDITOR=vi\n").unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
         assert_eq!(blocks_in(&rc), 1, "first run must append the block");
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
         assert_eq!(blocks_in(&rc), 1, "same version must not append again");
 
         let after = std::fs::read_to_string(&rc).unwrap();
@@ -970,9 +1063,9 @@ mod tests {
         let rc = dir.path().join(".bashrc");
         let old = "# >>> cella shell completion v0 >>>\nold_and_wrong\n# <<< cella shell completion <<<\n";
         std::fs::write(&rc, format!("export EDITOR=vi\n{old}alias l=ls\n")).unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let after = std::fs::read_to_string(&rc).unwrap();
         assert_eq!(blocks_in(&rc), 1, "exactly one block must remain: {after}");
@@ -1005,9 +1098,9 @@ mod tests {
              alias l=ls\n",
         )
         .unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let after = std::fs::read_to_string(&rc).unwrap();
         assert!(
@@ -1019,6 +1112,47 @@ mod tests {
         assert!(
             after.contains("v1"),
             "new block must still be appended: {after}"
+        );
+    }
+
+    /// The lifecycle this code produces on its own: a write cut short leaves an
+    /// unterminated block, the next run appends a well-formed one after the
+    /// user's lines, and the version bump after that has to strip only the
+    /// second. Buffering to the *next* end marker anywhere in the file instead
+    /// swallows everything between the two — as root, silently.
+    #[test]
+    fn a_stale_unterminated_block_does_not_swallow_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(
+            &rc,
+            "export EDITOR=vi\n\
+             # >>> cella shell completion v0 >>>\n\
+             truncated\n\
+             export SECRET_TOOL=1\n\
+             alias l=ls\n\
+             # >>> cella shell completion v0 >>>\n\
+             current\n\
+             # <<< cella shell completion <<<\n\
+             export TAIL=1\n",
+        )
+        .unwrap();
+        let block = &COMPLETION_BLOCKS[0];
+
+        run_injection(&rc, block);
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        for line in [
+            "export EDITOR=vi",
+            "export SECRET_TOOL=1",
+            "alias l=ls",
+            "export TAIL=1",
+        ] {
+            assert!(after.contains(line), "`{line}` was swallowed: {after}");
+        }
+        assert!(
+            !after.contains("current"),
+            "the well-formed block must still be replaced: {after}"
         );
     }
 
@@ -1037,9 +1171,9 @@ mod tests {
              export ALSO_KEEP=1\n",
         )
         .unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let after = std::fs::read_to_string(&rc).unwrap();
         assert!(after.contains("export KEEP_ME=1"), "{after}");
@@ -1055,9 +1189,9 @@ mod tests {
         let old = "# >>> cella shell completion v0 >>>\nstale\n# <<< cella shell completion <<<\n";
         std::fs::write(&rc, format!("export EDITOR=vi\n{old}")).unwrap();
         let before = std::fs::metadata(&rc).unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let after = std::fs::metadata(&rc).unwrap();
         assert_eq!(
@@ -1072,8 +1206,7 @@ mod tests {
     /// to a root-owned file and have our root-run redirect clobber the target.
     #[test]
     fn injection_never_writes_a_predictable_scratch_path() {
-        let (_, snippet) = COMPLETION_SNIPPETS[0];
-        let cmd = managed_block_command("/home/dev/.bashrc", COMPLETION_SNIPPETS[0].0, snippet);
+        let cmd = managed_block_command("/home/dev/.bashrc", &COMPLETION_BLOCKS[0]);
         assert!(
             !cmd.contains(".bashrc."),
             "no derived scratch path may appear in the command: {cmd}"
@@ -1081,8 +1214,8 @@ mod tests {
         assert!(!cmd.contains("tmp"), "no scratch file at all: {cmd}");
     }
 
-    /// A symlinked rc file falls back to append-only, exactly matching the
-    /// pre-existing `inject_snippets` behaviour. Truncating and rewriting
+    /// A symlinked rc file falls back to append-only, exactly matching
+    /// `append_if_absent_command`'s behaviour. Truncating and rewriting
     /// through a symlink as root would be strictly worse than what we had.
     ///
     /// The target is seeded with a *stale block* so the assertion can tell the
@@ -1100,9 +1233,9 @@ mod tests {
         .unwrap();
         let rc = dir.path().join(".bashrc");
         std::os::unix::fs::symlink(&target, &rc).unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let after = std::fs::read_to_string(&target).unwrap();
         assert!(after.starts_with("important\n"), "{after}");
@@ -1127,9 +1260,9 @@ mod tests {
     fn injection_skips_a_missing_profile() {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join(".zshrc");
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         assert!(!rc.exists(), "must not create the profile");
     }
@@ -1158,9 +1291,9 @@ mod tests {
         let stale =
             "# >>> cella shell completion v0 >>>\nstale\n# <<< cella shell completion <<<\n";
         std::fs::write(&rc, format!("export EDITOR=vi\n{stale}")).unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        let cmd = managed_block_command(&rc.to_string_lossy(), guard, snippet);
+        let cmd = managed_block_command(&rc.to_string_lossy(), block);
         let status = std::process::Command::new("sh")
             .args(["-c", &cmd])
             // Prepended, not replaced: `sh`, `grep`, `cat`, `rm` and `printf`
@@ -1193,9 +1326,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join(".bashrc");
         std::fs::write(&rc, "export EDITOR=vi\n").unwrap();
-        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+        let block = &COMPLETION_BLOCKS[0];
 
-        run_injection(&rc, guard, snippet);
+        run_injection(&rc, block);
 
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1213,8 +1346,8 @@ mod tests {
         let guards: Vec<&str> = PATH_SNIPPETS
             .iter()
             .chain(TITLE_SNIPPETS)
-            .chain(COMPLETION_SNIPPETS)
             .map(|(g, _)| *g)
+            .chain(COMPLETION_BLOCKS.iter().map(|b| b.guard))
             .collect();
         let unique: std::collections::HashSet<&str> = guards.iter().copied().collect();
         assert_eq!(guards.len(), unique.len(), "guards must not collide");

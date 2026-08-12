@@ -1249,7 +1249,7 @@ impl UpContext {
             .await;
 
         // Add /cella/bin to PATH in shell profiles so `cella` CLI is discoverable.
-        inject_cella_path(self.client.as_ref(), container_id, remote_user).await;
+        inject_shell_integration(self.client.as_ref(), container_id, remote_user).await;
 
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
@@ -2170,8 +2170,17 @@ pub async fn inject_post_start(
 }
 
 /// Add `/cella/bin` to PATH in the container's shell profile.
-async fn inject_cella_path(client: &dyn ContainerBackend, container_id: &str, remote_user: &str) {
-    cella_orchestrator::container_setup::inject_cella_path(client, container_id, remote_user).await;
+async fn inject_shell_integration(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
+    cella_orchestrator::container_setup::inject_shell_integration(
+        client,
+        container_id,
+        remote_user,
+    )
+    .await;
 }
 
 // ── Shared container-operation helpers (delegated to orchestrator) ─────────
