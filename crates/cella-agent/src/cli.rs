@@ -575,6 +575,19 @@ fn command_synopsis(spec: &CommandSpec) -> String {
     } else {
         format!("{} ({})", spec.path, spec.aliases.join(", "))
     };
+    synopsis_from(spec, head)
+}
+
+/// The same synopsis without the alias annotation, for a `Usage:` line.
+///
+/// `Usage: cella list (ls) [options]` is not something a user can type. The
+/// listing tables want the aliases inline; a usage line wants a command.
+fn usage_synopsis(spec: &CommandSpec) -> String {
+    synopsis_from(spec, spec.path.to_owned())
+}
+
+/// Append operands and the `[options]` marker to an already-rendered head.
+fn synopsis_from(spec: &CommandSpec, head: String) -> String {
     let mut parts = vec![head];
     // `[options]` goes before the trailing `-- <cmd...>`, because that is the
     // only place the parser reads them: anything after `--` is handed to the
@@ -638,8 +651,11 @@ fn render_command_help(out: &mut dyn std::io::Write, command: &str) -> std::io::
         return writeln!(out, "No help available for this command.");
     };
 
-    writeln!(out, "Usage: cella {}\n", command_synopsis(spec))?;
+    writeln!(out, "Usage: cella {}\n", usage_synopsis(spec))?;
     writeln!(out, "{}\n", spec.about)?;
+    if !spec.aliases.is_empty() {
+        writeln!(out, "Aliases: {}\n", spec.aliases.join(", "))?;
+    }
 
     let subcommands: Vec<&CommandSpec> = cella_completion::subcommands_of(spec.path).collect();
     if !subcommands.is_empty() {
@@ -2093,6 +2109,25 @@ mod tests {
                 spec.path
             );
         }
+    }
+
+    /// A `Usage:` line has to be something the user can type. Annotating it
+    /// with aliases — `Usage: cella list (ls) [options]` — is not.
+    #[test]
+    fn usage_lines_are_runnable_commands() {
+        for spec in CLI_SURFACE {
+            let usage = usage_synopsis(spec);
+            assert!(
+                !usage.contains('(') && !usage.contains(')'),
+                "`{}` usage is not typeable: {usage}",
+                spec.path
+            );
+            assert!(usage.starts_with(spec.path), "{usage}");
+        }
+        // The aliases still have to be discoverable, just not in the usage line.
+        let text = rendered(|b| render_command_help(b, "list"));
+        assert!(text.contains("Aliases: ls"), "{text}");
+        assert!(!text.contains("Usage: cella list (ls)"), "{text}");
     }
 
     /// A sub-subcommand's flags must survive into the help a user can actually
