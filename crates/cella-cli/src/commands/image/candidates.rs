@@ -255,43 +255,69 @@ pub fn compute(tags: &[String], current: &str, alias_runtime: Option<&str>) -> O
     let parsed = grammar.parse(current)?;
     let selection = parsed.variant;
 
-    // A floating pin names a variant but carries no image version, so there
-    // is nothing to advance from — only something to fix in place. Offering
-    // that is the whole point of a command that pins.
-    let Some(current_version) = parsed.version else {
-        return Some(Candidates {
-            current: current.to_owned(),
-            version_bump: None,
-            pin: newest_in_variant(&grammar, &refs, selection).map(|(_, tag)| tag.to_owned()),
-            moves: moves_for(&grammar, &refs, selection, None, alias_runtime),
-            limitation: limitation_for(&grammar, &refs, current, selection, alias_runtime),
-        });
-    };
-
     // Ranking finds the newest tag sharing the pin's selection; it says
     // nothing about whether that tag beats the pin, so every candidate is
     // measured against this key before being offered. An unparseable pin
     // leaves nothing to measure against, so nothing is offered.
-    let Some(current_key) = version_key(current_version) else {
-        return Some(Candidates::unrankable(current));
+    let current_key = match parsed.version {
+        Some(version) => match version_key(version) {
+            Some(key) => Some(key),
+            None => return Some(Candidates::unrankable(current)),
+        },
+        None => None,
     };
 
-    let version_bump = newest_in_variant(&grammar, &refs, selection)
-        .filter(|(key, tag)| *tag != current && *key > current_key)
-        .map(|(_, tag)| tag.to_owned());
+    // A pin re-resolves either because it names no version at all
+    // (`24-trixie`) or because it names one that a published tag extends
+    // (`5-trixie`, while `5.0.3-trixie` exists and shares its digest). Both
+    // track upstream, so both get pinned rather than bumped: freezing them is
+    // a lasting change, not an update.
+    let tracks_upstream = parsed
+        .version
+        .is_none_or(|version| is_alias_version(&grammar, &refs, selection, version));
+
+    let newest = newest_in_variant(&grammar, &refs, selection).filter(|(_, tag)| *tag != current);
+    let (version_bump, pin) = if tracks_upstream {
+        (None, newest.map(|(_, tag)| tag.to_owned()))
+    } else {
+        let bump = newest
+            .filter(|(key, _)| current_key.as_ref().is_some_and(|current| key > current))
+            .map(|(_, tag)| tag.to_owned());
+        (bump, None)
+    };
 
     Some(Candidates {
         current: current.to_owned(),
         version_bump,
-        pin: None,
+        pin,
         moves: moves_for(
             &grammar,
             &refs,
             selection,
-            Some(&current_key),
+            current_key.as_ref(),
             alias_runtime,
+            tracks_upstream,
         ),
         limitation: limitation_for(&grammar, &refs, current, selection, alias_runtime),
+    })
+}
+
+/// Whether `version` is an alias that re-resolves, i.e. some published tag in
+/// the same variant carries a version with more dotted segments.
+///
+/// `5-trixie` and `5.0-trixie` both resolve to `5.0.3-trixie` upstream and
+/// share its digest, so pinning one of them freezes a tag that was tracking.
+/// The dot check keeps the boundary honest: `5` does not extend to `50.1`.
+fn is_alias_version(grammar: &TagGrammar, tags: &[&str], selection: &str, version: &str) -> bool {
+    tags.iter().any(|tag| {
+        grammar.parse(tag).is_some_and(|parsed| {
+            parsed.variant == selection
+                && parsed.version.is_some_and(|candidate| {
+                    candidate
+                        .strip_prefix(version)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+        })
     })
 }
 
@@ -467,11 +493,12 @@ fn moves_for(
     selection: &str,
     current_key: Option<&VersionKey>,
     alias_runtime: Option<&str>,
+    tracks_upstream: bool,
 ) -> Vec<VariantMove> {
     // A variant may be a bare runtime with no distro at all (`5.0.3-22`).
     // It still has a runtime axis, just no release one.
     let Some((prefix, _, current_release)) = distro_of(selection) else {
-        return runtime_only_moves(grammar, tags, selection, current_key);
+        return runtime_only_moves(grammar, tags, selection, current_key, tracks_upstream);
     };
     let pin_runtime = match (runtime_of(prefix), alias_runtime) {
         (Runtime::Alias, Some(runtime)) => {
@@ -515,10 +542,11 @@ fn moves_for(
         if current_key.is_some_and(|current| &key < current) {
             continue;
         }
-        // Every offered tag carries a version, so moving off a *floating* pin
-        // freezes it as well as moving it. That is the same lasting change
-        // `pin` is gated on, and it must not ride in on a runtime flag alone.
-        let axes = if current_key.is_none() {
+        // Every offered tag carries a version, so moving off a pin that was
+        // tracking upstream freezes it as well as moving it. That is the same
+        // lasting change `pin` is gated on, and it must not ride in on a
+        // runtime flag alone.
+        let axes = if tracks_upstream {
             axes | AxisSet::SHAPE
         } else {
             axes
@@ -561,6 +589,7 @@ fn runtime_only_moves(
     tags: &[&str],
     selection: &str,
     current_key: Option<&VersionKey>,
+    tracks_upstream: bool,
 ) -> Vec<VariantMove> {
     let Some(pinned) = version_key(selection) else {
         return Vec::new();
@@ -581,8 +610,8 @@ fn runtime_only_moves(
         if current_key.is_some_and(|current| &key < current) {
             continue;
         }
-        // As in `moves_for`: moving off a floating pin also freezes it.
-        let axes = if current_key.is_none() {
+        // As in `moves_for`: moving off a tracking pin also freezes it.
+        let axes = if tracks_upstream {
             AxisSet::RUNTIME | AxisSet::SHAPE
         } else {
             AxisSet::RUNTIME
@@ -761,6 +790,52 @@ mod tests {
                 .all(|m| !m.axes.contains(AxisSet::SHAPE)),
             "a versioned pin is not re-pinned: {:?}",
             versioned.moves
+        );
+    }
+
+    /// A version can itself be an alias. Upstream, `5-trixie`, `5.0-trixie`
+    /// and `5.0.3-trixie` all carry digest `b55b444f…954f` — the first two
+    /// re-resolve as 5.x moves on. Reading them as ordinary versioned pins let
+    /// bare `--yes` rewrite `5-trixie` to `5.0.3-trixie`, freezing a tag that
+    /// was tracking, with no flag at all.
+    #[test]
+    fn a_version_that_re_resolves_is_pinned_not_bumped() {
+        let tags = typescript_node_tags();
+
+        for pin in ["5-trixie", "5.0-trixie"] {
+            let c = compute(&tags, pin, None).unwrap();
+            assert_eq!(
+                c.version_bump, None,
+                "{pin} tracks upstream; advancing it is a pin"
+            );
+            assert_eq!(c.pin.as_deref(), Some("5.0.3-trixie"), "{pin}");
+            assert!(
+                c.moves.iter().all(|m| m.axes.contains(AxisSet::SHAPE)),
+                "{pin}: moving off it also freezes it: {:?}",
+                c.moves
+            );
+        }
+
+        // A fully-specified version is not extended by anything published, so
+        // it is a real pin and its bump stays free.
+        let exact = compute(&tags, "5.0.1-trixie", None).unwrap();
+        assert_eq!(exact.version_bump.as_deref(), Some("5.0.3-trixie"));
+        assert_eq!(exact.pin, None);
+    }
+
+    /// The dot boundary matters: `5` must not be read as an alias of `50.1`.
+    #[test]
+    fn an_alias_version_must_match_on_a_dot_boundary() {
+        let tags: Vec<String> = ["5-trixie", "50.1-trixie", "trixie"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let c = compute(&tags, "5-trixie", None).unwrap();
+        assert_eq!(c.pin, None, "50.1 does not extend 5");
+        assert_eq!(
+            c.version_bump.as_deref(),
+            Some("50.1-trixie"),
+            "it is an ordinary newer version"
         );
     }
 
