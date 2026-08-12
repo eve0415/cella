@@ -526,6 +526,10 @@ impl EnsureUpContext<'_> {
 
         if capabilities.managed_agent {
             self.ensure_agent_registered(&container.id).await;
+            // Same heal as the restart path: attaching to an already-running
+            // container is the only `up` some long-lived containers ever see.
+            crate::container_setup::inject_cella_path(self.client, &container.id, remote_user)
+                .await;
         }
 
         let (_probed_env, lifecycle_env) = self
@@ -793,6 +797,16 @@ impl EnsureUpContext<'_> {
                         )
                         .await;
                     restart_agent_in_container(self.client, &container.id).await;
+                    // Shell integration is otherwise create-only, so every
+                    // container that predates a given block never gets it.
+                    // Every guard is idempotent, so re-running on each restart
+                    // costs nothing and retroactively heals old containers.
+                    crate::container_setup::inject_cella_path(
+                        self.client,
+                        &container.id,
+                        remote_user,
+                    )
+                    .await;
                 }
 
                 self.run_restart_lifecycle(container, remote_user).await?;
