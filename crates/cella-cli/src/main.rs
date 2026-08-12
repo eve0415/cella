@@ -76,8 +76,12 @@ struct Cli {
     command: commands::Command,
 }
 
+fn main() {
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     title::install_signal_handlers();
 
     // Install miette's graphical error handler for pretty diagnostics
