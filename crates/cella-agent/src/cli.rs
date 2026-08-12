@@ -85,6 +85,13 @@ pub enum CliCommand {
     },
     Help,
     CommandHelp,
+    /// The user misused a command: an error has already been printed and the
+    /// process must exit non-zero.
+    ///
+    /// Distinct from [`CliCommand::Help`], which is an explicit `--help` and
+    /// exits 0. Returning `Help` here made `cella list --jsno` print an error
+    /// and still exit 0, so a script could not tell it from a clean run.
+    UsageError,
     Unsupported {
         command: String,
     },
@@ -113,7 +120,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => {
             if !flags_are_known(&args[2..], &["--json"], "list") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::List { json }
@@ -129,13 +136,13 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 _ => return CliCommand::Help,
             };
             if !flags_are_known(&args[3..], &[], "switch") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             CliCommand::Switch { branch }
         }
         Some("doctor") => {
             if !flags_are_known(&args[2..], &["--json"], "doctor") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::Doctor { json }
@@ -182,7 +189,7 @@ fn parse_exec_subcommand(args: &[String]) -> CliCommand {
     // command and may legitimately start with a dash.
     let own = &args[3..sep.unwrap_or(args.len())];
     if !flags_are_known(own, &["--json"], "exec") {
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     let json = own.iter().any(|a| a == "--json");
     CliCommand::Exec {
@@ -200,13 +207,13 @@ fn parse_down_subcommand(args: &[String]) -> CliCommand {
     };
     let flags = &args[3..];
     if !flags_are_known(flags, &["--rm", "--volumes", "--force"], "down") {
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     let has = |name: &str| flags.iter().any(|a| a == name);
     let (rm, volumes) = (has("--rm"), has("--volumes"));
     if volumes && !rm {
         eprintln!("Error: --volumes requires --rm");
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     CliCommand::Down {
         branch,
@@ -223,7 +230,7 @@ fn parse_up_subcommand(args: &[String]) -> CliCommand {
         _ => return CliCommand::Help,
     };
     if !flags_are_known(&args[3..], &["--rebuild"], "up") {
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     CliCommand::Up {
         branch,
@@ -238,11 +245,11 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
     };
     if name.is_empty() {
         eprintln!("Error: branch name cannot be empty");
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     if name.contains(|c: char| c.is_whitespace()) {
         eprintln!("Error: branch name cannot contain whitespace");
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     let mut base = None;
     let mut labels = Vec::new();
@@ -256,7 +263,7 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --base requires a value (e.g., --base main)");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             }
         } else if args[i] == "--label" {
@@ -273,12 +280,12 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --label requires KEY=VALUE format");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             }
         } else if args[i].starts_with('-') {
             eprintln!("Error: unknown flag '{}' for branch command", args[i]);
-            return CliCommand::Help;
+            return CliCommand::UsageError;
         } else {
             i += 1;
         }
@@ -314,7 +321,7 @@ fn parse_prune_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --older-than requires a value (e.g., --older-than 7d)");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             },
             "--label" => match args.get(i + 1) {
@@ -324,12 +331,12 @@ fn parse_prune_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --label requires KEY=VALUE format");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             },
             f if f.starts_with('-') => {
                 eprintln!("Error: unknown flag '{f}' for prune command");
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             _ => {
                 i += 1;
@@ -372,7 +379,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                         }
                         _ => {
                             eprintln!("Error: --base requires a value (e.g., --base main)");
-                            return CliCommand::Help;
+                            return CliCommand::UsageError;
                         }
                     }
                 } else if args[i] == "--timeout" {
@@ -387,7 +394,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                     }
                 } else if args[i].starts_with('-') {
                     eprintln!("Error: unknown flag '{}' for task run command", args[i]);
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 } else {
                     i += 1;
                 }
@@ -401,7 +408,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
         }
         Some("list" | "ls") => {
             if !flags_are_known(&args[3..], &["--json"], "task list") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             let json = args[3..].iter().any(|a| a == "--json");
             CliCommand::TaskList { json }
@@ -410,7 +417,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
             // Parse: cella task logs [-f|--follow] <branch> — the flag is
             // accepted on either side of the positional.
             if !flags_are_known(&args[3..], &["-f", "--follow"], "task logs") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             let follow = args[3..].iter().any(|a| a == "-f" || a == "--follow");
             let branch = args[3..].iter().find(|a| !a.starts_with('-')).cloned();
@@ -425,7 +432,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 _ => return CliCommand::Help,
             };
             if !flags_are_known(&args[4..], &[], "task wait") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             CliCommand::TaskWait { branch }
         }
@@ -435,7 +442,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 _ => return CliCommand::Help,
             };
             if !flags_are_known(&args[4..], &[], "task stop") {
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             CliCommand::TaskStop { branch }
         }
@@ -451,6 +458,10 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             Ok(())
         }
         CliCommand::CommandHelp => Ok(()),
+        CliCommand::UsageError => {
+            print_help();
+            std::process::exit(1);
+        }
         CliCommand::Doctor { json } => {
             if json {
                 run_doctor_json().await
@@ -1622,7 +1633,10 @@ mod tests {
             CliCommand::TaskStop { .. } => Some("task stop"),
             CliCommand::Switch { .. } => Some("switch"),
             CliCommand::Doctor { .. } => Some("doctor"),
-            CliCommand::Help | CliCommand::CommandHelp | CliCommand::Unsupported { .. } => None,
+            CliCommand::Help
+            | CliCommand::CommandHelp
+            | CliCommand::UsageError
+            | CliCommand::Unsupported { .. } => None,
         }
     }
 
@@ -1949,7 +1963,7 @@ mod tests {
                 }
                 let argv = argv_with_flag(spec, spec.leaf(), intruder);
                 assert!(
-                    matches!(parse_cli_args(&argv), CliCommand::Help),
+                    matches!(parse_cli_args(&argv), CliCommand::UsageError),
                     "`cella {} {intruder}` must be rejected, got argv {argv:?}",
                     spec.path
                 );
@@ -1965,7 +1979,7 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(matches!(parse_cli_args(&args), CliCommand::Help));
+        assert!(matches!(parse_cli_args(&args), CliCommand::UsageError));
     }
 
     fn rendered(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
@@ -2619,7 +2633,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2778,7 +2792,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2788,7 +2802,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2798,7 +2812,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2885,7 +2899,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -3009,7 +3023,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]

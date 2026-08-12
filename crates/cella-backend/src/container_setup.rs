@@ -599,7 +599,8 @@ const STRIP_BLOCK_AWK: &str = concat!(
 /// rewrite, and the append still happens — degrading to purely additive.
 fn managed_block_command(path: &str, block: &ManagedBlock) -> String {
     format!(
-        "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
+        "if [ -f '{path}' ] \
+         && ! {{ grep -q '{guard}' '{path}' && grep -q '{end}' '{path}'; }}; then \
          if grep -q '{start}' '{path}' && [ ! -L '{path}' ] \
          && stripped=$(awk -v s='{start}' -v e='{end}' '{prog}' '{path}' 2>/dev/null); then \
          printf '%s\\n' \"$stripped\" > '{path}'; fi; \
@@ -1113,6 +1114,31 @@ mod tests {
             after.contains("v1"),
             "new block must still be appended: {after}"
         );
+    }
+
+    /// A block whose opening marker landed but whose body did not — an append
+    /// cut short — must be repaired, not treated as already current. Guarding
+    /// on the opening marker alone leaves completions permanently broken in
+    /// that container until the version happens to change.
+    #[test]
+    fn a_half_written_current_block_is_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        let block = &COMPLETION_BLOCKS[0];
+        std::fs::write(&rc, format!("export EDITOR=vi\n{}\n", block.guard)).unwrap();
+
+        run_injection(&rc, block);
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert!(
+            after.contains("/cella/share/completions/cella.bash"),
+            "the truncated block must be completed: {after}"
+        );
+        assert!(
+            after.contains(block.end),
+            "closing marker must be present: {after}"
+        );
+        assert!(after.contains("export EDITOR=vi"), "{after}");
     }
 
     /// The lifecycle this code produces on its own: a write cut short leaves an
