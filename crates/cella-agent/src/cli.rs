@@ -566,10 +566,18 @@ fn command_synopsis(spec: &CommandSpec) -> String {
         format!("{} ({})", spec.path, spec.aliases.join(", "))
     };
     let mut parts = vec![head];
-    parts.extend(spec.operands.iter().map(OperandSpec::synopsis));
+    // `[options]` goes before the trailing `-- <cmd...>`, because that is the
+    // only place the parser reads them: anything after `--` is handed to the
+    // user's own command verbatim.
+    let (trailing, leading): (Vec<_>, Vec<_>) = spec
+        .operands
+        .iter()
+        .partition(|o| matches!(o, OperandSpec::Trailing { .. }));
+    parts.extend(leading.iter().map(|o| o.synopsis()));
     if spec.options.iter().any(|o| o.long != "--help") {
         parts.push("[options]".to_owned());
     }
+    parts.extend(trailing.iter().map(|o| o.synopsis()));
     parts.join(" ")
 }
 
@@ -626,21 +634,41 @@ fn render_command_help(out: &mut dyn std::io::Write, command: &str) -> std::io::
     let subcommands: Vec<&CommandSpec> = cella_completion::subcommands_of(spec.path).collect();
     if !subcommands.is_empty() {
         writeln!(out, "Subcommands:")?;
-        let rows: Vec<(String, &'static str)> = subcommands
-            .iter()
-            .map(|sub| {
-                let synopsis = command_synopsis(sub);
-                let leaf = synopsis
-                    .strip_prefix(spec.path)
-                    .map_or_else(|| synopsis.clone(), |rest| rest.trim_start().to_owned());
-                (leaf, sub.about)
-            })
-            .collect();
-        write_table(out, &rows)?;
-        writeln!(out)?;
+        for sub in &subcommands {
+            write_subcommand_entry(out, spec.path, sub)?;
+        }
     }
 
     writeln!(out, "Options:")?;
+    write_option_table(out, spec)
+}
+
+/// One `Subcommands:` entry: its synopsis and about, then its own options.
+///
+/// The child's options have to appear here because they appear nowhere else —
+/// `parse_cli_args` keys its `--help` interception on `args[1]`, so
+/// `cella task run --help` renders the *parent*'s help. Collapsing the child to
+/// `[options]` and stopping would leave `--base`, `--timeout`, `--json` and
+/// `--follow` undocumented anywhere a user can reach.
+fn write_subcommand_entry(
+    out: &mut dyn std::io::Write,
+    parent: &str,
+    sub: &CommandSpec,
+) -> std::io::Result<()> {
+    let synopsis = command_synopsis(sub);
+    let leaf = synopsis
+        .strip_prefix(parent)
+        .map_or_else(|| synopsis.clone(), |rest| rest.trim_start().to_owned());
+    writeln!(out, "  {leaf}")?;
+    writeln!(out, "      {}", sub.about)?;
+    for opt in sub.options.iter().filter(|o| o.long != "--help") {
+        writeln!(out, "      {:22}  {}", option_label(opt), opt.help)?;
+    }
+    writeln!(out)
+}
+
+/// The `Options:` block for one command.
+fn write_option_table(out: &mut dyn std::io::Write, spec: &CommandSpec) -> std::io::Result<()> {
     let rows: Vec<(String, &'static str)> = spec
         .options
         .iter()
@@ -1943,7 +1971,7 @@ mod tests {
     /// the parser's `--help` interception keys on `args[1]` alone — `cella task
     /// run --help` prints `task` help. So `task` help must carry the children.
     #[test]
-    fn command_help_lists_subcommands_with_their_options() {
+    fn command_help_lists_every_subcommand() {
         let text = rendered(|b| render_command_help(b, "task"));
         for sub in cella_completion::subcommands_of("task") {
             assert!(text.contains(sub.leaf()), "task help omits `{}`", sub.path);
@@ -1952,6 +1980,52 @@ mod tests {
                 "task help omits about of `{}`",
                 sub.path
             );
+        }
+    }
+
+    /// `[options]` must precede the `--` separator: the parser only reads cella
+    /// options before it, so a synopsis reading `exec <branch> -- <cmd...>
+    /// [options]` points the user at exactly the position where their flags
+    /// would instead be handed to their own command.
+    #[test]
+    fn synopsis_places_options_before_the_separator() {
+        for spec in CLI_SURFACE {
+            let synopsis = command_synopsis(spec);
+            let (Some(options), Some(separator)) =
+                (synopsis.find("[options]"), synopsis.find("--"))
+            else {
+                continue;
+            };
+            assert!(
+                options < separator,
+                "`{}` renders options after the separator: {synopsis}",
+                spec.path
+            );
+        }
+    }
+
+    /// A sub-subcommand's flags must survive into the help a user can actually
+    /// reach. The parser answers `cella task run --help` with `task`'s help, so
+    /// if `task`'s help collapses each child to `[options]`, then `--base`,
+    /// `--timeout`, `--json` and `--follow` are documented nowhere.
+    #[test]
+    fn parent_help_documents_every_child_option() {
+        let text = rendered(|b| render_command_help(b, "task"));
+        for sub in cella_completion::subcommands_of("task") {
+            for opt in sub.options.iter().filter(|o| o.long != "--help") {
+                assert!(
+                    text.contains(opt.long),
+                    "`task` help omits `{}` of `{}`:\n{text}",
+                    opt.long,
+                    sub.path
+                );
+                assert!(
+                    text.contains(opt.help),
+                    "`task` help omits the prose for `{}` of `{}`:\n{text}",
+                    opt.long,
+                    sub.path
+                );
+            }
         }
     }
 
