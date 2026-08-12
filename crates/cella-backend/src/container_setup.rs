@@ -531,9 +531,9 @@ pub async fn inject_cella_path(
 /// before appending. Bumping the version in the guard therefore replaces the
 /// block in every existing container.
 ///
-/// Best-effort, like its sibling: on an image whose `sed` lacks `-i` the delete
-/// fails, the append still runs behind the same `grep` guard, and the result is
-/// the additive behaviour we had before. Errors are discarded either way.
+/// Best-effort, like its sibling: if the rewrite cannot run the append still
+/// does, and the result is the additive behaviour we had before. Errors are
+/// discarded either way.
 async fn inject_managed_block(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -559,25 +559,52 @@ async fn inject_managed_block(
     }
 }
 
+/// Strip a complete `start … end` block, buffering so an *unterminated* one is
+/// put back verbatim.
+///
+/// The obvious `sed -i '/start/,/end/d'` is wrong twice over. A sed range whose
+/// closing address never matches runs to end of file, so an rc file carrying a
+/// half-written block — a previous injection that was cut short, or a stray end
+/// marker above the start — loses every line the user wrote after it, deleted
+/// by a command running as root. And `sed -i` rewrites through a temp file, so
+/// the container user's `.bashrc` would come back owned by root.
+///
+/// awk is POSIX-mandated and present in busybox, so this costs no portability.
+const STRIP_BLOCK_AWK: &str = concat!(
+    r#"skip { buf = buf $0 "\n"; if (index($0, e)) { skip = 0; buf = "" } next } "#,
+    r#"index($0, s) { skip = 1; buf = $0 "\n"; next } "#,
+    r#"{ print } "#,
+    r#"END { if (skip) printf "%s", buf }"#,
+);
+
 /// The `sh -c` program [`inject_managed_block`] runs against one profile.
 ///
 /// Split out so the shell logic can be exercised against real files instead of
-/// only read — the delete-then-append sequence is the part that can corrupt an
+/// only read — the strip-then-append sequence is the part that can corrupt an
 /// rc file if it is wrong.
+///
+/// The rewrite is `awk … > tmp && cat tmp > path`, not `mv`: `cat` into the
+/// existing file keeps its inode, mode and owner, which matters because this
+/// runs as root against a file the container user owns. If awk is missing or
+/// fails, `&&` leaves the original untouched and the append still happens —
+/// degrading to the additive behaviour of [`inject_snippets`].
 fn managed_block_command(path: &str, guard: &str, snippet: &str) -> String {
     format!(
         "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then \
-         sed -i '/{start}/,/{end}/d' '{path}' 2>/dev/null; \
+         awk -v s='{start}' -v e='{end}' '{prog}' '{path}' > '{path}.cella-tmp' 2>/dev/null \
+         && cat '{path}.cella-tmp' > '{path}'; \
+         rm -f '{path}.cella-tmp'; \
          printf '%s\\n' '{escaped}' >> '{path}'; fi",
         start = COMPLETION_BLOCK_START_PATTERN,
         end = COMPLETION_BLOCK_END_PATTERN,
+        prog = STRIP_BLOCK_AWK,
         escaped = snippet.replace('\'', "'\\''"),
     )
 }
 
-/// `sed` address matching the opening marker of *any* version of the block.
+/// Opening marker of *any* version of the block.
 const COMPLETION_BLOCK_START_PATTERN: &str = "# >>> cella shell completion";
-/// `sed` address matching the closing marker.
+/// Closing marker.
 const COMPLETION_BLOCK_END_PATTERN: &str = "# <<< cella shell completion";
 
 /// Source the generated completion scripts from the shells that have one.
@@ -945,6 +972,85 @@ mod tests {
         assert!(after.contains("alias l=ls"), "clobbered the file: {after}");
     }
 
+    /// A block whose end marker is missing — a previous write that was cut
+    /// short — must be left alone, not treated as "delete to end of file".
+    /// A `sed '/start/,/end/d'` range does exactly that, as root, taking every
+    /// line the user wrote after it.
+    #[test]
+    fn an_unterminated_block_does_not_eat_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(
+            &rc,
+            "export EDITOR=vi\n\
+             # >>> cella shell completion v0 >>>\n\
+             truncated\n\
+             export SECRET_TOOL=1\n\
+             alias l=ls\n",
+        )
+        .unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert!(
+            after.contains("export SECRET_TOOL=1"),
+            "content after an unterminated block was destroyed: {after}"
+        );
+        assert!(after.contains("alias l=ls"), "{after}");
+        assert!(after.contains("export EDITOR=vi"), "{after}");
+        assert!(
+            after.contains("v1"),
+            "new block must still be appended: {after}"
+        );
+    }
+
+    /// An end marker sitting *before* any start marker must not open a range
+    /// that runs to EOF either.
+    #[test]
+    fn a_stray_end_marker_does_not_eat_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(
+            &rc,
+            "# <<< cella shell completion <<<\n\
+             export KEEP_ME=1\n\
+             # >>> cella shell completion v0 >>>\n\
+             stale\n\
+             export ALSO_KEEP=1\n",
+        )
+        .unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert!(after.contains("export KEEP_ME=1"), "{after}");
+        assert!(after.contains("export ALSO_KEEP=1"), "{after}");
+    }
+
+    /// The rc file belongs to the container user; injection runs as root and
+    /// must not hand ownership of the file to root by replacing it.
+    #[test]
+    fn injection_edits_in_place_rather_than_replacing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        let old = "# >>> cella shell completion v0 >>>\nstale\n# <<< cella shell completion <<<\n";
+        std::fs::write(&rc, format!("export EDITOR=vi\n{old}")).unwrap();
+        let before = std::fs::metadata(&rc).unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let after = std::fs::metadata(&rc).unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&before),
+            std::os::unix::fs::MetadataExt::ino(&after),
+            "the rc file must keep its inode, ownership and mode"
+        );
+    }
+
     /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
     /// container gets no PATH block either, so `cella` is not on PATH there.
     #[test]
@@ -958,25 +1064,21 @@ mod tests {
         assert!(!rc.exists(), "must not create the profile");
     }
 
-    /// Assumption 2's fallback: on an image whose `sed` cannot edit in place the
-    /// delete fails, the append still runs, and the result degrades to exactly
-    /// the additive behaviour `inject_snippets` already has — the stale block
-    /// survives beside the new one. Never a corrupted or truncated file.
+    /// Fallback on an image with no usable `awk`: the strip cannot run, the
+    /// append still does, and the result degrades to exactly the additive
+    /// behaviour `inject_snippets` already has — the stale block survives
+    /// beside the new one. Never a corrupted, truncated, or emptied file.
     ///
     /// Seeding a stale block first is what makes this test able to tell the
-    /// stub `sed` from the real one: with a working `sed` the answer is one
+    /// stub `awk` from the real one: with a working `awk` the answer is one
     /// block, with a broken one it is two.
     #[test]
-    fn a_sed_without_in_place_editing_degrades_to_appending() {
+    fn a_missing_awk_degrades_to_appending() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let stub = bin.join("sed");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\necho 'sed: unrecognized option -i' >&2\nexit 1\n",
-        )
-        .unwrap();
+        let stub = bin.join("awk");
+        std::fs::write(&stub, "#!/bin/sh\necho 'awk: not found' >&2\nexit 127\n").unwrap();
         std::process::Command::new("chmod")
             .args(["+x", &stub.to_string_lossy()])
             .status()
@@ -991,27 +1093,48 @@ mod tests {
         let cmd = managed_block_command(&rc.to_string_lossy(), guard, snippet);
         let status = std::process::Command::new("sh")
             .args(["-c", &cmd])
-            // Prepended, not replaced: `sh`, `grep` and `printf` must still
-            // resolve — only `sed` is shadowed.
+            // Prepended, not replaced: `sh`, `grep`, `cat`, `rm` and `printf`
+            // must still resolve — only `awk` is shadowed.
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
             )
             .status()
             .expect("sh must be available");
-        assert!(status.success(), "a broken sed must not fail the command");
+        assert!(status.success(), "a missing awk must not fail the command");
 
         let after = std::fs::read_to_string(&rc).unwrap();
         assert_eq!(
             blocks_in(&rc),
             2,
-            "the stub sed must have been used, leaving both blocks: {after}"
+            "the stub awk must have been used, leaving both blocks: {after}"
         );
         assert!(after.contains("stale"), "stale block must survive: {after}");
         assert!(after.contains("v1"), "new block must be appended: {after}");
         assert!(
             after.contains("export EDITOR=vi"),
             "clobbered the file: {after}"
+        );
+    }
+
+    /// The rewrite must not leave its scratch file behind in the user's home.
+    #[test]
+    fn injection_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(&rc, "export EDITOR=vi\n").unwrap();
+        let (guard, snippet) = COMPLETION_SNIPPETS[0];
+
+        run_injection(&rc, guard, snippet);
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != ".bashrc")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
         );
     }
 
