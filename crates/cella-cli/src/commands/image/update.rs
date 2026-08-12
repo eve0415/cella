@@ -168,7 +168,12 @@ impl UpdateArgs {
         // publishes runtime-ful lines beside it: 1-4 requests, or none.
         let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
             Some(probe) => {
-                let resolver = cella_oci::RegistryResolver::new(&reference);
+                // The tag list is fetched under the normalized reference, so
+                // the resolver must use it too — `org/image` shorthand would
+                // otherwise parse `org` as a registry and every probe fail.
+                // The user's own spelling is still what gets written back.
+                let resolver =
+                    cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
                 candidates::resolve_alias_runtime(&resolver, &probe).await
             }
             None => None,
@@ -186,6 +191,11 @@ impl UpdateArgs {
         let json_output = matches!(self.output.resolve(), OutputFormat::Json);
         if self.nothing_to_do(&found) && !json_output {
             eprintln!("Base image is up to date.");
+            // "Up to date" over an unevaluated axis is only half the answer,
+            // so the gap is reported even when nothing else is.
+            if let Some(limitation) = &found.limitation {
+                eprintln!("  ({})", limitation.message());
+            }
             return Ok(());
         }
 
@@ -338,29 +348,50 @@ impl UpdateArgs {
     }
 }
 
-/// Tell the user which flag would unlock the moves that were withheld.
-fn report_blocked(axes: impl Iterator<Item = AxisSet>, allowed: AxisSet) {
-    let mut blocked = 0;
-    let mut needed = AxisSet::default();
-    for axis in axes.filter(|a| !allowed.contains(*a)) {
-        blocked += 1;
-        needed |= axis;
-    }
-    if blocked == 0 {
-        return;
-    }
+/// How many not-yet-given flags a move still needs.
+fn missing_count(axes: AxisSet, allowed: AxisSet) -> usize {
+    describe_axes(axes, allowed).len()
+}
 
-    let flags: Vec<&str> = [
+/// The flags a move needs that have not been given.
+fn describe_axes(axes: AxisSet, allowed: AxisSet) -> Vec<&'static str> {
+    [
         (AxisSet::SHAPE, "--allow-pin"),
         (AxisSet::RUNTIME, "--allow-runtime-change"),
         (AxisSet::RELEASE, "--allow-os-change"),
     ]
     .into_iter()
-    .filter(|(axis, _)| needed.contains(*axis) && !allowed.contains(*axis))
+    .filter(|(axis, _)| axes.contains(*axis) && !allowed.contains(*axis))
     .map(|(_, flag)| flag)
-    .collect();
+    .collect()
+}
 
-    eprintln!("({blocked} move(s) available; pass {})", flags.join(" "));
+/// Those flags as a printable list.
+fn describe(axes: AxisSet, allowed: AxisSet) -> String {
+    describe_axes(axes, allowed).join(" ")
+}
+
+/// Tell the user which flag would unlock the moves that were withheld.
+fn report_blocked(axes: impl Iterator<Item = AxisSet>, allowed: AxisSet) {
+    let mut blocked = 0;
+    let mut cheapest = AxisSet::default();
+    for axis in axes.filter(|a| !allowed.contains(*a)) {
+        blocked += 1;
+        // Fewest additional flags wins, so the advice unlocks the narrowest
+        // move rather than the broadest.
+        if cheapest.is_empty() || missing_count(axis, allowed) < missing_count(cheapest, allowed) {
+            cheapest = axis;
+        }
+    }
+    if blocked == 0 {
+        return;
+    }
+
+    // Name the *cheapest* move's flags, not the union across unrelated
+    // alternatives: advising both flags for a release-only and a runtime-only
+    // option would land the user on the move that changes both.
+    let flags = describe(cheapest, allowed);
+    eprintln!("({blocked} move(s) available; pass {flags})");
 }
 
 /// Read the `"image"` value, or explain which other base-image shape this

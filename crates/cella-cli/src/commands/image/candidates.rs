@@ -143,6 +143,7 @@ fn axes_between(
     pin: &Runtime<'_>,
     candidate: &Runtime<'_>,
     release_changed: bool,
+    runtime_dimension: bool,
 ) -> Option<AxisSet> {
     let mut axes = if release_changed {
         AxisSet::RELEASE
@@ -151,7 +152,18 @@ fn axes_between(
     };
 
     match (pin, candidate) {
-        (Runtime::Alias | Runtime::Resolved(_), Runtime::Alias) => {}
+        // Both ends are alias lines, so neither names a runtime — and on an
+        // image that has a runtime dimension they need not agree. In
+        // typescript-node `buster` aliases Node 20 while `trixie` aliases
+        // Node 24, so calling this a release-only move would slip a runtime
+        // change past `--yes --allow-os-change`. Resolving the *target* alias
+        // would need a probe per candidate, so this over-asks for consent
+        // instead: never silently, sometimes unnecessarily.
+        (Runtime::Alias | Runtime::Resolved(_), Runtime::Alias) => {
+            if runtime_dimension {
+                axes |= AxisSet::RUNTIME;
+            }
+        }
         // The pin's line was resolved to a concrete runtime, so the explicit
         // lines can be ordered against it. Naming one is a shape change even
         // when the runtime is identical: the tag stops tracking the alias.
@@ -456,8 +468,10 @@ fn moves_for(
     current_key: Option<&VersionKey>,
     alias_runtime: Option<&str>,
 ) -> Vec<VariantMove> {
+    // A variant may be a bare runtime with no distro at all (`5.0.3-22`).
+    // It still has a runtime axis, just no release one.
     let Some((prefix, _, current_release)) = distro_of(selection) else {
-        return Vec::new();
+        return runtime_only_moves(grammar, tags, selection, current_key);
     };
     let pin_runtime = match (runtime_of(prefix), alias_runtime) {
         (Runtime::Alias, Some(runtime)) => {
@@ -466,8 +480,17 @@ fn moves_for(
         (runtime, _) => runtime,
     };
 
+    let variants = published_variants(grammar, tags);
+    // Whether this image distinguishes runtimes at all. On one that does not
+    // (`devcontainers/base`), an alias line means only its distro release.
+    let runtime_dimension = variants.iter().any(|variant| {
+        distro_of(variant).is_some_and(|(candidate_prefix, _, _)| {
+            matches!(runtime_of(candidate_prefix), Runtime::Explicit(..))
+        })
+    });
     let mut moves: Vec<(u32, Option<VersionKey>, VersionKey, VariantMove)> = Vec::new();
-    for candidate in published_variants(grammar, tags) {
+    for candidate in &variants {
+        let candidate = *candidate;
         if candidate == selection {
             continue;
         }
@@ -482,6 +505,7 @@ fn moves_for(
             &pin_runtime,
             &runtime_of(candidate_prefix),
             release.ord != current_release.ord,
+            runtime_dimension,
         ) else {
             continue;
         };
@@ -517,6 +541,51 @@ fn moves_for(
             .then_with(|| a.3.to.cmp(&b.3.to))
     });
     moves.into_iter().map(|(_, _, _, m)| m).collect()
+}
+
+/// Forward moves between variants that are bare runtimes, carrying no distro
+/// at all — typescript-node publishes `5.0.3-22` beside `5.0.3-22-trixie`.
+///
+/// Only the runtime axis exists here, so there is no release to compare and
+/// no alias to resolve: a bare runtime already names itself.
+fn runtime_only_moves(
+    grammar: &TagGrammar,
+    tags: &[&str],
+    selection: &str,
+    current_key: Option<&VersionKey>,
+) -> Vec<VariantMove> {
+    let Some(pinned) = version_key(selection) else {
+        return Vec::new();
+    };
+
+    let mut moves: Vec<(VersionKey, VariantMove)> = Vec::new();
+    for candidate in published_variants(grammar, tags) {
+        if candidate == selection || distro_of(candidate).is_some() {
+            continue;
+        }
+        // Forward only: the vocabularies still carry EOL runtimes.
+        let Some(target) = version_key(candidate).filter(|target| *target > pinned) else {
+            continue;
+        };
+        let Some((key, tag)) = newest_in_variant(grammar, tags, candidate) else {
+            continue;
+        };
+        if current_key.is_some_and(|current| &key < current) {
+            continue;
+        }
+        moves.push((
+            target,
+            VariantMove {
+                tag: tag.to_owned(),
+                from: selection.to_owned(),
+                to: candidate.to_owned(),
+                axes: AxisSet::RUNTIME,
+            },
+        ));
+    }
+
+    moves.sort_by(|a, b| b.0.cmp(&a.0));
+    moves.into_iter().map(|(_, m)| m).collect()
 }
 
 /// Locate the distro-release portion of a selection.
@@ -863,6 +932,57 @@ mod tests {
             c.moves.iter().all(|m| !m.axes.is_empty()),
             "a move with no axis would pass every --yes gate vacuously"
         );
+    }
+
+    /// Regression: `buster` aliases Node 20 and `trixie` aliases Node 24
+    /// upstream (verified by digest), so calling `buster` → `trixie` a
+    /// release-only move would slip a runtime change past
+    /// `--yes --allow-os-change`. Neither end names a runtime, so the move
+    /// must ask for runtime consent too.
+    #[test]
+    fn an_alias_to_alias_move_does_not_hide_a_runtime_change() {
+        let c = compute(&typescript_node_tags(), "1.1.2-buster", None).unwrap();
+        assert!(!c.moves.is_empty(), "buster has newer releases to move to");
+        for m in &c.moves {
+            assert!(
+                m.axes.contains(AxisSet::RUNTIME),
+                "unlabelled possible runtime change: {m:?}"
+            );
+        }
+    }
+
+    /// The over-ask is scoped: an image with no runtime dimension at all
+    /// keeps plain release moves, so `--allow-os-change` still suffices.
+    #[test]
+    fn an_image_without_runtimes_keeps_plain_release_moves() {
+        let tags: Vec<String> = ["1.0.0-bullseye", "1.0.1-bookworm", "bullseye", "bookworm"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let c = compute(&tags, "1.0.0-bullseye", None).unwrap();
+        assert_eq!(c.moves.len(), 1, "got {:?}", c.moves);
+        assert_eq!(c.moves[0].axes, AxisSet::RELEASE);
+    }
+
+    /// typescript-node publishes bare-runtime variants (`5.0.3-22`) beside
+    /// the distro-qualified ones. They have a runtime axis and no release
+    /// axis, and were previously dropped entirely.
+    #[test]
+    fn bare_runtime_variants_still_get_runtime_moves() {
+        let tags = typescript_node_tags();
+        assert!(tags.iter().any(|t| t == "5.0.3-22"), "fixture precondition");
+
+        let c = compute(&tags, "5.0.3-22", None).unwrap();
+        let listed: Vec<(&str, Vec<&str>)> = c
+            .moves
+            .iter()
+            .map(|m| (m.to.as_str(), m.axes.names()))
+            .collect();
+        assert_eq!(listed, vec![("24", vec!["runtime"])]);
+        assert_eq!(c.moves[0].tag, "5.0.3-24");
+
+        // Forward only, and the newest runtime has nowhere to go.
+        assert!(compute(&tags, "5.0.3-24", None).unwrap().moves.is_empty());
     }
 
     /// The vocabularies still carry EOL entries. Moving *to* one is never an
