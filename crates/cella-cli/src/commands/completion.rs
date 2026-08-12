@@ -1,6 +1,18 @@
 use clap::{Args, CommandFactory, ValueEnum};
 use clap_complete::{Shell, generate};
 
+/// Environment variable that switches cella into completion mode.
+///
+/// `clap_complete`'s `CompleteEnv` reads this at startup, and the same name is
+/// baked into the registration hook, which re-invokes cella with it set. Both
+/// sides must agree, so `main` and this module share one constant.
+///
+/// Deliberately not `clap_complete`'s default `COMPLETE`: with that name, a
+/// user who exports it for another clap-based tool turns *every* cella
+/// invocation into "print a hook and exit successfully" — `cella up` would
+/// silently not run.
+pub const COMPLETE_VAR: &str = "CELLA_COMPLETE";
+
 /// Generate shell completion scripts for cella.
 ///
 /// Output the completion script to stdout. Pipe it to the appropriate
