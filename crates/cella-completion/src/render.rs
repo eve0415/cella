@@ -38,7 +38,6 @@ fn data_section() -> String {
     out.push_str(&subcommands_fn());
     out.push_str(&flags_fn());
     out.push_str(&predicate_fn("__cella_takes_value", &value_options()));
-    out.push_str(&predicate_fn("__cella_takes_separator", &separator_paths()));
     out
 }
 
@@ -180,15 +179,6 @@ fn value_options() -> Vec<String> {
     out
 }
 
-/// Every command path that takes a literal `--` passthrough.
-fn separator_paths() -> Vec<String> {
-    CLI_SURFACE
-        .iter()
-        .filter(|spec| spec.separator)
-        .flat_map(path_keys)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{bash_script, data_section, zsh_script};
@@ -287,18 +277,6 @@ mod tests {
         for spec in CLI_SURFACE {
             for opt in spec.options.iter().filter(|opt| opt.value.is_some()) {
                 assert!(body.contains(opt.long), "`{}` takes a value", opt.long);
-            }
-        }
-    }
-
-    /// Asserts on the rendered `case` pattern, quoting included — that is the
-    /// text the shell actually matches against.
-    #[test]
-    fn every_separator_command_is_known_to_the_engine() {
-        let body = function_body("__cella_takes_separator");
-        for spec in CLI_SURFACE.iter().filter(|spec| spec.separator) {
-            for key in super::path_keys(spec) {
-                assert!(body.contains(&key), "`{key}` takes a `--` separator");
             }
         }
     }

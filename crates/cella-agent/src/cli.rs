@@ -198,21 +198,12 @@ fn parse_down_subcommand(args: &[String]) -> CliCommand {
         Some(b) if !b.starts_with('-') => b.clone(),
         _ => return CliCommand::Help,
     };
-    let mut rm = false;
-    let mut volumes = false;
-    let mut force = false;
-    for arg in &args[3..] {
-        match arg.as_str() {
-            "--rm" => rm = true,
-            "--volumes" => volumes = true,
-            "--force" => force = true,
-            f if f.starts_with('-') => {
-                eprintln!("Error: unknown flag '{f}' for down command");
-                return CliCommand::Help;
-            }
-            _ => {}
-        }
+    let flags = &args[3..];
+    if !flags_are_known(flags, &["--rm", "--volumes", "--force"], "down") {
+        return CliCommand::Help;
     }
+    let has = |name: &str| flags.iter().any(|a| a == name);
+    let (rm, volumes) = (has("--rm"), has("--volumes"));
     if volumes && !rm {
         eprintln!("Error: --volumes requires --rm");
         return CliCommand::Help;
@@ -221,7 +212,7 @@ fn parse_down_subcommand(args: &[String]) -> CliCommand {
         branch,
         rm,
         volumes,
-        force,
+        force: has("--force"),
     }
 }
 
@@ -231,18 +222,13 @@ fn parse_up_subcommand(args: &[String]) -> CliCommand {
         Some(b) if !b.starts_with('-') => b.clone(),
         _ => return CliCommand::Help,
     };
-    let mut rebuild = false;
-    for arg in &args[3..] {
-        match arg.as_str() {
-            "--rebuild" => rebuild = true,
-            f if f.starts_with('-') => {
-                eprintln!("Error: unknown flag '{f}' for up command");
-                return CliCommand::Help;
-            }
-            _ => {}
-        }
+    if !flags_are_known(&args[3..], &["--rebuild"], "up") {
+        return CliCommand::Help;
     }
-    CliCommand::Up { branch, rebuild }
+    CliCommand::Up {
+        branch,
+        rebuild: args[3..].iter().any(|a| a == "--rebuild"),
+    }
 }
 
 fn parse_branch_subcommand(args: &[String]) -> CliCommand {

@@ -34,8 +34,6 @@ pub struct CommandSpec {
     pub operands: &'static [OperandSpec],
     /// Every option the parser accepts for this command.
     pub options: &'static [OptionSpec],
-    /// True when a literal `--` introduces a passthrough command.
-    pub separator: bool,
 }
 
 impl CommandSpec {
@@ -169,7 +167,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
     CommandSpec {
         path: "list",
@@ -177,7 +174,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "List worktree branches and their container status.",
         operands: &[],
         options: &[JSON_ARRAY, HELP],
-        separator: false,
     },
     CommandSpec {
         path: "exec",
@@ -197,7 +193,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: true,
     },
     CommandSpec {
         path: "down",
@@ -228,7 +223,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
     CommandSpec {
         path: "up",
@@ -245,7 +239,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
     CommandSpec {
         path: "prune",
@@ -292,7 +285,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
     CommandSpec {
         path: "task",
@@ -300,7 +292,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "Run and manage background tasks.",
         operands: &[],
         options: &[HELP],
-        separator: false,
     },
     CommandSpec {
         path: "task run",
@@ -323,7 +314,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: true,
     },
     CommandSpec {
         path: "task list",
@@ -331,7 +321,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "List active tasks",
         operands: &[],
         options: &[JSON_ARRAY, HELP],
-        separator: false,
     },
     CommandSpec {
         path: "task logs",
@@ -348,7 +337,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
     CommandSpec {
         path: "task wait",
@@ -356,7 +344,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "Wait for task completion",
         operands: &[OperandSpec::Required { name: "branch" }],
         options: &[HELP],
-        separator: false,
     },
     CommandSpec {
         path: "task stop",
@@ -364,7 +351,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "Stop a running task",
         operands: &[OperandSpec::Required { name: "branch" }],
         options: &[HELP],
-        separator: false,
     },
     CommandSpec {
         path: "switch",
@@ -372,7 +358,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
         about: "Open an interactive shell in another branch's container.",
         operands: &[OperandSpec::Required { name: "branch" }],
         options: &[HELP],
-        separator: false,
     },
     CommandSpec {
         path: "doctor",
@@ -389,7 +374,6 @@ pub const CLI_SURFACE: &[CommandSpec] = &[
             },
             HELP,
         ],
-        separator: false,
     },
 ];
 
@@ -533,22 +517,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    /// A `--` passthrough is meaningless without a trailing operand to hold it.
-    #[test]
-    fn separator_commands_have_a_trailing_operand() {
-        for spec in CLI_SURFACE {
-            let trailing = spec
-                .operands
-                .iter()
-                .any(|o| matches!(o, super::OperandSpec::Trailing { .. }));
-            assert_eq!(
-                spec.separator, trailing,
-                "`{}` separator/trailing-operand mismatch",
-                spec.path
-            );
         }
     }
 
