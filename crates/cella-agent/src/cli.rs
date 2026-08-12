@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use cella_completion::{CLI_SURFACE, CommandSpec, OperandSpec, OptionSpec};
 use cella_protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
 
 use crate::control::ControlClient;
@@ -459,145 +460,158 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
     }
 }
 
+/// Print the top-level in-container help to stderr.
 fn print_help() {
-    eprintln!(
-        "\
-cella — dev container worktree management (in-container)
-
-Usage: cella <command> [options]
-
-Commands:
-  branch <name> [--base ref]     Create a worktree-backed branch with its own container
-  list                           List worktree branches and their containers
-  down <branch> [--rm] [--force] Stop a worktree branch's container
-  up <branch> [--rebuild]        Start/restart a worktree branch's container
-  exec <branch> -- <cmd...>      Run a command in another branch's container
-  switch <branch>                Open a shell in another branch's container
-  prune [--all] [--dry-run]      Remove worktrees and their containers
-  task run <branch> [--timeout N] -- <cmd...>  Run a background task
-  task list                      List active background tasks
-  task logs [-f] <branch>        Show output from a background task (-f to follow)
-  task wait <branch>             Wait for a background task to complete
-  task stop <branch>             Stop a running background task
-  doctor                         Check connectivity and version status
-
-Options:
-  --help, -h                     Show this help message
-
-Run `cella --help` on the host for all commands."
-    );
+    let mut buf = Vec::new();
+    if render_help(&mut buf).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
 }
 
+/// Print one command's help to stderr.
 fn print_command_help(command: &str) {
-    let text = match command {
-        "branch" => {
-            "\
-Usage: cella branch <name> [options]
-
-Create a worktree-backed branch with its own container.
-
-Options:
-  --base <ref>       Base branch or commit (default: current HEAD)
-  --label KEY=VALUE  Add a label to the container (repeatable)"
-        }
-        "list" | "ls" => {
-            "\
-Usage: cella list [options]
-
-List worktree branches and their container status.
-
-Options:
-  --json    Output as JSON array"
-        }
-        "exec" => {
-            "\
-Usage: cella exec <branch> [options] -- <command...>
-
-Run a command in another branch's container.
-
-Options:
-  --json    Capture stdout/stderr and output as JSON envelope"
-        }
-        "down" => {
-            "\
-Usage: cella down <branch> [options]
-
-Stop a worktree branch's container.
-
-Options:
-  --rm        Remove the container and worktree after stopping
-  --volumes   Also remove volumes (requires --rm)
-  --force     Force stop even when shutdownAction is \"none\""
-        }
-        "up" => {
-            "\
-Usage: cella up <branch> [options]
-
-Start or restart a worktree branch's container.
-
-Options:
-  --rebuild   Rebuild the container from scratch"
-        }
-        "prune" => {
-            "\
-Usage: cella prune [options]
-
-Remove worktrees and their containers.
-
-Options:
-  --all               Include unmerged worktrees
-  --dry-run           Show what would be pruned without doing it
-  --older-than <dur>  Only prune older than duration (e.g., 7d, 24h)
-  --missing-worktree  Only prune branches whose worktree is gone
-  --label KEY=VALUE   Only prune matching labels (repeatable)"
-        }
-        "task" => {
-            "\
-Usage: cella task <subcommand>
-
-Subcommands:
-  run <branch> [--base ref] [--timeout secs] -- <cmd...>   Run a background task
-  list [--json]                           List active tasks
-  logs [-f|--follow] <branch>             Show task output
-  wait <branch>                           Wait for task completion
-  stop <branch>                           Stop a running task"
-        }
-        "doctor" => {
-            "\
-Usage: cella doctor [options]
-
-Check daemon connectivity and version status.
-
-Options:
-  --json    Output structured health data as JSON"
-        }
-        "switch" => {
-            "\
-Usage: cella switch <branch>
-
-Open an interactive shell in another branch's container."
-        }
-        _ => "No help available for this command.",
-    };
-    eprintln!("{text}");
+    let mut buf = Vec::new();
+    if render_command_help(&mut buf, command).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
 }
 
+/// Explain that a host-only command has no in-container equivalent.
 fn print_unsupported(command: &str) {
-    eprintln!(
-        "\
-Error: `cella {command}` is not available inside a dev container.
+    let mut buf = Vec::new();
+    if render_unsupported(&mut buf, command).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
+}
 
-Available commands inside containers:
-  cella branch <name>          Create a worktree-backed branch
-  cella list                   List worktree branches
-  cella down <branch>          Stop a branch's container
-  cella up <branch>            Start/restart a branch's container
-  cella exec <branch> -- cmd   Run command in another branch's container
-  cella switch <branch>        Shell into another branch's container
-  cella prune                  Remove worktrees
+/// The `--help` option, which every command accepts.
+///
+/// `cella-completion`'s own `every_command_accepts_help` test guarantees the
+/// lookup succeeds.
+fn help_option() -> &'static OptionSpec {
+    CLI_SURFACE
+        .iter()
+        .flat_map(|c| c.options)
+        .find(|o| o.long == "--help")
+        .expect("every command accepts --help")
+}
 
-Run `cella --help` on the host for all commands."
-    );
+/// `-h, --help` / `    --base <ref>` — the left column of an `Options:` block.
+fn option_label(opt: &OptionSpec) -> String {
+    let short = opt
+        .short
+        .map_or_else(|| "    ".to_owned(), |c| format!("-{c}, "));
+    let value = opt
+        .value
+        .as_ref()
+        .map_or_else(String::new, |v| format!(" <{}>", v.placeholder));
+    format!("{short}{}{value}", opt.long)
+}
+
+/// `task run <branch> -- <command...> [options]` — the left column of a
+/// `Commands:` block. Aliases are shown so `ls` is discoverable.
+fn command_synopsis(spec: &CommandSpec) -> String {
+    let head = if spec.aliases.is_empty() {
+        spec.path.to_owned()
+    } else {
+        format!("{} ({})", spec.path, spec.aliases.join(", "))
+    };
+    let mut parts = vec![head];
+    parts.extend(spec.operands.iter().map(OperandSpec::synopsis));
+    if spec.options.iter().any(|o| o.long != "--help") {
+        parts.push("[options]".to_owned());
+    }
+    parts.join(" ")
+}
+
+/// Every command, roots first with their subcommands nested underneath.
+fn commands_in_display_order() -> Vec<&'static CommandSpec> {
+    let mut out = Vec::new();
+    for root in cella_completion::root_commands() {
+        out.push(root);
+        out.extend(cella_completion::subcommands_of(root.path));
+    }
+    out
+}
+
+/// Write a `label  description` table, padded to the widest label.
+fn write_table(
+    out: &mut dyn std::io::Write,
+    rows: &[(String, &'static str)],
+) -> std::io::Result<()> {
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (label, description) in rows {
+        writeln!(out, "  {label:width$}  {description}")?;
+    }
+    Ok(())
+}
+
+/// Render the top-level in-container help from [`CLI_SURFACE`].
+fn render_help(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "cella — dev container worktree management (in-container)\n"
+    )?;
+    writeln!(out, "Usage: cella <command> [options]\n")?;
+    writeln!(out, "Commands:")?;
+    let rows: Vec<(String, &'static str)> = commands_in_display_order()
+        .into_iter()
+        .map(|spec| (command_synopsis(spec), spec.about))
+        .collect();
+    write_table(out, &rows)?;
+    writeln!(out, "\nOptions:")?;
+    let help = help_option();
+    write_table(out, &[(option_label(help), help.help)])?;
+    writeln!(out, "\nRun `cella --help` on the host for all commands.")
+}
+
+/// Render one command's help, looked up by any spelling the parser accepts.
+fn render_command_help(out: &mut dyn std::io::Write, command: &str) -> std::io::Result<()> {
+    let Some(spec) = cella_completion::root_commands().find(|c| c.matches(command)) else {
+        return writeln!(out, "No help available for this command.");
+    };
+
+    writeln!(out, "Usage: cella {}\n", command_synopsis(spec))?;
+    writeln!(out, "{}\n", spec.about)?;
+
+    let subcommands: Vec<&CommandSpec> = cella_completion::subcommands_of(spec.path).collect();
+    if !subcommands.is_empty() {
+        writeln!(out, "Subcommands:")?;
+        let rows: Vec<(String, &'static str)> = subcommands
+            .iter()
+            .map(|sub| {
+                let synopsis = command_synopsis(sub);
+                let leaf = synopsis
+                    .strip_prefix(spec.path)
+                    .map_or_else(|| synopsis.clone(), |rest| rest.trim_start().to_owned());
+                (leaf, sub.about)
+            })
+            .collect();
+        write_table(out, &rows)?;
+        writeln!(out)?;
+    }
+
+    writeln!(out, "Options:")?;
+    let rows: Vec<(String, &'static str)> = spec
+        .options
+        .iter()
+        .map(|opt| (option_label(opt), opt.help))
+        .collect();
+    write_table(out, &rows)
+}
+
+/// Render the "that command is host-only" error, listing what does work here.
+fn render_unsupported(out: &mut dyn std::io::Write, command: &str) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "Error: `cella {command}` is not available inside a dev container.\n"
+    )?;
+    writeln!(out, "Available commands inside containers:")?;
+    let rows: Vec<(String, &'static str)> = cella_completion::root_commands()
+        .map(|spec| (command_synopsis(spec), spec.about))
+        .collect();
+    write_table(out, &rows)?;
+    writeln!(out, "\nRun `cella --help` on the host for all commands.")
 }
 
 /// Connect to the host daemon for CLI commands.
@@ -1504,6 +1518,106 @@ fn is_json_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// `print_unsupported` used to list seven commands, silently omitting
+    /// `doctor` and the whole `task` family — so the error that tells you what
+    /// *is* available lied about it.
+    #[test]
+    fn unsupported_lists_every_root_command() {
+        let text = rendered(|b| render_unsupported(b, "build"));
+        assert!(text.contains("cella build"), "{text}");
+        for spec in cella_completion::root_commands() {
+            assert!(
+                text.contains(spec.path),
+                "unsupported omits `{}`",
+                spec.path
+            );
+        }
+    }
+
+    /// Every option in the table reaches per-command help, with its own prose.
+    #[test]
+    fn command_help_documents_every_option() {
+        for spec in cella_completion::root_commands() {
+            let text = rendered(|b| render_command_help(b, spec.leaf()));
+            assert!(
+                text.contains(spec.about),
+                "`{}` help omits its about",
+                spec.path
+            );
+            for opt in spec.options {
+                assert!(
+                    text.contains(opt.long),
+                    "`{}` help omits `{}`",
+                    spec.path,
+                    opt.long
+                );
+                assert!(
+                    text.contains(opt.help),
+                    "`{}` help omits the prose for `{}`",
+                    spec.path,
+                    opt.long
+                );
+            }
+        }
+    }
+
+    /// Sub-subcommands are only reachable through their parent's help, because
+    /// the parser's `--help` interception keys on `args[1]` alone — `cella task
+    /// run --help` prints `task` help. So `task` help must carry the children.
+    #[test]
+    fn command_help_lists_subcommands_with_their_options() {
+        let text = rendered(|b| render_command_help(b, "task"));
+        for sub in cella_completion::subcommands_of("task") {
+            assert!(text.contains(sub.leaf()), "task help omits `{}`", sub.path);
+            assert!(
+                text.contains(sub.about),
+                "task help omits about of `{}`",
+                sub.path
+            );
+        }
+    }
+
+    /// An alias must resolve to the same help as the canonical spelling.
+    #[test]
+    fn command_help_resolves_aliases() {
+        assert_eq!(
+            rendered(|b| render_command_help(b, "ls")),
+            rendered(|b| render_command_help(b, "list"))
+        );
+    }
+
+    #[test]
+    fn command_help_for_an_unknown_command_says_so() {
+        let text = rendered(|b| render_command_help(b, "nonsense"));
+        assert_eq!(text.trim(), "No help available for this command.");
+    }
+
+    /// The drift this table exists to prevent: `print_unsupported` used to omit
+    /// `doctor` and the whole `task` family, and the top-level help never
+    /// mentioned the `ls` / `task ls` aliases.
+    #[test]
+    fn help_lists_every_surface_command() {
+        let mut buf = Vec::new();
+        render_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        for spec in CLI_SURFACE {
+            assert!(help.contains(spec.path), "help omits `{}`", spec.path);
+            for alias in spec.aliases {
+                assert!(
+                    help.contains(alias),
+                    "help omits alias `{alias}` of `{}`",
+                    spec.path
+                );
+            }
+        }
+    }
 
     #[test]
     fn parse_branch_command() {
