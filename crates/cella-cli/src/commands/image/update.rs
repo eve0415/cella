@@ -228,20 +228,21 @@ impl UpdateArgs {
             return Ok(self.auto_choice(found));
         }
 
-        let mut options: Vec<String> = Vec::with_capacity(found.os_moves.len() + 2);
+        let mut options: Vec<String> = Vec::with_capacity(found.moves.len() + 2);
         if let Some(bump) = &found.version_bump {
             options.push(bump.clone());
         }
         if let Some(pin) = &found.pin {
             options.push(pin.clone());
         }
-        for os_move in &found.os_moves {
+        for variant_move in &found.moves {
             options.push(format!(
-                "{}   {} {} {}",
-                os_move.tag,
-                os_move.from,
+                "{}   {} {} {}  [{}]",
+                variant_move.tag,
+                variant_move.from,
                 style::hint_arrow(),
-                os_move.to
+                variant_move.to,
+                variant_move.axes.names().join(", ")
             ));
         }
         let keep = format!("keep {}", found.current);
@@ -261,14 +262,14 @@ impl UpdateArgs {
     /// The non-interactive choice under `--yes`.
     fn auto_choice(&self, found: &Candidates) -> Option<String> {
         if self.apply.allow_os_change
-            && let Some(best) = found.os_moves.first()
+            && let Some(best) = found.moves.first()
         {
             return Some(best.tag.clone());
         }
-        if !found.os_moves.is_empty() {
+        if !found.moves.is_empty() {
             eprintln!(
                 "({} OS move(s) available; pass --allow-os-change)",
-                found.os_moves.len()
+                found.moves.len()
             );
         }
         found.version_bump.clone()
@@ -339,7 +340,7 @@ fn unknown_tag_error(requested: &str, found: &Candidates) -> String {
     if let Some(pin) = &found.pin {
         known.push(pin);
     }
-    known.extend(found.os_moves.iter().map(|m| m.tag.as_str()));
+    known.extend(found.moves.iter().map(|m| m.tag.as_str()));
 
     if known.is_empty() {
         return format!("tag not published: {requested}");
@@ -359,14 +360,20 @@ fn display_candidates(reference: &str, found: &Candidates) {
     if let Some(pin) = &found.pin {
         eprintln!("  {pin}   (pin)");
     }
-    for os_move in &found.os_moves {
+    for variant_move in &found.moves {
         eprintln!(
-            "  {}   ({} {} {})",
-            os_move.tag,
-            os_move.from,
+            "  {}   ({} {} {}: {})",
+            variant_move.tag,
+            variant_move.from,
             style::hint_arrow(),
-            os_move.to
+            variant_move.to,
+            variant_move.axes.names().join(", ")
         );
+    }
+    // Said out loud rather than silently emitting a shorter list: the user
+    // cannot otherwise tell a complete offer from a truncated one.
+    if let Some(limitation) = found.limitation {
+        eprintln!("  ({})", limitation.message());
     }
 }
 
@@ -375,10 +382,17 @@ fn display_candidates(reference: &str, found: &Candidates) {
 /// Deliberately its own shape rather than an addition to `cella outdated`,
 /// whose output mirrors the official CLI's `loadVersionInfo` contract.
 fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
-    let os_moves: Vec<serde_json::Value> = found
-        .os_moves
+    let moves: Vec<serde_json::Value> = found
+        .moves
         .iter()
-        .map(|m| serde_json::json!({"tag": m.tag, "from": m.from, "to": m.to}))
+        .map(|m| {
+            serde_json::json!({
+                "tag": m.tag,
+                "from": m.from,
+                "to": m.to,
+                "axes": m.axes.names(),
+            })
+        })
         .collect();
 
     serde_json::to_string_pretty(&serde_json::json!({
@@ -387,7 +401,7 @@ fn render_json(reference: &str, found: &Candidates) -> miette::Result<String> {
             "current": found.current,
             "versionBump": found.version_bump,
             "pin": found.pin,
-            "osMoves": os_moves,
+            "moves": moves,
         }
     }))
     .into_diagnostic()
@@ -520,7 +534,8 @@ mod tests {
             current: "2.0.14-1-trixie".to_owned(),
             version_bump: None,
             pin: None,
-            os_moves: Vec::new(),
+            moves: Vec::new(),
+            limitation: None,
         };
         assert!(up_to_date.is_empty());
 
@@ -564,7 +579,8 @@ mod tests {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
             pin: None,
-            os_moves: Vec::new(),
+            moves: Vec::new(),
+            limitation: None,
         };
 
         assert!(
@@ -597,7 +613,8 @@ mod tests {
             current: "2.0.2-trixie".to_owned(),
             version_bump: Some("2.0.14-1-trixie".to_owned()),
             pin: None,
-            os_moves: Vec::new(),
+            moves: Vec::new(),
+            limitation: None,
         };
         let err = unknown_tag_error("9.9.9-trixie", &found);
         assert!(err.contains("9.9.9-trixie"));
@@ -610,18 +627,22 @@ mod tests {
             current: "2.0.2-bookworm".to_owned(),
             version_bump: Some("2.0.14-1-bookworm".to_owned()),
             pin: None,
-            os_moves: vec![candidates::OsMove {
+            moves: vec![candidates::VariantMove {
                 tag: "2.0.14-1-trixie".to_owned(),
                 from: "bookworm".to_owned(),
                 to: "trixie".to_owned(),
+                axes: candidates::AxisSet::RELEASE,
             }],
+            limitation: None,
         };
         let rendered = render_json("mcr.microsoft.com/devcontainers/rust", &found).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["image"]["current"], "2.0.2-bookworm");
         assert_eq!(value["image"]["versionBump"], "2.0.14-1-bookworm");
-        assert_eq!(value["image"]["osMoves"][0]["to"], "trixie");
+        assert_eq!(value["image"]["moves"][0]["to"], "trixie");
+        assert_eq!(value["image"]["moves"][0]["axes"][0], "release");
+        assert_eq!(value["image"]["pin"], serde_json::Value::Null);
     }
 
     #[test]
@@ -656,9 +677,9 @@ mod tests {
         }
     }
 
-    /// Guards the load-bearing assumption that OS moves never cross families.
+    /// Guards the load-bearing assumption that moves never cross families.
     #[test]
-    fn os_moves_never_cross_distro_families() {
+    fn moves_never_cross_distro_families() {
         let debian = release::parse_variant("bookworm").unwrap();
         let ubuntu = release::parse_variant("noble").unwrap();
         assert!(!ubuntu.is_newer_than(&debian));
