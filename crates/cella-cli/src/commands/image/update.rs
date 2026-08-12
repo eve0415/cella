@@ -7,27 +7,66 @@ use miette::IntoDiagnostic as _;
 
 use cella_oci::{TagCache, TagSource};
 
-use super::candidates::{self, Candidates};
+use super::candidates::{self, AxisSet, Candidates};
 use super::jsonc_edit;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
 use crate::commands::{OutputFormat, boxed_err_to_report};
 use crate::style;
 
+/// Which axes `--yes` may change without being asked again.
+///
+/// One struct rather than three loose flags: together they are a single
+/// decision — how far an unattended run may move the pin — and they map
+/// one-to-one onto [`AxisSet`].
+#[derive(Args)]
+pub struct AllowFlags {
+    /// Allow moving to a newer OS release, not just a newer version.
+    #[arg(long)]
+    pub allow_os_change: bool,
+
+    /// Allow pinning a floating tag, and making an implicit pin explicit.
+    ///
+    /// A floating tag re-resolves on every rebuild, so freezing one in CI is
+    /// a lasting behaviour change rather than an update.
+    #[arg(long)]
+    pub allow_pin: bool,
+
+    /// Allow moving to a newer runtime major, e.g. Node 22 to Node 24.
+    #[arg(long)]
+    pub allow_runtime_change: bool,
+}
+
+impl AllowFlags {
+    /// The axes these flags permit.
+    fn axes(&self) -> AxisSet {
+        let mut allowed = AxisSet::default();
+        if self.allow_pin {
+            allowed |= AxisSet::SHAPE;
+        }
+        if self.allow_runtime_change {
+            allowed |= AxisSet::RUNTIME;
+        }
+        if self.allow_os_change {
+            allowed |= AxisSet::RELEASE;
+        }
+        allowed
+    }
+}
+
 /// How much the command may do to the config without being asked again.
 ///
-/// Grouped rather than left loose on [`UpdateArgs`]: these three are one
+/// Grouped rather than left loose on [`UpdateArgs`]: these are one
 /// decision — report, prompt, or apply — expressed as the flags the official
 /// CLI surface expects.
 #[derive(Args)]
 pub struct ApplyFlags {
     /// Apply the update without prompting. Takes the version bump only
-    /// unless --allow-os-change is also given.
+    /// unless the matching --allow-* flag is also given.
     #[arg(long)]
     pub yes: bool,
 
-    /// Allow moving to a newer OS release, not just a newer version.
-    #[arg(long)]
-    pub allow_os_change: bool,
+    #[command(flatten)]
+    pub allow: AllowFlags,
 
     /// Only report; don't apply.
     #[arg(long)]
@@ -47,7 +86,9 @@ pub struct UpdateArgs {
     ///
     /// Naming a tag is itself the consent, so --allow-os-change is neither
     /// needed nor accepted alongside it, and --check would contradict it.
-    #[arg(long, conflicts_with_all = ["yes", "check", "allow_os_change"])]
+    #[arg(long, conflicts_with_all = [
+        "yes", "check", "allow_os_change", "allow_pin", "allow_runtime_change",
+    ])]
     pub to: Option<String>,
 
     /// Ignore the cached tag list.
@@ -260,20 +301,55 @@ impl UpdateArgs {
     }
 
     /// The non-interactive choice under `--yes`.
+    ///
+    /// A move may be taken only when *every* axis it changes has been
+    /// allowed; a partially-allowed move is refused outright rather than
+    /// approximated by a smaller one the user did not ask for.
     fn auto_choice(&self, found: &Candidates) -> Option<String> {
-        if self.apply.allow_os_change
-            && let Some(best) = found.moves.first()
-        {
+        let allowed = self.apply.allow.axes();
+
+        if let Some(best) = found.moves.iter().find(|m| allowed.contains(m.axes)) {
             return Some(best.tag.clone());
         }
-        if !found.moves.is_empty() {
-            eprintln!(
-                "({} OS move(s) available; pass --allow-os-change)",
-                found.moves.len()
-            );
+        report_blocked(found.moves.iter().map(|m| m.axes), allowed);
+
+        // Pinning a floating tag is itself a shape change: the tag stops
+        // tracking upstream. It needs the same consent an explicit move does.
+        if let Some(pin) = &found.pin {
+            if self.apply.allow.allow_pin {
+                return Some(pin.clone());
+            }
+            eprintln!("(a pin is available; pass --allow-pin)");
+            return None;
         }
+
         found.version_bump.clone()
     }
+}
+
+/// Tell the user which flag would unlock the moves that were withheld.
+fn report_blocked(axes: impl Iterator<Item = AxisSet>, allowed: AxisSet) {
+    let mut blocked = 0;
+    let mut needed = AxisSet::default();
+    for axis in axes.filter(|a| !allowed.contains(*a)) {
+        blocked += 1;
+        needed |= axis;
+    }
+    if blocked == 0 {
+        return;
+    }
+
+    let flags: Vec<&str> = [
+        (AxisSet::SHAPE, "--allow-pin"),
+        (AxisSet::RUNTIME, "--allow-runtime-change"),
+        (AxisSet::RELEASE, "--allow-os-change"),
+    ]
+    .into_iter()
+    .filter(|(axis, _)| needed.contains(*axis) && !allowed.contains(*axis))
+    .map(|(_, flag)| flag)
+    .collect();
+
+    eprintln!("({blocked} move(s) available; pass {})", flags.join(" "));
 }
 
 /// Read the `"image"` value, or explain which other base-image shape this
@@ -631,7 +707,7 @@ mod tests {
                 tag: "2.0.14-1-trixie".to_owned(),
                 from: "bookworm".to_owned(),
                 to: "trixie".to_owned(),
-                axes: candidates::AxisSet::RELEASE,
+                axes: AxisSet::RELEASE,
             }],
             limitation: None,
         };
@@ -645,6 +721,132 @@ mod tests {
         assert_eq!(value["image"]["pin"], serde_json::Value::Null);
     }
 
+    /// `--yes` may take a move only when every axis it changes is allowed.
+    /// A partially-allowed move must be refused, not approximated.
+    #[test]
+    fn yes_takes_a_move_only_when_every_axis_is_allowed() {
+        let found = Candidates {
+            current: "5.0.3-22-bookworm".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![
+                candidates::VariantMove {
+                    tag: "5.0.3-24-trixie".to_owned(),
+                    from: "22-bookworm".to_owned(),
+                    to: "24-trixie".to_owned(),
+                    axes: AxisSet::RUNTIME | AxisSet::RELEASE,
+                },
+                candidates::VariantMove {
+                    tag: "5.0.3-22-trixie".to_owned(),
+                    from: "22-bookworm".to_owned(),
+                    to: "22-trixie".to_owned(),
+                    axes: AxisSet::RELEASE,
+                },
+            ],
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None,
+            "bare --yes must not change the OS or the runtime"
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-os-change"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-22-trixie"),
+            "only the release-only move is fully allowed"
+        );
+        assert_eq!(
+            parse_update(&[
+                "cella",
+                "image",
+                "update",
+                "--yes",
+                "--allow-os-change",
+                "--allow-runtime-change",
+            ])
+            .auto_choice(&found)
+            .as_deref(),
+            Some("5.0.3-24-trixie"),
+            "with both axes allowed the newest reachable move wins"
+        );
+    }
+
+    /// A shape-only move is digest-identical, so nothing about the resulting
+    /// image changes — but it freezes a tag that was tracking upstream, and
+    /// that needs consent.
+    #[test]
+    fn a_shape_only_move_needs_allow_pin() {
+        let found = Candidates {
+            current: "5.0.3-trixie".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![candidates::VariantMove {
+                tag: "5.0.3-24-trixie".to_owned(),
+                from: "trixie".to_owned(),
+                to: "24-trixie".to_owned(),
+                axes: AxisSet::SHAPE,
+            }],
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None,
+            "bare --yes must not rewrite tag shape in CI"
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-pin"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
+    /// Freezing a floating tag is a lasting behaviour change, so `--yes`
+    /// alone leaves it floating.
+    #[test]
+    fn pinning_a_floating_tag_needs_allow_pin() {
+        let found = Candidates {
+            current: "24-trixie".to_owned(),
+            version_bump: None,
+            pin: Some("5.0.3-24-trixie".to_owned()),
+            moves: Vec::new(),
+            limitation: None,
+        };
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"]).auto_choice(&found),
+            None
+        );
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes", "--allow-pin"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
+    /// A plain version bump is what `--yes` is for and needs no flag.
+    #[test]
+    fn yes_alone_still_takes_a_version_bump() {
+        let found = Candidates {
+            current: "4.0.10-24-trixie".to_owned(),
+            version_bump: Some("5.0.3-24-trixie".to_owned()),
+            pin: None,
+            moves: Vec::new(),
+            limitation: None,
+        };
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"])
+                .auto_choice(&found)
+                .as_deref(),
+            Some("5.0.3-24-trixie")
+        );
+    }
+
     #[test]
     fn cli_accepts_the_documented_flags() {
         use clap::Parser as _;
@@ -652,6 +854,22 @@ mod tests {
         assert!(
             crate::Cli::try_parse_from(["cella", "image", "update", "--yes", "--allow-os-change"])
                 .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from(["cella", "image", "update", "--yes", "--allow-pin"])
+                .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "cella",
+                "image",
+                "update",
+                "--yes",
+                "--allow-runtime-change",
+                "--allow-os-change",
+                "--allow-pin",
+            ])
+            .is_ok()
         );
         assert!(
             crate::Cli::try_parse_from(["cella", "image", "update", "--to", "2.0.14-trixie"])
@@ -669,6 +887,15 @@ mod tests {
             vec!["cella", "image", "update", "--to", "x", "--check"],
             vec!["cella", "image", "update", "--to", "x", "--yes"],
             vec!["cella", "image", "update", "--to", "x", "--allow-os-change"],
+            vec!["cella", "image", "update", "--to", "x", "--allow-pin"],
+            vec![
+                "cella",
+                "image",
+                "update",
+                "--to",
+                "x",
+                "--allow-runtime-change",
+            ],
         ] {
             assert!(
                 crate::Cli::try_parse_from(&conflicting).is_err(),
