@@ -163,7 +163,18 @@ impl UpdateArgs {
             );
         }
 
-        let computed = candidates::compute(&fetched.tags, &tag);
+        // An alias line names no runtime, so which one it points at can only
+        // be learned from the registry. Probed only when the image actually
+        // publishes runtime-ful lines beside it: 1-4 requests, or none.
+        let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
+            Some(probe) => {
+                let resolver = cella_oci::RegistryResolver::new(&reference);
+                candidates::resolve_alias_runtime(&resolver, &probe).await
+            }
+            None => None,
+        };
+
+        let computed = candidates::compute(&fetched.tags, &tag, alias_runtime.as_deref());
         if self.stop_at_floating(computed.as_ref()) {
             eprintln!("{tag} tracks latest — nothing to pin");
             return Ok(());
@@ -448,7 +459,7 @@ fn display_candidates(reference: &str, found: &Candidates) {
     }
     // Said out loud rather than silently emitting a shorter list: the user
     // cannot otherwise tell a complete offer from a truncated one.
-    if let Some(limitation) = found.limitation {
+    if let Some(limitation) = &found.limitation {
         eprintln!("  ({})", limitation.message());
     }
 }
@@ -599,7 +610,7 @@ mod tests {
             }
         );
         // `latest` has no leading version, so nothing is offered.
-        assert!(candidates::compute(&["24.04".to_owned()], "latest").is_none());
+        assert!(candidates::compute(&["24.04".to_owned()], "latest", None).is_none());
     }
 
     /// Regression: `--to` was swallowed by the "up to date" early return, so
@@ -632,7 +643,7 @@ mod tests {
     #[test]
     fn an_explicit_target_survives_a_floating_current_tag() {
         assert!(
-            candidates::compute(&["24.04".to_owned()], "latest").is_none(),
+            candidates::compute(&["24.04".to_owned()], "latest", None).is_none(),
             "precondition: a floating tag computes nothing"
         );
 
@@ -913,6 +924,32 @@ mod tests {
         assert!(!debian.is_newer_than(&ubuntu));
     }
 
+    /// The alias line resolved against the live registry, end to end: only a
+    /// digest can say which runtime `5.0.3-trixie` currently points at.
+    #[cella_testing::runtime_test(network)]
+    async fn resolves_the_real_alias_line_by_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TagCache::with_root(dir.path());
+        let reference = "mcr.microsoft.com/devcontainers/typescript-node";
+        let fetched = cella_oci::fetch_image_tags(&cache, reference, true)
+            .await
+            .unwrap();
+
+        let probe = candidates::alias_probe(&fetched.tags, "5.0.3-trixie")
+            .expect("trixie is an alias line upstream");
+        let resolver = cella_oci::RegistryResolver::new(reference);
+        let runtime = candidates::resolve_alias_runtime(&resolver, &probe)
+            .await
+            .expect("the alias must resolve to a published runtime");
+
+        let found = candidates::compute(&fetched.tags, "5.0.3-trixie", Some(&runtime)).unwrap();
+        assert!(
+            found.moves.iter().all(|m| m.axes.contains(AxisSet::SHAPE)),
+            "every move off an alias line makes the pin explicit: {:?}",
+            found.moves
+        );
+    }
+
     #[cella_testing::runtime_test(network)]
     async fn resolves_candidates_for_the_real_rust_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -921,7 +958,7 @@ mod tests {
             cella_oci::fetch_image_tags(&cache, "mcr.microsoft.com/devcontainers/rust", true)
                 .await
                 .unwrap();
-        let found = candidates::compute(&fetched.tags, "2.0.2-trixie").unwrap();
+        let found = candidates::compute(&fetched.tags, "2.0.2-trixie", None).unwrap();
         let bump = found
             .version_bump
             .expect("a newer trixie tag must exist upstream");

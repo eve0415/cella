@@ -84,18 +84,27 @@ pub struct VariantMove {
 /// Surfaced rather than silently shortening the list: a user who sees three
 /// moves has no way to tell "these are all of them" from "runtimes could not
 /// be read".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Limitation {
     /// The variant does not decompose into runtime and release — php's
     /// `8.5-apache-trixie` leaves `8.5-apache`, which is not a version.
     UndecomposableVariant,
+    /// The pin sits on an alias line whose runtime could not be read, so the
+    /// explicit runtime lines cannot be ordered against it. Carries the tag
+    /// the probe failed on.
+    UnresolvedAlias(String),
 }
 
 impl Limitation {
     /// The one-line explanation shown under the candidate list.
-    pub const fn message(self) -> &'static str {
+    pub fn message(&self) -> String {
         match self {
-            Self::UndecomposableVariant => "runtime moves unavailable for this variant shape",
+            Self::UndecomposableVariant => {
+                "runtime moves unavailable for this variant shape".to_owned()
+            }
+            Self::UnresolvedAlias(tag) => {
+                format!("runtime lines unavailable (could not resolve {tag})")
+            }
         }
     }
 }
@@ -106,6 +115,8 @@ enum Runtime<'a> {
     /// No runtime component — an alias line such as `trixie`, which resolves
     /// to whichever runtime upstream currently points it at.
     Alias,
+    /// An alias line whose runtime was identified by comparing digests.
+    Resolved(VersionKey),
     /// A comparable numeric runtime: `22-trixie` yields `22`.
     Explicit(&'a str, VersionKey),
     /// A prefix that is not a version, so runtimes here cannot be ordered.
@@ -140,7 +151,19 @@ fn axes_between(
     };
 
     match (pin, candidate) {
-        (Runtime::Alias, Runtime::Alias) => {}
+        (Runtime::Alias | Runtime::Resolved(_), Runtime::Alias) => {}
+        // The pin's line was resolved to a concrete runtime, so the explicit
+        // lines can be ordered against it. Naming one is a shape change even
+        // when the runtime is identical: the tag stops tracking the alias.
+        (Runtime::Resolved(pinned), Runtime::Explicit(_, target)) => {
+            if target < pinned {
+                return None;
+            }
+            axes |= AxisSet::SHAPE;
+            if target > pinned {
+                axes |= AxisSet::RUNTIME;
+            }
+        }
         (Runtime::Explicit(_, pinned), Runtime::Explicit(_, target)) => {
             if target < pinned {
                 return None;
@@ -212,7 +235,7 @@ impl Candidates {
 /// `24-trixie` (the floating Node 24 variant): both are one leading numeric
 /// group. Reading them the same way ranked `24 > 5` and offered a floating
 /// tag as an update to a pinned one.
-pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
+pub fn compute(tags: &[String], current: &str, alias_runtime: Option<&str>) -> Option<Candidates> {
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
     // Derived once for the whole computation: every parse below shares it.
     let grammar = TagGrammar::from_tags(&refs);
@@ -228,8 +251,8 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
             current: current.to_owned(),
             version_bump: None,
             pin: newest_in_variant(&grammar, &refs, selection).map(|(_, tag)| tag.to_owned()),
-            moves: moves_for(&grammar, &refs, selection, None),
-            limitation: limitation_for(selection),
+            moves: moves_for(&grammar, &refs, selection, None, alias_runtime),
+            limitation: limitation_for(&grammar, &refs, current, selection, alias_runtime),
         });
     };
 
@@ -249,15 +272,125 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         current: current.to_owned(),
         version_bump,
         pin: None,
-        moves: moves_for(&grammar, &refs, selection, Some(&current_key)),
-        limitation: limitation_for(selection),
+        moves: moves_for(
+            &grammar,
+            &refs,
+            selection,
+            Some(&current_key),
+            alias_runtime,
+        ),
+        limitation: limitation_for(&grammar, &refs, current, selection, alias_runtime),
     })
 }
 
 /// The limitation that applies to a pin on `selection`, if any.
-fn limitation_for(selection: &str) -> Option<Limitation> {
+///
+/// An alias pin only counts as unresolved when the image actually publishes
+/// runtime-ful lines beside it — otherwise there was never anything to
+/// resolve, and saying so would be noise.
+fn limitation_for(
+    grammar: &TagGrammar,
+    tags: &[&str],
+    current: &str,
+    selection: &str,
+    alias_runtime: Option<&str>,
+) -> Option<Limitation> {
     let (prefix, _, _) = distro_of(selection)?;
-    matches!(runtime_of(prefix), Runtime::Opaque(_)).then_some(Limitation::UndecomposableVariant)
+    match runtime_of(prefix) {
+        Runtime::Opaque(_) => Some(Limitation::UndecomposableVariant),
+        Runtime::Alias
+            if alias_runtime.is_none() && has_runtime_siblings(grammar, tags, selection) =>
+        {
+            Some(Limitation::UnresolvedAlias(current.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the image publishes explicit-runtime variants alongside this
+/// alias line, i.e. whether a digest probe has anything to compare against.
+fn has_runtime_siblings(grammar: &TagGrammar, tags: &[&str], selection: &str) -> bool {
+    let Some((_, _, release)) = distro_of(selection) else {
+        return false;
+    };
+    published_variants(grammar, tags)
+        .into_iter()
+        .any(|variant| {
+            distro_of(variant).is_some_and(|(prefix, _, candidate_release)| {
+                candidate_release == release && matches!(runtime_of(prefix), Runtime::Explicit(..))
+            })
+        })
+}
+
+/// Whether the pin sits on an alias line whose runtime can be identified by
+/// comparing manifest digests, and the tags to compare it against.
+///
+/// Returns `None` when the pin already names a runtime, when the image
+/// publishes none beside it, or when the tag does not parse — in each case
+/// there is nothing a probe could learn.
+pub fn alias_probe(tags: &[String], current: &str) -> Option<AliasProbe> {
+    let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let grammar = TagGrammar::from_tags(&refs);
+    let parsed = grammar.parse(current)?;
+    let (prefix, _, release) = distro_of(parsed.variant)?;
+    if !matches!(runtime_of(prefix), Runtime::Alias) {
+        return None;
+    }
+
+    let published: std::collections::HashSet<&str> = refs.iter().copied().collect();
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for variant in published_variants(&grammar, &refs) {
+        let Some((candidate_prefix, _, candidate_release)) = distro_of(variant) else {
+            continue;
+        };
+        if candidate_release != release {
+            continue;
+        }
+        let Runtime::Explicit(runtime, _) = runtime_of(candidate_prefix) else {
+            continue;
+        };
+        // Compare like with like: a versioned pin against the same version on
+        // the explicit line, a floating pin against the bare variant.
+        let tag = parsed.version.map_or_else(
+            || variant.to_owned(),
+            |version| format!("{version}-{variant}"),
+        );
+        if published.contains(tag.as_str()) {
+            candidates.push((runtime.to_owned(), tag));
+        }
+    }
+
+    (!candidates.is_empty()).then(|| AliasProbe {
+        pin: current.to_owned(),
+        candidates,
+    })
+}
+
+/// The tags whose digests identify which runtime an alias line points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasProbe {
+    /// The pinned tag itself.
+    pub pin: String,
+    /// `(runtime, tag)` pairs on the same distro release.
+    pub candidates: Vec<(String, String)>,
+}
+
+/// Identify the runtime an alias line resolves to, by digest.
+///
+/// `None` when the registry cannot be reached or nothing matches; callers
+/// degrade to same-shape offers rather than guessing, because an unanchored
+/// list would present Node 22 as an update to a Node 24 pin.
+pub async fn resolve_alias_runtime<R: cella_oci::AliasResolver + Sync>(
+    resolver: &R,
+    probe: &AliasProbe,
+) -> Option<String> {
+    let pinned = resolver.digest(&probe.pin).await?;
+    for (runtime, tag) in &probe.candidates {
+        if resolver.digest(tag).await.as_deref() == Some(pinned.as_str()) {
+            return Some(runtime.clone());
+        }
+    }
+    None
 }
 
 /// Every published variant, as the grammar reads them, with alias spellings
@@ -321,11 +454,17 @@ fn moves_for(
     tags: &[&str],
     selection: &str,
     current_key: Option<&VersionKey>,
+    alias_runtime: Option<&str>,
 ) -> Vec<VariantMove> {
     let Some((prefix, _, current_release)) = distro_of(selection) else {
         return Vec::new();
     };
-    let pin_runtime = runtime_of(prefix);
+    let pin_runtime = match (runtime_of(prefix), alias_runtime) {
+        (Runtime::Alias, Some(runtime)) => {
+            version_key(runtime).map_or(Runtime::Alias, Runtime::Resolved)
+        }
+        (runtime, _) => runtime,
+    };
 
     let mut moves: Vec<(u32, Option<VersionKey>, VersionKey, VariantMove)> = Vec::new();
     for candidate in published_variants(grammar, tags) {
@@ -353,7 +492,7 @@ fn moves_for(
             continue;
         }
         let runtime_rank = match runtime_of(candidate_prefix) {
-            Runtime::Explicit(_, key) => Some(key),
+            Runtime::Explicit(_, key) | Runtime::Resolved(key) => Some(key),
             Runtime::Alias | Runtime::Opaque(_) => None,
         };
         moves.push((
@@ -467,13 +606,13 @@ mod tests {
     fn a_node_major_is_never_offered_as_an_image_version_bump() {
         let tags = typescript_node_tags();
 
-        let newest = compute(&tags, "5.0.3-trixie").expect("the pin must parse");
+        let newest = compute(&tags, "5.0.3-trixie", None).expect("the pin must parse");
         assert_eq!(
             newest.version_bump, None,
             "5.0.3 is the newest release on the trixie line"
         );
 
-        let older = compute(&tags, "5.0.1-trixie").expect("the pin must parse");
+        let older = compute(&tags, "5.0.1-trixie", None).expect("the pin must parse");
         assert_eq!(
             older.version_bump.as_deref(),
             Some("5.0.3-trixie"),
@@ -495,7 +634,7 @@ mod tests {
             ("20-trixie", "4.0.10-20-trixie"),
             ("24-trixie", "5.0.3-24-trixie"),
         ] {
-            let c = compute(&tags, pin).expect("a floating tag still names a variant");
+            let c = compute(&tags, pin, None).expect("a floating tag still names a variant");
             assert_eq!(c.version_bump, None, "{pin} has no version to advance");
             assert_eq!(
                 c.pin.as_deref(),
@@ -509,7 +648,7 @@ mod tests {
     /// newest version on its *own* variant rather than a runtime-ful one.
     #[test]
     fn a_bare_codename_pins_to_its_own_line() {
-        let c = compute(&typescript_node_tags(), "trixie").expect("trixie names a variant");
+        let c = compute(&typescript_node_tags(), "trixie", None).expect("trixie names a variant");
         assert_eq!(c.pin.as_deref(), Some("5.0.3-trixie"));
         assert_eq!(c.version_bump, None);
     }
@@ -530,7 +669,7 @@ mod tests {
         // the raw list is a `dev-` build and the real newest sits mid-list.
         // This is the bug being prevented.
         let tags = rust_tags();
-        let c = compute(&tags, "2.0.2-trixie").unwrap();
+        let c = compute(&tags, "2.0.2-trixie", None).unwrap();
         let bump = c.version_bump.expect("a newer trixie tag exists");
         assert!(bump.ends_with("-trixie"));
 
@@ -540,7 +679,7 @@ mod tests {
 
     #[test]
     fn offers_moves_only_forward_and_in_family() {
-        let c = compute(&rust_tags(), "2.0.2-bullseye").unwrap();
+        let c = compute(&rust_tags(), "2.0.2-bullseye", None).unwrap();
         let targets: Vec<&str> = c.moves.iter().map(|m| m.to.as_str()).collect();
         assert!(targets.contains(&"trixie"));
         assert!(targets.contains(&"bookworm"));
@@ -553,7 +692,7 @@ mod tests {
 
     #[test]
     fn moves_are_newest_release_first() {
-        let c = compute(&rust_tags(), "2.0.2-buster").unwrap();
+        let c = compute(&rust_tags(), "2.0.2-buster", None).unwrap();
         let targets: Vec<&str> = c.moves.iter().map(|m| m.to.as_str()).collect();
         assert_eq!(targets, vec!["trixie", "bookworm", "bullseye"]);
         assert!(c.moves.iter().all(|m| m.from == "buster"));
@@ -577,7 +716,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
 
-        let c = compute(&tags, "4.0.10-22-trixie").unwrap();
+        let c = compute(&tags, "4.0.10-22-trixie", None).unwrap();
         assert_eq!(c.version_bump.as_deref(), Some("5.0.1-22-trixie"));
     }
 
@@ -593,7 +732,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
 
-        let c = compute(&tags, "4.0.10-22-bookworm").unwrap();
+        let c = compute(&tags, "4.0.10-22-bookworm", None).unwrap();
 
         // The release-only move is the one that must hold Node fixed. Moving
         // the runtime too is a separate offer, and it says so on its face.
@@ -636,7 +775,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
 
-        let c = compute(&tags, "1.0.0-bullseye").unwrap();
+        let c = compute(&tags, "1.0.0-bullseye", None).unwrap();
         assert_eq!(c.moves.len(), 1, "got {:?}", c.moves);
         assert_eq!(
             c.moves[0].to, "bookworm",
@@ -657,7 +796,7 @@ mod tests {
             .map(|t| t.as_str().unwrap().to_owned())
             .collect();
 
-        let c = compute(&tags, "1.0.0-bullseye").unwrap();
+        let c = compute(&tags, "1.0.0-bullseye", None).unwrap();
         let mut ordinals: Vec<&str> = c.moves.iter().map(|m| m.to.as_str()).collect();
         let before = ordinals.len();
         ordinals.sort_unstable();
@@ -682,7 +821,7 @@ mod tests {
             .collect();
 
         // trixie's newest is 3.0.4 here, which is not a downgrade.
-        let ok = compute(&tags, "3.0.4-bookworm").unwrap();
+        let ok = compute(&tags, "3.0.4-bookworm", None).unwrap();
         assert_eq!(ok.moves.len(), 1);
         assert_eq!(ok.moves[0].tag, "3.0.4-trixie");
 
@@ -691,7 +830,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        let c = compute(&young, "3.0.4-bookworm").unwrap();
+        let c = compute(&young, "3.0.4-bookworm", None).unwrap();
         assert!(
             c.moves.is_empty(),
             "a move that rolls the version back is not an update: {:?}",
@@ -704,7 +843,7 @@ mod tests {
     /// against the live registry when it was captured.
     #[test]
     fn moves_are_the_full_forward_cross_product() {
-        let c = compute(&typescript_node_tags(), "5.0.3-22-bookworm").unwrap();
+        let c = compute(&typescript_node_tags(), "5.0.3-22-bookworm", None).unwrap();
         let listed: Vec<(&str, Vec<&str>)> = c
             .moves
             .iter()
@@ -730,7 +869,7 @@ mod tests {
     /// update, on either axis.
     #[test]
     fn moves_never_go_backwards_on_either_axis() {
-        let c = compute(&typescript_node_tags(), "5.0.3-22-bookworm").unwrap();
+        let c = compute(&typescript_node_tags(), "5.0.3-22-bookworm", None).unwrap();
         for m in &c.moves {
             assert!(
                 !m.to.ends_with("-buster") && !m.to.ends_with("-bullseye"),
@@ -759,7 +898,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
 
-        let c = compute(&tags, "3.0.4-8.5-apache-bookworm").unwrap();
+        let c = compute(&tags, "3.0.4-8.5-apache-bookworm", None).unwrap();
         assert_eq!(
             c.limitation,
             Some(Limitation::UndecomposableVariant),
@@ -793,20 +932,161 @@ mod tests {
         .collect();
 
         for pin in ["2.1.4-9.0-bookworm-slim", "2.1.4-11.0-preview-resolute"] {
-            let c = compute(&tags, pin).unwrap();
+            let c = compute(&tags, pin, None).unwrap();
             assert!(c.moves.is_empty(), "{pin} got {:?}", c.moves);
             assert_eq!(c.limitation, None);
         }
     }
 
+    /// Digests captured from mcr.microsoft.com/devcontainers/typescript-node.
+    /// The alias line and the Node 24 line are the same image; Node 22 is not.
+    const ALIAS_DIGEST: &str = "b55b444f6658dd2370d430c12d4bc9540c8ed0d3d5b05e4c247161173666954f";
+    const NODE_22_DIGEST: &str = "4f634c449931ac2aff140f9fac5825413196e631ccc0eb7afd17033144253be4";
+
+    fn seeded_resolver() -> cella_oci::MapResolver {
+        cella_oci::MapResolver::new([
+            ("5.0.3-trixie", ALIAS_DIGEST),
+            ("5.0.3-24-trixie", ALIAS_DIGEST),
+            ("5.0.3-22-trixie", NODE_22_DIGEST),
+            ("5.0.3-20-trixie", NODE_22_DIGEST),
+            ("trixie", ALIAS_DIGEST),
+            ("24-trixie", ALIAS_DIGEST),
+            ("22-trixie", NODE_22_DIGEST),
+        ])
+    }
+
+    #[tokio::test]
+    async fn an_alias_line_is_identified_by_digest() {
+        let tags = typescript_node_tags();
+        let probe = alias_probe(&tags, "5.0.3-trixie").expect("trixie is an alias line");
+        assert!(
+            probe
+                .candidates
+                .iter()
+                .any(|(runtime, tag)| runtime == "24" && tag == "5.0.3-24-trixie"),
+            "got {:?}",
+            probe.candidates
+        );
+
+        assert_eq!(
+            resolve_alias_runtime(&seeded_resolver(), &probe)
+                .await
+                .as_deref(),
+            Some("24"),
+            "the trixie alias resolves to Node 24"
+        );
+    }
+
+    /// Done-condition: a resolved alias pin is offered the explicit line for
+    /// the *same* runtime, labelled as a shape change only.
+    #[tokio::test]
+    async fn a_resolved_alias_offers_the_explicit_line_as_a_shape_move() {
+        let tags = typescript_node_tags();
+        let probe = alias_probe(&tags, "5.0.3-trixie").unwrap();
+        let runtime = resolve_alias_runtime(&seeded_resolver(), &probe)
+            .await
+            .unwrap();
+
+        let c = compute(&tags, "5.0.3-trixie", Some(&runtime)).unwrap();
+        let listed: Vec<(&str, Vec<&str>)> = c
+            .moves
+            .iter()
+            .map(|m| (m.tag.as_str(), m.axes.names()))
+            .collect();
+
+        assert_eq!(listed, vec![("5.0.3-24-trixie", vec!["shape"])]);
+        assert_eq!(c.limitation, None);
+        assert_eq!(c.version_bump, None, "5.0.3 is newest on the trixie line");
+    }
+
+    /// Without a resolved runtime the explicit lines cannot be ordered, so
+    /// none are offered — and the user is told why rather than being handed a
+    /// silently shorter list.
+    #[tokio::test]
+    async fn an_unresolvable_alias_degrades_and_says_so() {
+        let tags = typescript_node_tags();
+        let probe = alias_probe(&tags, "5.0.3-trixie").unwrap();
+
+        // A resolver that knows nothing: the offline / 401 / stale-cache path.
+        let blind = cella_oci::MapResolver::new(Vec::<(String, String)>::new());
+        assert_eq!(resolve_alias_runtime(&blind, &probe).await, None);
+
+        let c = compute(&tags, "5.0.3-trixie", None).unwrap();
+        assert!(
+            c.moves.iter().all(|m| !m.axes.contains(AxisSet::SHAPE)),
+            "no runtime line may be offered unanchored: {:?}",
+            c.moves
+        );
+        assert_eq!(
+            c.limitation,
+            Some(Limitation::UnresolvedAlias("5.0.3-trixie".to_owned()))
+        );
+    }
+
+    /// A pin that already names its runtime has nothing to probe, and neither
+    /// does an image that publishes no runtime-ful lines.
+    #[test]
+    fn probing_is_skipped_when_there_is_nothing_to_learn() {
+        assert_eq!(
+            alias_probe(&typescript_node_tags(), "5.0.3-24-trixie"),
+            None,
+            "the pin already names its runtime"
+        );
+        // An image with no runtime-ful lines at all has nothing to compare.
+        let plain: Vec<String> = [
+            "1.0.0-bookworm",
+            "1.0.1-bookworm",
+            "bookworm",
+            "1.0.1-trixie",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(alias_probe(&plain, "bookworm"), None);
+        assert_eq!(
+            compute(&plain, "bookworm", None).unwrap().limitation,
+            None,
+            "nothing to resolve means nothing to report"
+        );
+    }
+
+    /// rust's `2.0.14-trixie` and `2.0.14-1-trixie` are digest-identical, so
+    /// the revision line is offered as a shape move once the alias resolves.
+    /// The *version bump* still never crosses between the two lines — that is
+    /// a separate question from what moves are offered.
+    #[test]
+    fn a_rust_alias_pin_is_offered_its_revision_line_without_crossing_versions() {
+        let tags = rust_tags();
+        let probe = alias_probe(&tags, "2.0.9-trixie").expect("trixie is an alias line here");
+        assert!(
+            probe.candidates.iter().any(|(runtime, _)| runtime == "1"),
+            "got {:?}",
+            probe.candidates
+        );
+
+        let c = compute(&tags, "2.0.9-trixie", Some("1")).unwrap();
+        assert_eq!(
+            c.version_bump.as_deref(),
+            Some(NEWEST_PLAIN_TRIXIE),
+            "the bump stays on the plain line"
+        );
+        assert!(
+            c.moves
+                .iter()
+                .all(|m| m.axes.contains(AxisSet::SHAPE) && m.to == "1-trixie"),
+            "the revision line is a labelled shape move, not a bump: {:?}",
+            c.moves
+        );
+    }
+
     #[test]
     fn unparseable_tags_produce_nothing() {
         // `latest` names no variant at all, so there is nothing to pin it to.
-        assert!(compute(&rust_tags(), "latest").is_none());
+        assert!(compute(&rust_tags(), "latest", None).is_none());
 
         // A bare codename does name a variant, so it is pinnable — the one
         // thing it is not is bumpable.
-        let trixie = compute(&rust_tags(), "trixie").expect("trixie is a published variant");
+        let trixie = compute(&rust_tags(), "trixie", None).expect("trixie is a published variant");
         assert_eq!(trixie.version_bump, None);
         assert_eq!(trixie.pin.as_deref(), Some(NEWEST_PLAIN_TRIXIE));
     }
@@ -822,21 +1102,23 @@ mod tests {
             "fixture must contain {NEWEST_TRIXIE}"
         );
 
-        let c = compute(&tags, NEWEST_TRIXIE).unwrap();
+        let c = compute(&tags, NEWEST_TRIXIE, None).unwrap();
         assert_eq!(c.version_bump, None);
 
         // MCR publishes two parallel lines: plain `X-trixie` and revision
         // `X-1-trixie`. A pin stays on the line it is on, so the plain line's
         // newest is what a plain pin is offered.
         assert_eq!(
-            compute(&tags, "2.0.2-trixie")
+            compute(&tags, "2.0.2-trixie", None)
                 .unwrap()
                 .version_bump
                 .as_deref(),
             Some(NEWEST_PLAIN_TRIXIE)
         );
         assert_eq!(
-            compute(&tags, NEWEST_PLAIN_TRIXIE).unwrap().version_bump,
+            compute(&tags, NEWEST_PLAIN_TRIXIE, None)
+                .unwrap()
+                .version_bump,
             None
         );
     }
@@ -853,7 +1135,7 @@ mod tests {
             ("2.0.9-1-trixie", Some(NEWEST_TRIXIE)),
         ] {
             assert_eq!(
-                compute(&tags, pin).unwrap().version_bump.as_deref(),
+                compute(&tags, pin, None).unwrap().version_bump.as_deref(),
                 expected,
                 "pin {pin} crossed lines"
             );
@@ -862,7 +1144,7 @@ mod tests {
 
     #[test]
     fn trixie_is_newest_debian_so_it_has_no_moves() {
-        let c = compute(&rust_tags(), NEWEST_TRIXIE).unwrap();
+        let c = compute(&rust_tags(), NEWEST_TRIXIE, None).unwrap();
         assert!(c.moves.is_empty());
         assert!(c.is_empty());
     }
@@ -875,10 +1157,10 @@ mod tests {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        let c = compute(&tags, "24.04").unwrap();
+        let c = compute(&tags, "24.04", None).unwrap();
         assert_eq!(c.version_bump.as_deref(), Some("24.10"));
         assert!(c.moves.is_empty());
 
-        assert_eq!(compute(&tags, "24.10").unwrap().version_bump, None);
+        assert_eq!(compute(&tags, "24.10", None).unwrap().version_bump, None);
     }
 }
