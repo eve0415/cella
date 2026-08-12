@@ -104,78 +104,15 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
     match subcmd {
         Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => {
+            if !flags_are_known(&args[2..], &["--json"], "list") {
+                return CliCommand::Help;
+            }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::List { json }
         }
-        Some("exec") => {
-            // Parse: cella exec <branch> [--json] -- <cmd...>
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let sep = args.iter().position(|a| a == "--");
-            let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
-            if command.is_empty() {
-                return CliCommand::Help;
-            }
-            let json = args[3..sep.unwrap_or(args.len())]
-                .iter()
-                .any(|a| a == "--json");
-            CliCommand::Exec {
-                branch,
-                command,
-                json,
-            }
-        }
-        Some("down") => {
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let mut rm = false;
-            let mut volumes = false;
-            let mut force = false;
-            for arg in &args[3..] {
-                match arg.as_str() {
-                    "--rm" => rm = true,
-                    "--volumes" => volumes = true,
-                    "--force" => force = true,
-                    f if f.starts_with('-') => {
-                        eprintln!("Error: unknown flag '{f}' for down command");
-                        return CliCommand::Help;
-                    }
-                    _ => {}
-                }
-            }
-            if volumes && !rm {
-                eprintln!("Error: --volumes requires --rm");
-                return CliCommand::Help;
-            }
-            CliCommand::Down {
-                branch,
-                rm,
-                volumes,
-                force,
-            }
-        }
-        Some("up") => {
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let mut rebuild = false;
-            for arg in &args[3..] {
-                match arg.as_str() {
-                    "--rebuild" => rebuild = true,
-                    f if f.starts_with('-') => {
-                        eprintln!("Error: unknown flag '{f}' for up command");
-                        return CliCommand::Help;
-                    }
-                    _ => {}
-                }
-            }
-            CliCommand::Up { branch, rebuild }
-        }
+        Some("exec") => parse_exec_subcommand(args),
+        Some("down") => parse_down_subcommand(args),
+        Some("up") => parse_up_subcommand(args),
         Some("prune") => parse_prune_subcommand(args),
         Some("task") => parse_task_subcommand(args),
         Some("switch") => {
@@ -183,9 +120,15 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[3..], &[], "switch") {
+                return CliCommand::Help;
+            }
             CliCommand::Switch { branch }
         }
         Some("doctor") => {
+            if !flags_are_known(&args[2..], &["--json"], "doctor") {
+                return CliCommand::Help;
+            }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::Doctor { json }
         }
@@ -194,6 +137,99 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             command: cmd.to_string(),
         },
     }
+}
+
+/// Reject any dash-led argument that is not in `accepted`.
+///
+/// The commands that parse a flag or two used to scan for exactly those and
+/// silently drop everything else, so `cella list --jsno` succeeded and quietly
+/// did nothing. Returns `false` (after reporting) when an intruder is present.
+fn flags_are_known(args: &[String], accepted: &[&str], command: &str) -> bool {
+    for arg in args {
+        if arg.starts_with('-') && !accepted.contains(&arg.as_str()) {
+            eprintln!("Error: unknown flag '{arg}' for {command} command");
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse `cella exec <branch> [--json] -- <cmd...>`.
+fn parse_exec_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    let sep = args.iter().position(|a| a == "--");
+    let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
+    if command.is_empty() {
+        return CliCommand::Help;
+    }
+    // Only the region before `--`; everything after belongs to the user's own
+    // command and may legitimately start with a dash.
+    let own = &args[3..sep.unwrap_or(args.len())];
+    if !flags_are_known(own, &["--json"], "exec") {
+        return CliCommand::Help;
+    }
+    let json = own.iter().any(|a| a == "--json");
+    CliCommand::Exec {
+        branch,
+        command,
+        json,
+    }
+}
+
+/// Parse `cella down <branch> [--rm] [--volumes] [--force]`.
+fn parse_down_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    let mut rm = false;
+    let mut volumes = false;
+    let mut force = false;
+    for arg in &args[3..] {
+        match arg.as_str() {
+            "--rm" => rm = true,
+            "--volumes" => volumes = true,
+            "--force" => force = true,
+            f if f.starts_with('-') => {
+                eprintln!("Error: unknown flag '{f}' for down command");
+                return CliCommand::Help;
+            }
+            _ => {}
+        }
+    }
+    if volumes && !rm {
+        eprintln!("Error: --volumes requires --rm");
+        return CliCommand::Help;
+    }
+    CliCommand::Down {
+        branch,
+        rm,
+        volumes,
+        force,
+    }
+}
+
+/// Parse `cella up <branch> [--rebuild]`.
+fn parse_up_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    let mut rebuild = false;
+    for arg in &args[3..] {
+        match arg.as_str() {
+            "--rebuild" => rebuild = true,
+            f if f.starts_with('-') => {
+                eprintln!("Error: unknown flag '{f}' for up command");
+                return CliCommand::Help;
+            }
+            _ => {}
+        }
+    }
+    CliCommand::Up { branch, rebuild }
 }
 
 fn parse_branch_subcommand(args: &[String]) -> CliCommand {
@@ -365,11 +401,18 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
             }
         }
         Some("list" | "ls") => {
+            if !flags_are_known(&args[3..], &["--json"], "task list") {
+                return CliCommand::Help;
+            }
             let json = args[3..].iter().any(|a| a == "--json");
             CliCommand::TaskList { json }
         }
         Some("logs") => {
-            // Parse: cella task logs [-f|--follow] <branch>
+            // Parse: cella task logs [-f|--follow] <branch> — the flag is
+            // accepted on either side of the positional.
+            if !flags_are_known(&args[3..], &["-f", "--follow"], "task logs") {
+                return CliCommand::Help;
+            }
             let follow = args[3..].iter().any(|a| a == "-f" || a == "--follow");
             let branch = args[3..].iter().find(|a| !a.starts_with('-')).cloned();
             branch.map_or(CliCommand::Help, |b| CliCommand::TaskLogs {
@@ -382,6 +425,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[4..], &[], "task wait") {
+                return CliCommand::Help;
+            }
             CliCommand::TaskWait { branch }
         }
         Some("stop") => {
@@ -389,6 +435,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[4..], &[], "task stop") {
+                return CliCommand::Help;
+            }
             CliCommand::TaskStop { branch }
         }
         _ => CliCommand::Help,
@@ -1795,13 +1844,12 @@ mod tests {
         }
     }
 
-    /// Commands that reject unknown flags today. `list`, `exec`, `switch`,
-    /// `doctor` and `task list|logs|wait|stop` scan for the flags they know and
-    /// ignore the rest, so an intruder there parses fine and this test would
-    /// fail against them. Widened to the whole table when they turn strict.
-    const STRICT_PATHS: &[&str] = &["branch", "down", "up", "prune", "task run"];
-
     /// Layer (c): a flag a command does not accept must be refused, not ignored.
+    ///
+    /// Covers every entry in the table. It used to be restricted to the handful
+    /// of commands that were strict — `list`, `exec`, `switch`, `doctor` and
+    /// `task list|logs|wait|stop` merely scanned for the flags they knew and
+    /// dropped the rest, so `cella list --jsno` succeeded and did nothing.
     #[test]
     fn unknown_flags_are_rejected() {
         let every_spelling: Vec<String> = CLI_SURFACE
@@ -1811,7 +1859,9 @@ mod tests {
             .collect();
 
         for spec in CLI_SURFACE {
-            if !STRICT_PATHS.contains(&spec.path) {
+            // `task` is a namespace: `cella task --anything` is answered by the
+            // subcommand dispatch, not by a flag scan.
+            if cella_completion::subcommands_of(spec.path).next().is_some() {
                 continue;
             }
             let accepted: Vec<String> = spec.options.iter().flat_map(option_spellings).collect();
@@ -1827,6 +1877,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The concrete regression: a typo'd flag used to parse as a plain `list`
+    /// and silently produce non-JSON output.
+    #[test]
+    fn list_rejects_a_typo_flag() {
+        let args: Vec<String> = ["cella", "list", "--jsno"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(matches!(parse_cli_args(&args), CliCommand::Help));
     }
 
     fn rendered(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
