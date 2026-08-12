@@ -2412,21 +2412,36 @@ fn append_extra_mounts(
         mounts.push(m.clone());
     }
 
-    let (vol_name, vol_target, _ro) = client.agent_volume_mount();
+    let (vol_name, vol_target, read_only) = client.agent_volume_mount();
     if managed_agent && !vol_name.is_empty() {
-        mounts.push(MountConfig {
-            mount_type: "volume".to_string(),
-            source: vol_name,
-            target: vol_target,
-            consistency: None,
-            read_only: false,
-            external: false,
-        });
+        mounts.push(agent_volume_mount_config(vol_name, vol_target, read_only));
     }
 }
 
 /// Bind-mount agent IPC directories (Claude Code teams/tasks, Codex queues)
 /// from the host into the container for cross-container communication.
+/// The dev container's mount for the shared agent volume.
+///
+/// `read_only` comes from the backend and is honored rather than discarded:
+/// the volume is shared by *every* cella container, and nothing inside a
+/// container writes to it. The agent only reads `/cella/.daemon_addr`; the
+/// host rewrites that file through a separate helper container, which mounts
+/// the volume writable on its own terms.
+///
+/// Docker mounts are immutable after creation, so this reaches only containers
+/// created from here on — existing ones keep their writable `/cella` until they
+/// are recreated.
+fn agent_volume_mount_config(name: String, target: String, read_only: bool) -> MountConfig {
+    MountConfig {
+        mount_type: "volume".to_string(),
+        source: name,
+        target,
+        consistency: None,
+        read_only,
+        external: false,
+    }
+}
+
 fn append_agent_ipc_mounts(mounts: &mut Vec<MountConfig>, remote_user: &str) {
     let Ok(home_str) = std::env::var("HOME") else {
         return;
@@ -2540,6 +2555,28 @@ mod tests {
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
+
+    /// The backend declares the agent volume read-only and the orchestrator
+    /// used to destructure that flag as `_ro`, hardcoding `read_only: false` —
+    /// leaving `/cella` writable from inside every container, for a volume
+    /// shared across all of them.
+    #[test]
+    fn agent_volume_mount_honors_the_backends_read_only_flag() {
+        let mount =
+            agent_volume_mount_config("cella-agent".to_string(), "/cella".to_string(), true);
+        assert!(mount.read_only, "the declared flag must not be discarded");
+        assert_eq!(mount.source, "cella-agent");
+        assert_eq!(mount.target, "/cella");
+        assert_eq!(mount.mount_type, "volume");
+    }
+
+    /// Not hardcoded the other way either — a backend that wants it writable
+    /// still gets a writable mount.
+    #[test]
+    fn agent_volume_mount_passes_a_writable_flag_through() {
+        let mount = agent_volume_mount_config("v".to_string(), "/cella".to_string(), false);
+        assert!(!mount.read_only);
+    }
 
     #[test]
     fn network_rule_policy_enforce_eq() {
