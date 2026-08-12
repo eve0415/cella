@@ -4,6 +4,7 @@ members = [
     "crates/cella-backend",
     "crates/cella-cli",
     "crates/cella-codegen",
+    "crates/cella-completion",
     "crates/cella-compose",
     "crates/cella-config",
     "crates/cella-container",
@@ -198,6 +199,7 @@ divan = "=0.1.21"
 cella-backend = { path = "crates/cella-backend" }
 cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
+cella-completion = { path = "crates/cella-completion" }
 cella-compose = { path = "crates/cella-compose" }
 cella-doctor = { path = "crates/cella-doctor" }
 cella-config = { path = "crates/cella-config" }
