@@ -18,6 +18,10 @@
 //! This crate has no dependencies, by design: `cella-agent` links it at
 //! runtime, so its cost is the table plus the rendering code and nothing else.
 
+mod render;
+
+pub use render::{bash_script, zsh_script};
+
 /// One command or sub-subcommand of the in-container `cella` CLI.
 pub struct CommandSpec {
     /// Space-separated path, e.g. `"branch"` or `"task run"`.
