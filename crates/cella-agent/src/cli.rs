@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use cella_completion::{CLI_SURFACE, CommandSpec, OperandSpec, OptionSpec};
 use cella_protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
 
 use crate::control::ControlClient;
@@ -84,6 +85,13 @@ pub enum CliCommand {
     },
     Help,
     CommandHelp,
+    /// The user misused a command: an error has already been printed and the
+    /// process must exit non-zero.
+    ///
+    /// Distinct from [`CliCommand::Help`], which is an explicit `--help` and
+    /// exits 0. Returning `Help` here made `cella list --jsno` print an error
+    /// and still exit 0, so a script could not tell it from a clean run.
+    UsageError,
     Unsupported {
         command: String,
     },
@@ -93,9 +101,17 @@ pub enum CliCommand {
 pub fn parse_cli_args(args: &[String]) -> CliCommand {
     let subcmd = args.get(1).map(String::as_str);
 
-    if let Some(cmd) = subcmd.filter(|c| {
-        *c != "--help" && *c != "-h" && args[2..].iter().any(|a| a == "--help" || a == "-h")
-    }) {
+    // Only cella's own region counts: for `exec` and `task run`, everything
+    // after `--` is the user's command, and `cella exec b -- ls --help` must
+    // run `ls --help` rather than print cella's help and exit 0. `get` returns
+    // None rather than panicking when a bare `--` sits where a subcommand goes.
+    let separator = args.iter().position(|a| a == "--");
+    let own = args
+        .get(2..separator.unwrap_or(args.len()))
+        .unwrap_or_default();
+    if let Some(cmd) =
+        subcmd.filter(|c| *c != "--help" && *c != "-h" && own.iter().any(is_help_flag))
+    {
         print_command_help(cmd);
         return CliCommand::CommandHelp;
     }
@@ -103,78 +119,15 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
     match subcmd {
         Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => {
+            if !flags_are_known(&args[2..], &["--json"], "list") {
+                return CliCommand::UsageError;
+            }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::List { json }
         }
-        Some("exec") => {
-            // Parse: cella exec <branch> [--json] -- <cmd...>
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let sep = args.iter().position(|a| a == "--");
-            let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
-            if command.is_empty() {
-                return CliCommand::Help;
-            }
-            let json = args[3..sep.unwrap_or(args.len())]
-                .iter()
-                .any(|a| a == "--json");
-            CliCommand::Exec {
-                branch,
-                command,
-                json,
-            }
-        }
-        Some("down") => {
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let mut rm = false;
-            let mut volumes = false;
-            let mut force = false;
-            for arg in &args[3..] {
-                match arg.as_str() {
-                    "--rm" => rm = true,
-                    "--volumes" => volumes = true,
-                    "--force" => force = true,
-                    f if f.starts_with('-') => {
-                        eprintln!("Error: unknown flag '{f}' for down command");
-                        return CliCommand::Help;
-                    }
-                    _ => {}
-                }
-            }
-            if volumes && !rm {
-                eprintln!("Error: --volumes requires --rm");
-                return CliCommand::Help;
-            }
-            CliCommand::Down {
-                branch,
-                rm,
-                volumes,
-                force,
-            }
-        }
-        Some("up") => {
-            let branch = match args.get(2) {
-                Some(b) if !b.starts_with('-') => b.clone(),
-                _ => return CliCommand::Help,
-            };
-            let mut rebuild = false;
-            for arg in &args[3..] {
-                match arg.as_str() {
-                    "--rebuild" => rebuild = true,
-                    f if f.starts_with('-') => {
-                        eprintln!("Error: unknown flag '{f}' for up command");
-                        return CliCommand::Help;
-                    }
-                    _ => {}
-                }
-            }
-            CliCommand::Up { branch, rebuild }
-        }
+        Some("exec") => parse_exec_subcommand(args),
+        Some("down") => parse_down_subcommand(args),
+        Some("up") => parse_up_subcommand(args),
         Some("prune") => parse_prune_subcommand(args),
         Some("task") => parse_task_subcommand(args),
         Some("switch") => {
@@ -182,9 +135,15 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[3..], &[], "switch") {
+                return CliCommand::UsageError;
+            }
             CliCommand::Switch { branch }
         }
         Some("doctor") => {
+            if !flags_are_known(&args[2..], &["--json"], "doctor") {
+                return CliCommand::UsageError;
+            }
             let json = args[2..].iter().any(|a| a == "--json");
             CliCommand::Doctor { json }
         }
@@ -195,6 +154,90 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
     }
 }
 
+/// Whether an argument asks for help.
+fn is_help_flag(arg: &String) -> bool {
+    arg == "--help" || arg == "-h"
+}
+
+/// Reject any dash-led argument that is not in `accepted`.
+///
+/// The commands that parse a flag or two used to scan for exactly those and
+/// silently drop everything else, so `cella list --jsno` succeeded and quietly
+/// did nothing. Returns `false` (after reporting) when an intruder is present.
+fn flags_are_known(args: &[String], accepted: &[&str], command: &str) -> bool {
+    for arg in args {
+        if arg.starts_with('-') && !accepted.contains(&arg.as_str()) {
+            eprintln!("Error: unknown flag '{arg}' for {command} command");
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse `cella exec <branch> [--json] -- <cmd...>`.
+fn parse_exec_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    let sep = args.iter().position(|a| a == "--");
+    let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
+    if command.is_empty() {
+        return CliCommand::Help;
+    }
+    // Only the region before `--`; everything after belongs to the user's own
+    // command and may legitimately start with a dash.
+    let own = &args[3..sep.unwrap_or(args.len())];
+    if !flags_are_known(own, &["--json"], "exec") {
+        return CliCommand::UsageError;
+    }
+    let json = own.iter().any(|a| a == "--json");
+    CliCommand::Exec {
+        branch,
+        command,
+        json,
+    }
+}
+
+/// Parse `cella down <branch> [--rm] [--volumes] [--force]`.
+fn parse_down_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    let flags = &args[3..];
+    if !flags_are_known(flags, &["--rm", "--volumes", "--force"], "down") {
+        return CliCommand::UsageError;
+    }
+    let has = |name: &str| flags.iter().any(|a| a == name);
+    let (rm, volumes) = (has("--rm"), has("--volumes"));
+    if volumes && !rm {
+        eprintln!("Error: --volumes requires --rm");
+        return CliCommand::UsageError;
+    }
+    CliCommand::Down {
+        branch,
+        rm,
+        volumes,
+        force: has("--force"),
+    }
+}
+
+/// Parse `cella up <branch> [--rebuild]`.
+fn parse_up_subcommand(args: &[String]) -> CliCommand {
+    let branch = match args.get(2) {
+        Some(b) if !b.starts_with('-') => b.clone(),
+        _ => return CliCommand::Help,
+    };
+    if !flags_are_known(&args[3..], &["--rebuild"], "up") {
+        return CliCommand::UsageError;
+    }
+    CliCommand::Up {
+        branch,
+        rebuild: args[3..].iter().any(|a| a == "--rebuild"),
+    }
+}
+
 fn parse_branch_subcommand(args: &[String]) -> CliCommand {
     let name = match args.get(2) {
         Some(n) if !n.starts_with('-') => n.clone(),
@@ -202,11 +245,11 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
     };
     if name.is_empty() {
         eprintln!("Error: branch name cannot be empty");
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     if name.contains(|c: char| c.is_whitespace()) {
         eprintln!("Error: branch name cannot contain whitespace");
-        return CliCommand::Help;
+        return CliCommand::UsageError;
     }
     let mut base = None;
     let mut labels = Vec::new();
@@ -220,7 +263,7 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --base requires a value (e.g., --base main)");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             }
         } else if args[i] == "--label" {
@@ -230,19 +273,19 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
                         eprintln!(
                             "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
                         );
-                        return CliCommand::Help;
+                        return CliCommand::UsageError;
                     }
                     labels.push(val.clone());
                     i += 2;
                 }
                 _ => {
                     eprintln!("Error: --label requires KEY=VALUE format");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             }
         } else if args[i].starts_with('-') {
             eprintln!("Error: unknown flag '{}' for branch command", args[i]);
-            return CliCommand::Help;
+            return CliCommand::UsageError;
         } else {
             i += 1;
         }
@@ -278,7 +321,7 @@ fn parse_prune_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --older-than requires a value (e.g., --older-than 7d)");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             },
             "--label" => match args.get(i + 1) {
@@ -288,12 +331,12 @@ fn parse_prune_subcommand(args: &[String]) -> CliCommand {
                 }
                 _ => {
                     eprintln!("Error: --label requires KEY=VALUE format");
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 }
             },
             f if f.starts_with('-') => {
                 eprintln!("Error: unknown flag '{f}' for prune command");
-                return CliCommand::Help;
+                return CliCommand::UsageError;
             }
             _ => {
                 i += 1;
@@ -336,7 +379,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                         }
                         _ => {
                             eprintln!("Error: --base requires a value (e.g., --base main)");
-                            return CliCommand::Help;
+                            return CliCommand::UsageError;
                         }
                     }
                 } else if args[i] == "--timeout" {
@@ -347,11 +390,11 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                         eprintln!(
                             "Error: --timeout requires a value in seconds (e.g., --timeout 300)"
                         );
-                        return CliCommand::Help;
+                        return CliCommand::UsageError;
                     }
                 } else if args[i].starts_with('-') {
                     eprintln!("Error: unknown flag '{}' for task run command", args[i]);
-                    return CliCommand::Help;
+                    return CliCommand::UsageError;
                 } else {
                     i += 1;
                 }
@@ -364,11 +407,18 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
             }
         }
         Some("list" | "ls") => {
+            if !flags_are_known(&args[3..], &["--json"], "task list") {
+                return CliCommand::UsageError;
+            }
             let json = args[3..].iter().any(|a| a == "--json");
             CliCommand::TaskList { json }
         }
         Some("logs") => {
-            // Parse: cella task logs [-f|--follow] <branch>
+            // Parse: cella task logs [-f|--follow] <branch> — the flag is
+            // accepted on either side of the positional.
+            if !flags_are_known(&args[3..], &["-f", "--follow"], "task logs") {
+                return CliCommand::UsageError;
+            }
             let follow = args[3..].iter().any(|a| a == "-f" || a == "--follow");
             let branch = args[3..].iter().find(|a| !a.starts_with('-')).cloned();
             branch.map_or(CliCommand::Help, |b| CliCommand::TaskLogs {
@@ -381,6 +431,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[4..], &[], "task wait") {
+                return CliCommand::UsageError;
+            }
             CliCommand::TaskWait { branch }
         }
         Some("stop") => {
@@ -388,6 +441,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
+            if !flags_are_known(&args[4..], &[], "task stop") {
+                return CliCommand::UsageError;
+            }
             CliCommand::TaskStop { branch }
         }
         _ => CliCommand::Help,
@@ -402,6 +458,10 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             Ok(())
         }
         CliCommand::CommandHelp => Ok(()),
+        CliCommand::UsageError => {
+            print_help();
+            std::process::exit(1);
+        }
         CliCommand::Doctor { json } => {
             if json {
                 run_doctor_json().await
@@ -459,145 +519,206 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
     }
 }
 
+/// Print the top-level in-container help to stderr.
 fn print_help() {
-    eprintln!(
-        "\
-cella — dev container worktree management (in-container)
-
-Usage: cella <command> [options]
-
-Commands:
-  branch <name> [--base ref]     Create a worktree-backed branch with its own container
-  list                           List worktree branches and their containers
-  down <branch> [--rm] [--force] Stop a worktree branch's container
-  up <branch> [--rebuild]        Start/restart a worktree branch's container
-  exec <branch> -- <cmd...>      Run a command in another branch's container
-  switch <branch>                Open a shell in another branch's container
-  prune [--all] [--dry-run]      Remove worktrees and their containers
-  task run <branch> [--timeout N] -- <cmd...>  Run a background task
-  task list                      List active background tasks
-  task logs [-f] <branch>        Show output from a background task (-f to follow)
-  task wait <branch>             Wait for a background task to complete
-  task stop <branch>             Stop a running background task
-  doctor                         Check connectivity and version status
-
-Options:
-  --help, -h                     Show this help message
-
-Run `cella --help` on the host for all commands."
-    );
+    let mut buf = Vec::new();
+    if render_help(&mut buf).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
 }
 
+/// Print one command's help to stderr.
 fn print_command_help(command: &str) {
-    let text = match command {
-        "branch" => {
-            "\
-Usage: cella branch <name> [options]
-
-Create a worktree-backed branch with its own container.
-
-Options:
-  --base <ref>       Base branch or commit (default: current HEAD)
-  --label KEY=VALUE  Add a label to the container (repeatable)"
-        }
-        "list" | "ls" => {
-            "\
-Usage: cella list [options]
-
-List worktree branches and their container status.
-
-Options:
-  --json    Output as JSON array"
-        }
-        "exec" => {
-            "\
-Usage: cella exec <branch> [options] -- <command...>
-
-Run a command in another branch's container.
-
-Options:
-  --json    Capture stdout/stderr and output as JSON envelope"
-        }
-        "down" => {
-            "\
-Usage: cella down <branch> [options]
-
-Stop a worktree branch's container.
-
-Options:
-  --rm        Remove the container and worktree after stopping
-  --volumes   Also remove volumes (requires --rm)
-  --force     Force stop even when shutdownAction is \"none\""
-        }
-        "up" => {
-            "\
-Usage: cella up <branch> [options]
-
-Start or restart a worktree branch's container.
-
-Options:
-  --rebuild   Rebuild the container from scratch"
-        }
-        "prune" => {
-            "\
-Usage: cella prune [options]
-
-Remove worktrees and their containers.
-
-Options:
-  --all               Include unmerged worktrees
-  --dry-run           Show what would be pruned without doing it
-  --older-than <dur>  Only prune older than duration (e.g., 7d, 24h)
-  --missing-worktree  Only prune branches whose worktree is gone
-  --label KEY=VALUE   Only prune matching labels (repeatable)"
-        }
-        "task" => {
-            "\
-Usage: cella task <subcommand>
-
-Subcommands:
-  run <branch> [--base ref] [--timeout secs] -- <cmd...>   Run a background task
-  list [--json]                           List active tasks
-  logs [-f|--follow] <branch>             Show task output
-  wait <branch>                           Wait for task completion
-  stop <branch>                           Stop a running task"
-        }
-        "doctor" => {
-            "\
-Usage: cella doctor [options]
-
-Check daemon connectivity and version status.
-
-Options:
-  --json    Output structured health data as JSON"
-        }
-        "switch" => {
-            "\
-Usage: cella switch <branch>
-
-Open an interactive shell in another branch's container."
-        }
-        _ => "No help available for this command.",
-    };
-    eprintln!("{text}");
+    let mut buf = Vec::new();
+    if render_command_help(&mut buf, command).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
 }
 
+/// Explain that a host-only command has no in-container equivalent.
 fn print_unsupported(command: &str) {
-    eprintln!(
-        "\
-Error: `cella {command}` is not available inside a dev container.
+    let mut buf = Vec::new();
+    if render_unsupported(&mut buf, command).is_ok() {
+        eprint!("{}", String::from_utf8_lossy(&buf));
+    }
+}
 
-Available commands inside containers:
-  cella branch <name>          Create a worktree-backed branch
-  cella list                   List worktree branches
-  cella down <branch>          Stop a branch's container
-  cella up <branch>            Start/restart a branch's container
-  cella exec <branch> -- cmd   Run command in another branch's container
-  cella switch <branch>        Shell into another branch's container
-  cella prune                  Remove worktrees
+/// The `--help` option, which every command accepts.
+///
+/// `cella-completion`'s own `every_command_accepts_help` test guarantees the
+/// lookup succeeds.
+fn help_option() -> &'static OptionSpec {
+    CLI_SURFACE
+        .iter()
+        .flat_map(|c| c.options)
+        .find(|o| o.long == "--help")
+        .expect("every command accepts --help")
+}
 
-Run `cella --help` on the host for all commands."
-    );
+/// `-h, --help` / `    --base <ref>` — the left column of an `Options:` block.
+fn option_label(opt: &OptionSpec) -> String {
+    let short = opt
+        .short
+        .map_or_else(|| "    ".to_owned(), |c| format!("-{c}, "));
+    let value = opt
+        .value
+        .as_ref()
+        .map_or_else(String::new, |v| format!(" <{}>", v.placeholder));
+    format!("{short}{}{value}", opt.long)
+}
+
+/// `task run <branch> -- <command...> [options]` — the left column of a
+/// `Commands:` block. Aliases are shown so `ls` is discoverable.
+fn command_synopsis(spec: &CommandSpec) -> String {
+    let head = if spec.aliases.is_empty() {
+        spec.path.to_owned()
+    } else {
+        format!("{} ({})", spec.path, spec.aliases.join(", "))
+    };
+    synopsis_from(spec, head)
+}
+
+/// The same synopsis without the alias annotation, for a `Usage:` line.
+///
+/// `Usage: cella list (ls) [options]` is not something a user can type. The
+/// listing tables want the aliases inline; a usage line wants a command.
+fn usage_synopsis(spec: &CommandSpec) -> String {
+    synopsis_from(spec, spec.path.to_owned())
+}
+
+/// Append operands and the `[options]` marker to an already-rendered head.
+fn synopsis_from(spec: &CommandSpec, head: String) -> String {
+    let mut parts = vec![head];
+    // `[options]` goes before the trailing `-- <cmd...>`, because that is the
+    // only place the parser reads them: anything after `--` is handed to the
+    // user's own command verbatim.
+    let (trailing, leading): (Vec<_>, Vec<_>) = spec
+        .operands
+        .iter()
+        .partition(|o| matches!(o, OperandSpec::Trailing { .. }));
+    parts.extend(leading.iter().map(|o| o.synopsis()));
+    if spec.options.iter().any(|o| o.long != "--help") {
+        parts.push("[options]".to_owned());
+    }
+    parts.extend(trailing.iter().map(|o| o.synopsis()));
+    parts.join(" ")
+}
+
+/// Every command, roots first with their subcommands nested underneath.
+fn commands_in_display_order() -> Vec<&'static CommandSpec> {
+    let mut out = Vec::new();
+    for root in cella_completion::root_commands() {
+        out.push(root);
+        out.extend(cella_completion::subcommands_of(root.path));
+    }
+    out
+}
+
+/// Write a `label  description` table, padded to the widest label.
+fn write_table(
+    out: &mut dyn std::io::Write,
+    rows: &[(String, &'static str)],
+) -> std::io::Result<()> {
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (label, description) in rows {
+        writeln!(out, "  {label:width$}  {description}")?;
+    }
+    Ok(())
+}
+
+/// Render the top-level in-container help from [`CLI_SURFACE`].
+fn render_help(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "cella — dev container worktree management (in-container)\n"
+    )?;
+    writeln!(out, "Usage: cella <command> [options]\n")?;
+    writeln!(out, "Commands:")?;
+    let rows: Vec<(String, &'static str)> = commands_in_display_order()
+        .into_iter()
+        .map(|spec| (command_synopsis(spec), spec.about))
+        .collect();
+    write_table(out, &rows)?;
+    writeln!(out, "\nOptions:")?;
+    let help = help_option();
+    write_table(out, &[(option_label(help), help.help)])?;
+    writeln!(out, "\nRun `cella --help` on the host for all commands.")
+}
+
+/// Render one command's help, looked up by any spelling the parser accepts.
+fn render_command_help(out: &mut dyn std::io::Write, command: &str) -> std::io::Result<()> {
+    let Some(spec) = cella_completion::root_commands().find(|c| c.matches(command)) else {
+        return writeln!(out, "No help available for this command.");
+    };
+
+    writeln!(out, "Usage: cella {}\n", usage_synopsis(spec))?;
+    writeln!(out, "{}\n", spec.about)?;
+    if !spec.aliases.is_empty() {
+        writeln!(out, "Aliases: {}\n", spec.aliases.join(", "))?;
+    }
+
+    let subcommands: Vec<&CommandSpec> = cella_completion::subcommands_of(spec.path).collect();
+    if !subcommands.is_empty() {
+        writeln!(out, "Subcommands:")?;
+        for sub in &subcommands {
+            write_subcommand_entry(out, spec.path, sub)?;
+        }
+    }
+
+    writeln!(out, "Options:")?;
+    write_option_table(out, spec)
+}
+
+/// One `Subcommands:` entry: its synopsis and about, then its own options.
+///
+/// The child's options have to appear here because they appear nowhere else —
+/// `parse_cli_args` keys its `--help` interception on `args[1]`, so
+/// `cella task run --help` renders the *parent*'s help. Collapsing the child to
+/// `[options]` and stopping would leave `--base`, `--timeout`, `--json` and
+/// `--follow` undocumented anywhere a user can reach.
+fn write_subcommand_entry(
+    out: &mut dyn std::io::Write,
+    parent: &str,
+    sub: &CommandSpec,
+) -> std::io::Result<()> {
+    let synopsis = command_synopsis(sub);
+    let leaf = synopsis
+        .strip_prefix(parent)
+        .map_or_else(|| synopsis.clone(), |rest| rest.trim_start().to_owned());
+    writeln!(out, "  {leaf}")?;
+    writeln!(out, "      {}", sub.about)?;
+    let rows: Vec<(String, &'static str)> = sub
+        .options
+        .iter()
+        .filter(|o| o.long != "--help")
+        .map(|opt| (format!("    {}", option_label(opt)), opt.help))
+        .collect();
+    write_table(out, &rows)?;
+    writeln!(out)
+}
+
+/// The `Options:` block for one command.
+fn write_option_table(out: &mut dyn std::io::Write, spec: &CommandSpec) -> std::io::Result<()> {
+    let rows: Vec<(String, &'static str)> = spec
+        .options
+        .iter()
+        .map(|opt| (option_label(opt), opt.help))
+        .collect();
+    write_table(out, &rows)
+}
+
+/// Render the "that command is host-only" error, listing what does work here.
+fn render_unsupported(out: &mut dyn std::io::Write, command: &str) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "Error: `cella {command}` is not available inside a dev container.\n"
+    )?;
+    writeln!(out, "Available commands inside containers:")?;
+    let rows: Vec<(String, &'static str)> = cella_completion::root_commands()
+        .map(|spec| (command_synopsis(spec), spec.about))
+        .collect();
+    write_table(out, &rows)?;
+    writeln!(out, "\nRun `cella --help` on the host for all commands.")
 }
 
 /// Connect to the host daemon for CLI commands.
@@ -1505,6 +1626,570 @@ fn is_json_line(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ── CLI_SURFACE ↔ parse_cli_args parity ────────────────────────────────
+    //
+    // `CLI_SURFACE` is the single source for the help text above, for the
+    // shipped shell-completion scripts, and for nothing the compiler checks.
+    // These tests are what stop it drifting from the parser it describes.
+
+    /// The table path a parsed command corresponds to.
+    ///
+    /// Deliberately has no `_` arm: adding a `CliCommand` variant breaks this
+    /// test module's compilation until the author records the command in
+    /// `CLI_SURFACE`. A missing *command* is the drift that actually happened —
+    /// no amount of flag-scraping catches it.
+    fn surface_path(cmd: &CliCommand) -> Option<&'static str> {
+        match cmd {
+            CliCommand::Branch { .. } => Some("branch"),
+            CliCommand::List { .. } => Some("list"),
+            CliCommand::Down { .. } => Some("down"),
+            CliCommand::Up { .. } => Some("up"),
+            CliCommand::Exec { .. } => Some("exec"),
+            CliCommand::Prune { .. } => Some("prune"),
+            CliCommand::TaskRun { .. } => Some("task run"),
+            CliCommand::TaskList { .. } => Some("task list"),
+            CliCommand::TaskLogs { .. } => Some("task logs"),
+            CliCommand::TaskWait { .. } => Some("task wait"),
+            CliCommand::TaskStop { .. } => Some("task stop"),
+            CliCommand::Switch { .. } => Some("switch"),
+            CliCommand::Doctor { .. } => Some("doctor"),
+            CliCommand::Help
+            | CliCommand::CommandHelp
+            | CliCommand::UsageError
+            | CliCommand::Unsupported { .. } => None,
+        }
+    }
+
+    /// The shortest argv that should parse to `spec`, typed as `spelling`.
+    fn minimal_argv(spec: &CommandSpec, spelling: &str) -> Vec<String> {
+        let mut argv = vec!["cella".to_owned()];
+        let segments: Vec<&str> = spec.path.split(' ').collect();
+        let last = segments.len() - 1;
+        for (i, segment) in segments.iter().enumerate() {
+            argv.push(if i == last { spelling } else { segment }.to_owned());
+        }
+        for operand in spec.operands {
+            match operand {
+                OperandSpec::Required { .. } => argv.push("b".to_owned()),
+                OperandSpec::Optional { .. } => {}
+                OperandSpec::Trailing { .. } => {
+                    argv.push("--".to_owned());
+                    argv.push("echo".to_owned());
+                }
+            }
+        }
+        argv
+    }
+
+    /// `minimal_argv` with `flag` spliced in ahead of any `--` separator —
+    /// everything after `--` belongs to the user's own command.
+    fn argv_with_flag(spec: &CommandSpec, spelling: &str, flag: &str) -> Vec<String> {
+        let mut argv = minimal_argv(spec, spelling);
+        let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+        argv.insert(at, flag.to_owned());
+        argv
+    }
+
+    /// Every spelling a command answers to.
+    fn spellings(spec: &CommandSpec) -> Vec<&'static str> {
+        std::iter::once(spec.leaf())
+            .chain(spec.aliases.iter().copied())
+            .collect()
+    }
+
+    /// Every way an option can be typed.
+    fn option_spellings(opt: &OptionSpec) -> Vec<String> {
+        let mut out = vec![opt.long.to_owned()];
+        if let Some(short) = opt.short {
+            out.push(format!("-{short}"));
+        }
+        out
+    }
+
+    /// Layer (a): every table entry is reachable, under every spelling.
+    #[test]
+    fn every_surface_command_parses() {
+        for spec in CLI_SURFACE {
+            // A namespace like `task` is not a command of its own — the parser
+            // requires a subcommand and answers bare `cella task` with Help.
+            if cella_completion::subcommands_of(spec.path).next().is_some() {
+                continue;
+            }
+            for spelling in spellings(spec) {
+                let argv = minimal_argv(spec, spelling);
+                assert_eq!(
+                    surface_path(&parse_cli_args(&argv)),
+                    Some(spec.path),
+                    "argv {argv:?} must parse as `{}`",
+                    spec.path
+                );
+            }
+        }
+    }
+
+    /// Layer (a'): a command the table does not list is refused, not guessed at.
+    #[test]
+    fn a_command_outside_the_surface_is_unsupported() {
+        let argv: Vec<String> = ["cella", "build"].iter().map(ToString::to_string).collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::Unsupported { command } if command == "build")
+        );
+    }
+
+    type Check = fn(&CliCommand) -> bool;
+
+    /// Layer (b): every table flag, with the observable effect it must have.
+    ///
+    /// Asserting merely "did not fall through to Help" would pass against a
+    /// parser that accepted the flag and dropped it on the floor — which is
+    /// exactly what `cella list --jsno` used to do with a typo'd flag.
+    const FLAG_CASES: &[(&[&str], Check)] = &[
+        (
+            &["cella", "branch", "b", "--base", "main"],
+            |c| matches!(c, CliCommand::Branch { base: Some(b), .. } if b == "main"),
+        ),
+        (
+            &["cella", "branch", "b", "--label", "a=1", "--label", "c=2"],
+            |c| matches!(c, CliCommand::Branch { labels, .. } if labels.as_slice() == ["a=1", "c=2"]),
+        ),
+        (&["cella", "list", "--json"], |c| {
+            matches!(c, CliCommand::List { json: true })
+        }),
+        (
+            &["cella", "exec", "b", "--json", "--", "echo"],
+            |c| matches!(c, CliCommand::Exec { json: true, command, .. } if command.as_slice() == ["echo"]),
+        ),
+        (&["cella", "down", "b", "--rm"], |c| {
+            matches!(
+                c,
+                CliCommand::Down {
+                    rm: true,
+                    volumes: false,
+                    ..
+                }
+            )
+        }),
+        (&["cella", "down", "b", "--rm", "--volumes"], |c| {
+            matches!(
+                c,
+                CliCommand::Down {
+                    rm: true,
+                    volumes: true,
+                    ..
+                }
+            )
+        }),
+        (&["cella", "down", "b", "--force"], |c| {
+            matches!(c, CliCommand::Down { force: true, .. })
+        }),
+        (&["cella", "up", "b", "--rebuild"], |c| {
+            matches!(c, CliCommand::Up { rebuild: true, .. })
+        }),
+        (&["cella", "prune", "--dry-run"], |c| {
+            matches!(c, CliCommand::Prune { dry_run: true, .. })
+        }),
+        (&["cella", "prune", "--all"], |c| {
+            matches!(c, CliCommand::Prune { all: true, .. })
+        }),
+        (
+            &["cella", "prune", "--older-than", "7d"],
+            |c| matches!(c, CliCommand::Prune { older_than: Some(d), .. } if d == "7d"),
+        ),
+        (&["cella", "prune", "--missing-worktree"], |c| {
+            matches!(
+                c,
+                CliCommand::Prune {
+                    missing_worktree: true,
+                    ..
+                }
+            )
+        }),
+        (
+            &["cella", "prune", "--label", "a=1"],
+            |c| matches!(c, CliCommand::Prune { labels, .. } if labels.as_slice() == ["a=1"]),
+        ),
+        (
+            &["cella", "task", "run", "b", "--base", "main", "--", "echo"],
+            |c| matches!(c, CliCommand::TaskRun { base: Some(b), .. } if b == "main"),
+        ),
+        (
+            &[
+                "cella",
+                "task",
+                "run",
+                "b",
+                "--timeout",
+                "300",
+                "--",
+                "echo",
+            ],
+            |c| {
+                matches!(
+                    c,
+                    CliCommand::TaskRun {
+                        timeout_secs: Some(300),
+                        ..
+                    }
+                )
+            },
+        ),
+        (&["cella", "task", "list", "--json"], |c| {
+            matches!(c, CliCommand::TaskList { json: true })
+        }),
+        (
+            &["cella", "task", "logs", "-f", "b"],
+            |c| matches!(c, CliCommand::TaskLogs { follow: true, branch } if branch == "b"),
+        ),
+        (
+            &["cella", "task", "logs", "--follow", "b"],
+            |c| matches!(c, CliCommand::TaskLogs { follow: true, branch } if branch == "b"),
+        ),
+        (&["cella", "doctor", "--json"], |c| {
+            matches!(c, CliCommand::Doctor { json: true })
+        }),
+    ];
+
+    #[test]
+    fn flag_cases_have_expected_effect() {
+        for (argv, check) in FLAG_CASES {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            assert!(
+                check(&parse_cli_args(&owned)),
+                "argv {argv:?} did not have its expected effect"
+            );
+        }
+    }
+
+    /// The completeness gate for layer (b): adding a flag to `CLI_SURFACE`
+    /// without a behavioural case above fails here.
+    ///
+    /// `--help`/`-h` are excluded — the parser intercepts them before any
+    /// per-command parsing, and `every_command_accepts_help` covers them.
+    #[test]
+    fn flag_cases_cover_every_surface_flag() {
+        for spec in CLI_SURFACE {
+            let segments: Vec<&str> = spec.path.split(' ').collect();
+            for opt in spec.options {
+                if opt.long == "--help" {
+                    continue;
+                }
+                for spelling in option_spellings(opt) {
+                    assert!(
+                        FLAG_CASES.iter().any(|(argv, _)| {
+                            argv.len() > segments.len()
+                                && argv[1..=segments.len()] == segments[..]
+                                && argv.contains(&spelling.as_str())
+                        }),
+                        "no behavioural case covers `cella {} {spelling}`",
+                        spec.path
+                    );
+                }
+            }
+        }
+    }
+
+    /// `--help`/`-h` reach every command — `cli.rs`'s interception runs before
+    /// any per-command parsing, which is why the table lists them everywhere.
+    #[test]
+    fn every_command_accepts_help() {
+        for spec in CLI_SURFACE {
+            for spelling in spellings(spec) {
+                for flag in ["--help", "-h"] {
+                    let argv = argv_with_flag(spec, spelling, flag);
+                    assert!(
+                        matches!(parse_cli_args(&argv), CliCommand::CommandHelp),
+                        "argv {argv:?} must print help"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A help flag past `--` belongs to the user's command, not to cella.
+    ///
+    /// `parse_exec_subcommand` already stops its unknown-flag scan at the
+    /// separator; the global `--help` interception above it did not, so
+    /// `cella exec b -- ls --help` printed cella's help and exited 0 without
+    /// ever running `ls`.
+    #[test]
+    fn a_help_flag_past_the_separator_belongs_to_the_user() {
+        let argv: Vec<String> = ["cella", "exec", "b", "--", "ls", "--help"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::Exec { command, .. }
+                if command.as_slice() == ["ls", "--help"]),
+            "the help flag must reach the user's command"
+        );
+
+        let argv: Vec<String> = ["cella", "task", "run", "b", "--", "cargo", "-h"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::TaskRun { command, .. }
+                if command.as_slice() == ["cargo", "-h"])
+        );
+    }
+
+    /// Before the separator it is still cella's.
+    #[test]
+    fn a_help_flag_before_the_separator_is_cellas() {
+        let argv: Vec<String> = ["cella", "exec", "b", "--help", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(matches!(parse_cli_args(&argv), CliCommand::CommandHelp));
+    }
+
+    /// A bare `--` as the subcommand must not panic the help scan.
+    #[test]
+    fn a_leading_separator_does_not_panic() {
+        for argv in [
+            vec!["cella", "--"],
+            vec!["cella", "--", "--help"],
+            vec!["cella"],
+        ] {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            let _ = parse_cli_args(&owned);
+        }
+    }
+
+    /// Layer (c): a flag a command does not accept must be refused, not ignored.
+    ///
+    /// Covers every entry in the table. It used to be restricted to the handful
+    /// of commands that were strict — `list`, `exec`, `switch`, `doctor` and
+    /// `task list|logs|wait|stop` merely scanned for the flags they knew and
+    /// dropped the rest, so `cella list --jsno` succeeded and did nothing.
+    #[test]
+    fn unknown_flags_are_rejected() {
+        let every_spelling: Vec<String> = CLI_SURFACE
+            .iter()
+            .flat_map(|s| s.options)
+            .flat_map(option_spellings)
+            .collect();
+
+        for spec in CLI_SURFACE {
+            // `task` is a namespace: `cella task --anything` is answered by the
+            // subcommand dispatch, not by a flag scan.
+            if cella_completion::subcommands_of(spec.path).next().is_some() {
+                continue;
+            }
+            let accepted: Vec<String> = spec.options.iter().flat_map(option_spellings).collect();
+            for intruder in &every_spelling {
+                if accepted.contains(intruder) {
+                    continue;
+                }
+                let argv = argv_with_flag(spec, spec.leaf(), intruder);
+                assert!(
+                    matches!(parse_cli_args(&argv), CliCommand::UsageError),
+                    "`cella {} {intruder}` must be rejected, got argv {argv:?}",
+                    spec.path
+                );
+            }
+        }
+    }
+
+    /// Every path that prints an `Error:` must exit non-zero, not just the ones
+    /// the first sweep happened to reach — two multi-line `eprintln!`s were
+    /// missed, so `--timeout abc` printed an error and still exited 0.
+    #[test]
+    fn every_reported_misuse_exits_non_zero() {
+        let cases: &[&[&str]] = &[
+            &["cella", "list", "--jsno"],
+            &["cella", "task", "run", "b", "--timeout", "abc", "--", "x"],
+            &["cella", "branch", "b", "--label", "dev.cella.x=1"],
+            &["cella", "branch", "b", "--base"],
+            &["cella", "down", "b", "--volumes"],
+            &["cella", "prune", "--older-than"],
+            &["cella", "up", "b", "--bogus"],
+        ];
+        for argv in cases {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            assert!(
+                matches!(parse_cli_args(&owned), CliCommand::UsageError),
+                "{argv:?} must be a usage error, not a zero-exit help"
+            );
+        }
+    }
+
+    /// The concrete regression: a typo'd flag used to parse as a plain `list`
+    /// and silently produce non-JSON output.
+    #[test]
+    fn list_rejects_a_typo_flag() {
+        let args: Vec<String> = ["cella", "list", "--jsno"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(matches!(parse_cli_args(&args), CliCommand::UsageError));
+    }
+
+    fn rendered(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// `print_unsupported` used to list seven commands, silently omitting
+    /// `doctor` and the whole `task` family — so the error that tells you what
+    /// *is* available lied about it.
+    #[test]
+    fn unsupported_lists_every_root_command() {
+        let text = rendered(|b| render_unsupported(b, "build"));
+        assert!(text.contains("cella build"), "{text}");
+        for spec in cella_completion::root_commands() {
+            assert!(
+                text.contains(spec.path),
+                "unsupported omits `{}`",
+                spec.path
+            );
+        }
+    }
+
+    /// Every option in the table reaches per-command help, with its own prose.
+    #[test]
+    fn command_help_documents_every_option() {
+        for spec in cella_completion::root_commands() {
+            let text = rendered(|b| render_command_help(b, spec.leaf()));
+            assert!(
+                text.contains(spec.about),
+                "`{}` help omits its about",
+                spec.path
+            );
+            for opt in spec.options {
+                assert!(
+                    text.contains(opt.long),
+                    "`{}` help omits `{}`",
+                    spec.path,
+                    opt.long
+                );
+                assert!(
+                    text.contains(opt.help),
+                    "`{}` help omits the prose for `{}`",
+                    spec.path,
+                    opt.long
+                );
+            }
+        }
+    }
+
+    /// Sub-subcommands are only reachable through their parent's help, because
+    /// the parser's `--help` interception keys on `args[1]` alone — `cella task
+    /// run --help` prints `task` help. So `task` help must carry the children.
+    #[test]
+    fn command_help_lists_every_subcommand() {
+        let text = rendered(|b| render_command_help(b, "task"));
+        for sub in cella_completion::subcommands_of("task") {
+            assert!(text.contains(sub.leaf()), "task help omits `{}`", sub.path);
+            assert!(
+                text.contains(sub.about),
+                "task help omits about of `{}`",
+                sub.path
+            );
+        }
+    }
+
+    /// `[options]` must precede the `--` separator: the parser only reads cella
+    /// options before it, so a synopsis reading `exec <branch> -- <cmd...>
+    /// [options]` points the user at exactly the position where their flags
+    /// would instead be handed to their own command.
+    #[test]
+    fn synopsis_places_options_before_the_separator() {
+        for spec in CLI_SURFACE {
+            let synopsis = command_synopsis(spec);
+            let (Some(options), Some(separator)) =
+                (synopsis.find("[options]"), synopsis.find("--"))
+            else {
+                continue;
+            };
+            assert!(
+                options < separator,
+                "`{}` renders options after the separator: {synopsis}",
+                spec.path
+            );
+        }
+    }
+
+    /// A `Usage:` line has to be something the user can type. Annotating it
+    /// with aliases — `Usage: cella list (ls) [options]` — is not.
+    #[test]
+    fn usage_lines_are_runnable_commands() {
+        for spec in CLI_SURFACE {
+            let usage = usage_synopsis(spec);
+            assert!(
+                !usage.contains('(') && !usage.contains(')'),
+                "`{}` usage is not typeable: {usage}",
+                spec.path
+            );
+            assert!(usage.starts_with(spec.path), "{usage}");
+        }
+        // The aliases still have to be discoverable, just not in the usage line.
+        let text = rendered(|b| render_command_help(b, "list"));
+        assert!(text.contains("Aliases: ls"), "{text}");
+        assert!(!text.contains("Usage: cella list (ls)"), "{text}");
+    }
+
+    /// A sub-subcommand's flags must survive into the help a user can actually
+    /// reach. The parser answers `cella task run --help` with `task`'s help, so
+    /// if `task`'s help collapses each child to `[options]`, then `--base`,
+    /// `--timeout`, `--json` and `--follow` are documented nowhere.
+    #[test]
+    fn parent_help_documents_every_child_option() {
+        let text = rendered(|b| render_command_help(b, "task"));
+        for sub in cella_completion::subcommands_of("task") {
+            for opt in sub.options.iter().filter(|o| o.long != "--help") {
+                assert!(
+                    text.contains(opt.long),
+                    "`task` help omits `{}` of `{}`:\n{text}",
+                    opt.long,
+                    sub.path
+                );
+                assert!(
+                    text.contains(opt.help),
+                    "`task` help omits the prose for `{}` of `{}`:\n{text}",
+                    opt.long,
+                    sub.path
+                );
+            }
+        }
+    }
+
+    /// An alias must resolve to the same help as the canonical spelling.
+    #[test]
+    fn command_help_resolves_aliases() {
+        assert_eq!(
+            rendered(|b| render_command_help(b, "ls")),
+            rendered(|b| render_command_help(b, "list"))
+        );
+    }
+
+    #[test]
+    fn command_help_for_an_unknown_command_says_so() {
+        let text = rendered(|b| render_command_help(b, "nonsense"));
+        assert_eq!(text.trim(), "No help available for this command.");
+    }
+
+    /// The drift this table exists to prevent: `print_unsupported` used to omit
+    /// `doctor` and the whole `task` family, and the top-level help never
+    /// mentioned the `ls` / `task ls` aliases.
+    #[test]
+    fn help_lists_every_surface_command() {
+        let mut buf = Vec::new();
+        render_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        for spec in CLI_SURFACE {
+            assert!(help.contains(spec.path), "help omits `{}`", spec.path);
+            for alias in spec.aliases {
+                assert!(
+                    help.contains(alias),
+                    "help omits alias `{alias}` of `{}`",
+                    spec.path
+                );
+            }
+        }
+    }
+
     #[test]
     fn parse_branch_command() {
         let args = vec![
@@ -1810,7 +2495,7 @@ mod tests {
         .map(ToString::to_string)
         .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2010,7 +2695,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2169,7 +2854,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2179,7 +2864,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2189,7 +2874,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2276,7 +2961,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]
@@ -2400,7 +3085,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::UsageError));
     }
 
     #[test]

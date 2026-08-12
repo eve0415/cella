@@ -1,7 +1,7 @@
 mod branch;
 mod build;
 mod code;
-mod completion;
+pub mod completion;
 mod compose_up;
 mod config;
 mod credential;
@@ -479,7 +479,32 @@ pub enum Command {
     /// Apply lifecycle hooks and user personalisation to an already-running container.
     #[command(name = "set-up")]
     SetUp(set_up::SetUpArgs),
-    /// Generate shell completion scripts.
+    /// Print the shell hook that enables cella's completions.
+    ///
+    /// The hook is a few lines long and delegates every keystroke back to the
+    /// installed `cella` binary, so completions can never drift from the version
+    /// you are running. Source it from your shell's startup file on every start —
+    /// do not redirect it into a file, because a saved hook is exactly what goes
+    /// stale.
+    ///
+    /// Bash: add `source <(cella completion bash)` to `~/.bashrc`.
+    ///
+    /// Zsh: add `source <(cella completion zsh)` to `~/.zshrc`, *after* the
+    /// `compinit` call — the hook is a `#compdef` script and needs zsh's
+    /// completion system already loaded.
+    ///
+    /// Fish: add `cella completion fish | source` to `~/.config/fish/config.fish`.
+    ///
+    /// Elvish: add `eval (cella completion elvish | slurp)` to `~/.elvish/rc.elv`.
+    ///
+    /// PowerShell: add `cella completion powershell | Out-String | Invoke-Expression`
+    /// to `$PROFILE`.
+    ///
+    /// If you previously saved a generated script — `~/.zfunc/_cella`,
+    /// `~/.local/share/bash-completion/completions/cella`,
+    /// `~/.config/fish/completions/cella.fish` — delete it. Those files are
+    /// autoloaded by your shell and shadow the hook.
+    #[command(verbatim_doc_comment)]
     Completion(completion::CompletionArgs),
     /// Manage the cella daemon.
     #[command(name = "daemon", hide = true)]
@@ -603,10 +628,7 @@ impl Command {
             Self::Upgrade(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Init(args) => args.execute(progress).await.map_err(boxed_err_to_report),
-            Self::Completion(args) => {
-                args.execute();
-                Ok(())
-            }
+            Self::Completion(args) => args.execute().map_err(boxed_err_to_report),
             Self::Credential(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Network(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Ports(args) => args.execute().await.map_err(boxed_err_to_report),

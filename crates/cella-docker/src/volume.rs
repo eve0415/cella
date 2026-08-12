@@ -1050,6 +1050,24 @@ fn build_volume_tar(
                 message: format!("tar append cella symlink: {e}"),
             })?;
 
+        // Sourced by the rc-file block, never executed — hence 0o644, unlike
+        // the /cella/bin shims above. Rendered from `cella-completion`'s
+        // command table, so they cannot disagree with the in-container help.
+        let bash = cella_completion::bash_script();
+        let zsh = cella_completion::zsh_script();
+        tar_append_file(
+            &mut archive,
+            "cella/share/completions/cella.bash",
+            bash.as_bytes(),
+            0o644,
+        )?;
+        tar_append_file(
+            &mut archive,
+            "cella/share/completions/cella.zsh",
+            zsh.as_bytes(),
+            0o644,
+        )?;
+
         tar_append_file(
             &mut archive,
             "cella/.version",
@@ -2001,7 +2019,7 @@ abc333  artifact-c
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_volume_tar_contains_exactly_ten_entries() {
+    fn build_volume_tar_contains_expected_entries() {
         let tar_bytes = build_volume_tar(
             "2.0.0",
             "aarch64",
@@ -2019,7 +2037,7 @@ abc333  artifact-c
         .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let entries: Vec<String> = archive
+        let mut entries: Vec<String> = archive
             .entries()
             .unwrap()
             .filter_map(|e| {
@@ -2027,14 +2045,95 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
+        entries.sort();
 
-        // agent binary, browser script, xsel, xclip, wl-paste, wl-copy, xdg-open, agent symlink, cella symlink, .version
+        // A bare count fails with `12 != 10`, which says nothing about what
+        // changed, and passes silently if one file is added and another removed.
         assert_eq!(
-            entries.len(),
-            10,
-            "expected 10 entries in volume tar, got {}: {entries:?}",
-            entries.len()
+            entries,
+            vec![
+                "cella/.version",
+                "cella/bin/cella",
+                "cella/bin/cella-agent",
+                "cella/bin/cella-browser",
+                "cella/bin/wl-copy",
+                "cella/bin/wl-paste",
+                "cella/bin/xclip",
+                "cella/bin/xdg-open",
+                "cella/bin/xsel",
+                "cella/share/completions/cella.bash",
+                "cella/share/completions/cella.zsh",
+                "cella/v2.0.0/aarch64/cella-agent",
+            ]
         );
+    }
+
+    /// The completion scripts are sourced, never executed — unlike the six
+    /// `/cella/bin` shims, which are 0o755 precisely because they are run.
+    /// `/cella/.version` is the existing 0o644 precedent for payload.
+    #[test]
+    fn build_volume_tar_completion_scripts_are_not_executable() {
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
+                xdg_open: b"s",
+            },
+            "m",
+        )
+        .unwrap();
+
+        let mut seen = 0;
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path.starts_with("cella/share/completions/") {
+                assert_eq!(entry.header().mode().unwrap(), 0o644, "{path}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "both completion scripts must be in the tar");
+    }
+
+    /// The shipped scripts must be the generated ones, not an empty placeholder.
+    #[test]
+    fn build_volume_tar_ships_the_generated_completion_scripts() {
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
+                xdg_open: b"s",
+            },
+            "m",
+        )
+        .unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            let expected = match path.as_str() {
+                "cella/share/completions/cella.bash" => cella_completion::bash_script(),
+                "cella/share/completions/cella.zsh" => cella_completion::zsh_script(),
+                _ => continue,
+            };
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+            assert_eq!(content, expected, "{path}");
+        }
     }
 
     #[test]
@@ -2165,7 +2264,10 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
-        assert_eq!(entries.len(), 10);
+        // An empty agent binary must still yield a well-formed, complete tar.
+        // `build_volume_tar_contains_expected_entries` is what pins *which*
+        // entries those are.
+        assert_eq!(entries.len(), 12);
     }
 
     // -----------------------------------------------------------------------

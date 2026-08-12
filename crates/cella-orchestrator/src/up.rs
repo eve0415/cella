@@ -447,7 +447,7 @@ impl EnsureUpContext<'_> {
         // Only seed when the container was NOT created by cella. Cella-managed
         // containers already have these files; overwriting them would clear the
         // real oncreate state and reset the content-hash gate.
-        if container.labels.contains_key("dev.cella.workspace_path") {
+        if is_cella_managed(container) {
             return;
         }
 
@@ -524,9 +524,7 @@ impl EnsureUpContext<'_> {
             }
         }
 
-        if capabilities.managed_agent {
-            self.ensure_agent_registered(&container.id).await;
-        }
+        self.heal_managed_agent(container, remote_user).await;
 
         let (_probed_env, lifecycle_env) = self
             .prepare_container_env(&container.id, remote_user)
@@ -709,6 +707,27 @@ impl EnsureUpContext<'_> {
         }
     }
 
+    /// Re-register the agent and re-apply shell integration on a container that
+    /// is already up.
+    ///
+    /// Both are idempotent, and both need re-running because a container can
+    /// outlive many cella versions: the agent may be talking to a restarted
+    /// daemon, and the rc-file blocks may predate a block cella has since added.
+    async fn heal_managed_agent(&self, container: &ContainerInfo, remote_user: &str) {
+        if !self.client.capabilities().managed_agent {
+            return;
+        }
+        self.ensure_agent_registered(&container.id).await;
+        if is_cella_managed(container) {
+            crate::container_setup::inject_shell_integration(
+                self.client,
+                &container.id,
+                remote_user,
+            )
+            .await;
+        }
+    }
+
     /// Roll back a daemon pre-registration that was made before a failed start.
     async fn rollback_preregistration(&self) {
         if self.client.capabilities().managed_agent {
@@ -793,6 +812,18 @@ impl EnsureUpContext<'_> {
                         )
                         .await;
                     restart_agent_in_container(self.client, &container.id).await;
+                    // Shell integration is otherwise create-only, so every
+                    // container that predates a given block never gets it.
+                    // Every guard is idempotent, so re-running on each restart
+                    // costs nothing and retroactively heals old containers.
+                    if is_cella_managed(container) {
+                        crate::container_setup::inject_shell_integration(
+                            self.client,
+                            &container.id,
+                            remote_user,
+                        )
+                        .await;
+                    }
                 }
 
                 self.run_restart_lifecycle(container, remote_user).await?;
@@ -1351,7 +1382,8 @@ impl EnsureUpContext<'_> {
             restart_agent_in_container(self.client, container_id).await;
         }
 
-        crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
+        crate::container_setup::inject_shell_integration(self.client, container_id, remote_user)
+            .await;
 
         if settings.credentials.protect {
             self.setup_credential_protection(container_id, settings, remote_user)
@@ -2398,16 +2430,44 @@ fn append_extra_mounts(
         mounts.push(m.clone());
     }
 
-    let (vol_name, vol_target, _ro) = client.agent_volume_mount();
+    let (vol_name, vol_target, read_only) = client.agent_volume_mount();
     if managed_agent && !vol_name.is_empty() {
-        mounts.push(MountConfig {
-            mount_type: "volume".to_string(),
-            source: vol_name,
-            target: vol_target,
-            consistency: None,
-            read_only: false,
-            external: false,
-        });
+        mounts.push(agent_volume_mount_config(vol_name, vol_target, read_only));
+    }
+}
+
+/// Whether cella created this container, rather than attaching to one made by
+/// VS Code or the official devcontainer CLI.
+///
+/// Shared with `seed_external_lifecycle_markers`, which needs the same
+/// distinction for the opposite reason. It gates rewriting the
+/// container's shell profiles: healing a container cella owns is the point, but
+/// a container the user merely pointed cella at once should not come away with
+/// cella blocks in its rc files — they would outlive cella's involvement, and
+/// without the agent volume mounted they would be inert anyway.
+fn is_cella_managed(container: &ContainerInfo) -> bool {
+    container.labels.contains_key("dev.cella.workspace_path")
+}
+
+/// The dev container's mount for the shared agent volume.
+///
+/// `read_only` comes from the backend and is honored rather than discarded:
+/// the volume is shared by *every* cella container, and nothing inside a
+/// container writes to it. The agent only reads `/cella/.daemon_addr`; the
+/// host rewrites that file through a separate helper container, which mounts
+/// the volume writable on its own terms.
+///
+/// Docker mounts are immutable after creation, so this reaches only containers
+/// created from here on — existing ones keep their writable `/cella` until they
+/// are recreated.
+fn agent_volume_mount_config(name: String, target: String, read_only: bool) -> MountConfig {
+    MountConfig {
+        mount_type: "volume".to_string(),
+        source: name,
+        target,
+        consistency: None,
+        read_only,
+        external: false,
     }
 }
 
@@ -2526,6 +2586,64 @@ mod tests {
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
+
+    /// Attaching to a VS Code or official-CLI container must not leave cella
+    /// blocks in its rc files; a container cella created must still be healed.
+    #[test]
+    fn only_cella_created_containers_get_their_profiles_rewritten() {
+        let with_labels = |pairs: &[(&str, &str)]| ContainerInfo {
+            id: "c".to_string(),
+            name: "c".to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+
+        assert!(is_cella_managed(&with_labels(&[(
+            "dev.cella.workspace_path",
+            "/work"
+        )])));
+        // A VS Code / official-CLI container carries devcontainer labels but
+        // never cella's.
+        assert!(!is_cella_managed(&with_labels(&[(
+            "devcontainer.metadata",
+            "[]"
+        )])));
+        assert!(!is_cella_managed(&with_labels(&[])));
+    }
+
+    /// The backend declares the agent volume read-only and the orchestrator
+    /// used to destructure that flag as `_ro`, hardcoding `read_only: false` —
+    /// leaving `/cella` writable from inside every container, for a volume
+    /// shared across all of them.
+    #[test]
+    fn agent_volume_mount_honors_the_backends_read_only_flag() {
+        let mount =
+            agent_volume_mount_config("cella-agent".to_string(), "/cella".to_string(), true);
+        assert!(mount.read_only, "the declared flag must not be discarded");
+        assert_eq!(mount.source, "cella-agent");
+        assert_eq!(mount.target, "/cella");
+        assert_eq!(mount.mount_type, "volume");
+    }
+
+    /// Not hardcoded the other way either — a backend that wants it writable
+    /// still gets a writable mount.
+    #[test]
+    fn agent_volume_mount_passes_a_writable_flag_through() {
+        let mount = agent_volume_mount_config("v".to_string(), "/cella".to_string(), false);
+        assert!(!mount.read_only);
+    }
 
     #[test]
     fn network_rule_policy_enforce_eq() {

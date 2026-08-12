@@ -8,7 +8,7 @@ mod title;
 
 use std::io::IsTerminal;
 
-use clap::Parser;
+use clap::{CommandFactory as _, Parser};
 use tracing_subscriber::EnvFilter;
 
 use commands::{LogFormat, LogLevel};
@@ -76,8 +76,22 @@ struct Cli {
     command: commands::Command,
 }
 
+fn main() {
+    // Answer completion requests before anything else. `CompleteEnv` writes
+    // the hook (or the candidate list) to stdout and exits, and upstream
+    // requires nothing has written to stdout first. On a normal run this is
+    // one `getenv`: `try_complete` checks the variable before it ever calls
+    // the `clap::Command` factory — no runtime, no signal handlers, no
+    // `Cli::command()`.
+    clap_complete::CompleteEnv::with_factory(Cli::command)
+        .var(commands::completion::COMPLETE_VAR)
+        .complete();
+
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     title::install_signal_handlers();
 
     // Install miette's graphical error handler for pretty diagnostics

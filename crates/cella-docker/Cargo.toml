@@ -8,6 +8,7 @@ license.workspace = true
 bollard.workspace = true
 reqwest.workspace = true
 cella-backend.workspace = true
+cella-completion.workspace = true
 crossterm.workspace = true
 glob.workspace = true
 miette.workspace = true
