@@ -2436,8 +2436,6 @@ fn append_extra_mounts(
     }
 }
 
-/// Bind-mount agent IPC directories (Claude Code teams/tasks, Codex queues)
-/// from the host into the container for cross-container communication.
 /// Whether cella created this container, rather than attaching to one made by
 /// VS Code or the official devcontainer CLI.
 ///
@@ -2472,6 +2470,8 @@ fn agent_volume_mount_config(name: String, target: String, read_only: bool) -> M
     }
 }
 
+/// Bind-mount agent IPC directories (Claude Code teams/tasks, Codex queues)
+/// from the host into the container for cross-container communication.
 fn append_agent_ipc_mounts(mounts: &mut Vec<MountConfig>, remote_user: &str) {
     let Ok(home_str) = std::env::var("HOME") else {
         return;

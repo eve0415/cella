@@ -65,7 +65,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install zsh
-        run: sudo apt-get install -y zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Run tests
         run: cargo test --workspace
@@ -83,7 +83,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install zsh
-        run: sudo apt-get install -y zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install cargo-insta
         uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
@@ -109,7 +109,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install zsh
-        run: sudo apt-get install -y zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
