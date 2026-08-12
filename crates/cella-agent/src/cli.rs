@@ -94,9 +94,17 @@ pub enum CliCommand {
 pub fn parse_cli_args(args: &[String]) -> CliCommand {
     let subcmd = args.get(1).map(String::as_str);
 
-    if let Some(cmd) = subcmd.filter(|c| {
-        *c != "--help" && *c != "-h" && args[2..].iter().any(|a| a == "--help" || a == "-h")
-    }) {
+    // Only cella's own region counts: for `exec` and `task run`, everything
+    // after `--` is the user's command, and `cella exec b -- ls --help` must
+    // run `ls --help` rather than print cella's help and exit 0. `get` returns
+    // None rather than panicking when a bare `--` sits where a subcommand goes.
+    let separator = args.iter().position(|a| a == "--");
+    let own = args
+        .get(2..separator.unwrap_or(args.len()))
+        .unwrap_or_default();
+    if let Some(cmd) =
+        subcmd.filter(|c| *c != "--help" && *c != "-h" && own.iter().any(is_help_flag))
+    {
         print_command_help(cmd);
         return CliCommand::CommandHelp;
     }
@@ -137,6 +145,11 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             command: cmd.to_string(),
         },
     }
+}
+
+/// Whether an argument asks for help.
+fn is_help_flag(arg: &String) -> bool {
+    arg == "--help" || arg == "-h"
 }
 
 /// Reject any dash-led argument that is not in `accepted`.
@@ -1869,6 +1882,57 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A help flag past `--` belongs to the user's command, not to cella.
+    ///
+    /// `parse_exec_subcommand` already stops its unknown-flag scan at the
+    /// separator; the global `--help` interception above it did not, so
+    /// `cella exec b -- ls --help` printed cella's help and exited 0 without
+    /// ever running `ls`.
+    #[test]
+    fn a_help_flag_past_the_separator_belongs_to_the_user() {
+        let argv: Vec<String> = ["cella", "exec", "b", "--", "ls", "--help"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::Exec { command, .. }
+                if command.as_slice() == ["ls", "--help"]),
+            "the help flag must reach the user's command"
+        );
+
+        let argv: Vec<String> = ["cella", "task", "run", "b", "--", "cargo", "-h"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            matches!(parse_cli_args(&argv), CliCommand::TaskRun { command, .. }
+                if command.as_slice() == ["cargo", "-h"])
+        );
+    }
+
+    /// Before the separator it is still cella's.
+    #[test]
+    fn a_help_flag_before_the_separator_is_cellas() {
+        let argv: Vec<String> = ["cella", "exec", "b", "--help", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(matches!(parse_cli_args(&argv), CliCommand::CommandHelp));
+    }
+
+    /// A bare `--` as the subcommand must not panic the help scan.
+    #[test]
+    fn a_leading_separator_does_not_panic() {
+        for argv in [
+            vec!["cella", "--"],
+            vec!["cella", "--", "--help"],
+            vec!["cella"],
+        ] {
+            let owned: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            let _ = parse_cli_args(&owned);
         }
     }
 

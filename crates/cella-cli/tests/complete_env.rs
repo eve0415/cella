@@ -35,3 +35,54 @@ fn complete_env_matches_the_completion_subcommand() {
         );
     }
 }
+
+/// Drive a real completion request and assert candidates come back.
+///
+/// The suite this replaced asserted the *generated script* named `switch`. The
+/// dynamic hook deliberately inlines nothing, so that assertion had to go — but
+/// dropping it left nothing checking the one thing a user notices: that
+/// pressing TAB produces anything at all. Every other test here would still
+/// pass against a binary that answered every request with an empty list.
+#[test]
+fn a_completion_request_returns_real_candidates() {
+    // The hook re-invokes cella as `CELLA_COMPLETE=<shell> cella -- <words...>`
+    // with `_CLAP_COMPLETE_INDEX` naming the word under the cursor.
+    let complete = |index: &str, words: &[&str]| -> Vec<String> {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cella"))
+            .env("CELLA_COMPLETE", "bash")
+            .env("_CLAP_COMPLETE_INDEX", index)
+            .arg("--")
+            .args(words)
+            .output()
+            .expect("run cella");
+        assert!(
+            out.status.success(),
+            "completion request failed for {words:?}"
+        );
+        String::from_utf8(out.stdout)
+            .expect("UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let top = complete("1", &["cella", ""]);
+    for expected in ["up", "down", "switch", "image", "completion"] {
+        assert!(
+            top.iter().any(|c| c == expected),
+            "`cella <TAB>` must offer `{expected}`, got {top:?}"
+        );
+    }
+
+    assert_eq!(
+        complete("1", &["cella", "im"]),
+        ["image"],
+        "a unique prefix must complete to exactly one subcommand"
+    );
+
+    let nested = complete("2", &["cella", "image", ""]);
+    assert!(
+        nested.iter().any(|c| c == "update"),
+        "`cella image <TAB>` must offer `update`, got {nested:?}"
+    );
+}
