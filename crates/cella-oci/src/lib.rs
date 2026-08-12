@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod auth;
 pub mod cache;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod push;
 pub mod tag_cache;
 pub mod tags;
 
+pub use alias::{AliasResolver, MapResolver, RegistryResolver};
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
 pub use error::TagListError;
