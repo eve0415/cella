@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use cella_oci::{VersionKey, split_tag, version_key};
+use cella_oci::{TagGrammar, VersionKey, version_key};
 
 use super::release::{Release, is_codename, parse_variant};
 
@@ -48,11 +48,25 @@ impl Candidates {
     }
 }
 
-/// Compute candidates for `current`, or `None` when `current` is a floating
-/// tag with no version to advance (`latest`, `trixie`, `dev-1-trixie`).
+/// Compute candidates for `current`, or `None` when `current` has no version
+/// to advance — either it does not parse (`latest`, `dev-1-trixie`) or it is a
+/// floating tag naming a variant only (`trixie`, `24-trixie`).
+///
+/// The pin is read through the repository's own tag grammar rather than by
+/// tag shape. Shape cannot tell `5.0.3-trixie` (image version 5.0.3) from
+/// `24-trixie` (the floating Node 24 variant): both are one leading numeric
+/// group. Reading them the same way ranked `24 > 5` and offered a floating
+/// tag as an update to a pinned one.
 pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
-    let (current_version, selection) = split_pin(current)?;
     let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    // Derived once for the whole computation: every parse below shares it.
+    let grammar = TagGrammar::from_tags(&refs);
+
+    let parsed = grammar.parse(current)?;
+    let selection = parsed.variant;
+    // A floating pin names a variant but carries no image version, so there
+    // is nothing to advance from.
+    let current_version = parsed.version?;
 
     // Ranking finds the newest tag sharing the pin's selection; it says
     // nothing about whether that tag beats the pin, so every candidate is
@@ -62,19 +76,19 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         return Some(Candidates::floating(current));
     };
 
-    let version_bump = newest_in_variant(&refs, selection)
+    let version_bump = newest_in_variant(&grammar, &refs, selection)
         .filter(|(key, tag)| *tag != current && *key > current_key)
         .map(|(_, tag)| tag.to_owned());
 
     let os_moves = distro_of(selection).map_or_else(Vec::new, |(prefix, _, current_release)| {
-        newer_releases(&refs, &current_release)
+        newer_releases(&grammar, &refs, &current_release)
             .into_iter()
             .filter_map(|(_, target_distro)| {
                 // Rebuild the full selection so an OS move carries the pinned
                 // prefix across: `22-bookworm` moves to `22-trixie`, never to
                 // whatever the newest `-trixie` tag happens to be.
                 let target = format!("{prefix}{target_distro}");
-                let (key, tag) = newest_in_variant(&refs, &target)?;
+                let (key, tag) = newest_in_variant(&grammar, &refs, &target)?;
                 // A newer OS whose version stream has only just started would
                 // roll the image version backwards. Moving forward on one axis
                 // is not worth moving backwards on the other.
@@ -91,24 +105,6 @@ pub fn compute(tags: &[String], current: &str) -> Option<Candidates> {
         current: current.to_owned(),
         version_bump,
         os_moves,
-    })
-}
-
-/// Split a pinned tag into the image's own version and the selection that
-/// must be held fixed.
-///
-/// [`cella_oci::split_tag`] puts *every* leading numeric group in the version,
-/// but only the first is the image's version. A composite tag like
-/// `4.0.10-22-trixie` (typescript-node) encodes a runtime major the user
-/// pinned deliberately, so everything after the first group belongs to the
-/// selection: offering `5.0.1-24-trixie` would move Node 22 to Node 24.
-fn split_pin(tag: &str) -> Option<(&str, &str)> {
-    let (version, variant) = split_tag(tag)?;
-    if variant.is_empty() {
-        return Some((version, ""));
-    }
-    version.find('-').map_or(Some((version, variant)), |cut| {
-        Some((&tag[..cut], &tag[cut + 1..]))
     })
 }
 
@@ -137,14 +133,18 @@ fn distro_of(selection: &str) -> Option<(&str, &str, Release)> {
 /// by identity rather than by spelling, and the codename wins as the canonical
 /// form. Without this the user sees the same move three times and a `--yes
 /// --allow-os-change` tie picks an arbitrary alias.
-fn newer_releases<'a>(tags: &[&'a str], current: &Release) -> Vec<(u32, &'a str)> {
+fn newer_releases<'a>(
+    grammar: &TagGrammar,
+    tags: &[&'a str],
+    current: &Release,
+) -> Vec<(u32, &'a str)> {
     let mut best: BTreeMap<(&str, u32), &'a str> = BTreeMap::new();
 
     for &tag in tags {
-        let Some((_, selection)) = split_pin(tag) else {
+        let Some(parsed) = grammar.parse(tag) else {
             continue;
         };
-        let Some((_, distro, release)) = distro_of(selection) else {
+        let Some((_, distro, release)) = distro_of(parsed.variant) else {
             continue;
         };
         if !release.is_newer_than(current) {
@@ -176,27 +176,34 @@ fn prefers(candidate: &str, current: &str) -> bool {
         > (is_codename(current), candidate.len(), candidate)
 }
 
-/// Newest tag whose selection is exactly `selection`.
+/// Newest tag whose variant is exactly `selection`.
 ///
-/// Split the same way as the pin, so ranking and the newer-than guard agree
-/// on what counts as the version. Matching a looser suffix instead would rank
-/// `2.0.14-1-trixie` as the newest `-trixie` tag even for a pin on the plain
-/// `-trixie` line, then reject it for having the same version — reporting
-/// "up to date" while a genuinely newer plain tag sat unoffered.
+/// Parsed through the same grammar as the pin, so ranking and the newer-than
+/// guard agree on what counts as the version. Matching a looser suffix instead
+/// would rank `2.0.14-1-trixie` as the newest `-trixie` tag even for a pin on
+/// the plain `-trixie` line, then reject it for having the same version —
+/// reporting "up to date" while a genuinely newer plain tag sat unoffered.
+///
+/// Floating tags carry no version and so never win: `24-trixie` is not an
+/// update to anything.
 ///
 /// An empty selection means the tag *is* the version (`ubuntu:24.04`); it
 /// needs no special case here.
 ///
 /// The winning [`VersionKey`] is returned alongside the tag so callers can
 /// compare it against the pin without parsing the tag a second time.
-fn newest_in_variant<'a>(tags: &[&'a str], selection: &str) -> Option<(VersionKey, &'a str)> {
+fn newest_in_variant<'a>(
+    grammar: &TagGrammar,
+    tags: &[&'a str],
+    selection: &str,
+) -> Option<(VersionKey, &'a str)> {
     tags.iter()
         .filter_map(|t| {
-            let (version, tag_selection) = split_pin(t)?;
-            if tag_selection != selection {
+            let parsed = grammar.parse(t)?;
+            if parsed.variant != selection {
                 return None;
             }
-            version_key(version).map(|key| (key, *t))
+            version_key(parsed.version?).map(|key| (key, *t))
         })
         .max_by(|a, b| a.0.cmp(&b.0))
 }
@@ -217,6 +224,54 @@ mod tests {
     /// Newest tag on the fixture's *plain* `-trixie` line, i.e. with no
     /// revision group.
     const NEWEST_PLAIN_TRIXIE: &str = "2.0.14-trixie";
+
+    fn typescript_node_tags() -> Vec<String> {
+        let raw = include_str!("../../../testdata/mcr-devcontainers-typescript-node-tags.json");
+        serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The reported bug: `cella image update` moved a pin from
+    /// `5.0.3-trixie` to `24-trixie` — off the newest image release, onto a
+    /// Node major masquerading as a version, and onto a floating tag at that.
+    ///
+    /// Both halves are asserted. Checking only that no bump is offered would
+    /// also pass if the grammar rejected the pin outright, which would report
+    /// "up to date" for a reason that is not true.
+    #[test]
+    fn a_node_major_is_never_offered_as_an_image_version_bump() {
+        let tags = typescript_node_tags();
+
+        let newest = compute(&tags, "5.0.3-trixie").expect("the pin must parse");
+        assert_eq!(
+            newest.version_bump, None,
+            "5.0.3 is the newest release on the trixie line"
+        );
+
+        let older = compute(&tags, "5.0.1-trixie").expect("the pin must parse");
+        assert_eq!(
+            older.version_bump.as_deref(),
+            Some("5.0.3-trixie"),
+            "the bump must stay on the pin's own variant"
+        );
+    }
+
+    /// A floating pin has no image version, so it has nothing to bump — and
+    /// must certainly not be bumped to a *different* runtime's floating tag.
+    #[test]
+    fn a_floating_runtime_tag_is_not_bumped_to_another_runtime() {
+        let tags = typescript_node_tags();
+        for pin in ["22-trixie", "20-trixie", "24-trixie"] {
+            assert!(
+                compute(&tags, pin).is_none(),
+                "{pin} is floating; it has no version to advance"
+            );
+        }
+    }
 
     fn rust_tags() -> Vec<String> {
         let raw = include_str!("../../../testdata/mcr-devcontainers-rust-tags.json");
