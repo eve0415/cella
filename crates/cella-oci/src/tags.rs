@@ -80,60 +80,49 @@ impl TagGrammar {
     }
 }
 
-/// Select the tags that pin a variant selection to a specific image
-/// version, newest first.
+/// Select the tags that pin a grammar-recognized selection to a more specific
+/// image version, newest first.
 ///
-/// A tag qualifies when it refines the selection in one of two ways:
+/// A floating selection accepts versioned tags with the same variant. A
+/// versioned selection accepts tags with the same variant whose version adds
+/// dotted segments to the selected version. An unknown selection accepts
+/// nothing, because suffix overlap alone is not evidence of variant identity.
 ///
-/// - **Version prefix** — it ends with `-{selection}` and everything
-///   before that suffix is dot/dash-separated numbers: for `"24-trixie"`
-///   this matches `4.0.10-24-trixie` and `5-24-trixie`.
-/// - **Version extension** — it extends the selection's own leading
-///   version with more dotted segments: for `"24-trixie"` this matches
-///   `24.7.0-trixie` (node-style registries).
-///
-/// Neither shape matches `dev-24-trixie`, the bare `24-trixie`, or
-/// another variant's `22-trixie`.
-///
-/// Tags are sorted by their version part descending, with more specific
+/// The selection itself has no added version specificity and is never
+/// offered. Tags are sorted by their version part descending, with more specific
 /// versions ranking above their aliases (`4.0.10` > `4.0` > `4`), and
 /// capped at [`MAX_PINNED_TAGS`].
 pub fn pinnable_tags<'a>(tags: &[&'a str], selection: &str) -> Vec<&'a str> {
+    let grammar = TagGrammar::from_tags(tags);
+    let Some(selection) = grammar.parse(selection) else {
+        return Vec::new();
+    };
     let mut keyed: Vec<(VersionKey, &'a str)> = tags
         .iter()
-        .filter_map(|&tag| Some((pin_version_key(tag, selection)?, tag)))
+        .filter_map(|&tag| Some((pin_version_key(&grammar, tag, selection)?, tag)))
         .collect();
     keyed.sort_unstable_by(|a, b| b.cmp(a));
     keyed.truncate(MAX_PINNED_TAGS);
     keyed.into_iter().map(|(_, tag)| tag).collect()
 }
 
-/// Compute the version sort key of a tag that refines `selection`, or
-/// `None` if it doesn't (see [`pinnable_tags`] for the accepted shapes).
-fn pin_version_key(tag: &str, selection: &str) -> Option<VersionKey> {
-    // Version prefix: `{version}-{selection}`.
-    if let Some(prefix) = tag
-        .strip_suffix(selection)
-        .and_then(|rest| rest.strip_suffix('-'))
-        && let Some(key) = version_key(prefix)
-    {
-        return Some(key);
+/// Compute the sort key when `tag` refines the parsed `selection` under the
+/// repository grammar.
+fn pin_version_key(
+    grammar: &TagGrammar,
+    tag: &str,
+    selection: ParsedTag<'_>,
+) -> Option<VersionKey> {
+    let parsed = grammar.parse(tag)?;
+    if parsed.variant != selection.variant {
+        return None;
     }
 
-    // Version extension: the selection's leading numeric part grows more
-    // dotted segments (`24-trixie` → `24.7.0-trixie`, `22` → `22.12.0`).
-    let numeric_end = selection
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(selection.len());
-    let (head, rest) = selection.split_at(numeric_end);
-    if head.is_empty() {
-        return None;
+    let version = parsed.version?;
+    if let Some(selected_version) = selection.version {
+        version.strip_prefix(selected_version)?.strip_prefix('.')?;
     }
-    let extended = tag.strip_suffix(rest)?;
-    if !extended.strip_prefix(head)?.starts_with('.') {
-        return None;
-    }
-    version_key(extended)
+    version_key(version)
 }
 
 /// Split a tag into its leading numeric version and its trailing variant.
@@ -467,12 +456,28 @@ mod tests {
     fn pinnable_tags_specific_versions_rank_above_aliases_in_composite_tags() {
         // Regression: the flat numeric key ranked "4-24-trixie" ([4, 24])
         // above "4.0.10-24-trixie" ([4, 0, 10, 24]) because 24 > 0 at
-        // index 1. Dash groups must be compared before dot segments.
+        // index 1. Dash groups must be compared before dot segments. This list
+        // derives only {"24-trixie"} as its variant vocabulary, so "trixie" is
+        // not a variant here and cannot select these tags.
         let tags = vec!["4-24-trixie", "4.0-24-trixie", "4.0.10-24-trixie"];
         assert_eq!(
-            pinnable_tags(&tags, "trixie"),
+            pinnable_tags(&tags, "24-trixie"),
             vec!["4.0.10-24-trixie", "4.0-24-trixie", "4-24-trixie"]
         );
+    }
+
+    #[test]
+    fn pinnable_tags_typescript_node_codename_stays_on_its_variant() {
+        let tags = fixture_tags(include_str!(
+            "../../cella-cli/testdata/mcr-devcontainers-typescript-node-tags.json"
+        ));
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        let pinned = pinnable_tags(&refs, "trixie");
+
+        assert!(pinned.contains(&"5.0.3-trixie"));
+        for alias in ["24-trixie", "22-trixie", "20-trixie"] {
+            assert!(!pinned.contains(&alias), "offered node alias {alias}");
+        }
     }
 
     #[test]
