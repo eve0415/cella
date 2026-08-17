@@ -540,6 +540,51 @@ pub async fn run_claude_install(
 
 // ── npm tool helpers ─────────────────────────────────────────────────────────
 
+const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"home="${HOME:-}"
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+    home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+fi
+[ -n "$home" ] || exit 1
+prefix="$(HOME="$home" npm config get prefix 2>/dev/null)"
+if [ -n "$prefix" ] && [ "$prefix" != "undefined" ] \
+    && mkdir -p "$prefix/lib/node_modules" "$prefix/bin" 2>/dev/null \
+    && [ -w "$prefix/lib/node_modules" ] && [ -w "$prefix/bin" ]; then
+    exit 0
+fi
+mkdir -p "$home/.local/bin" "$home/.local/lib" || exit 1
+HOME="$home" npm config set prefix "$home/.local""#;
+
+/// Ensure the remote user can write to npm's global prefix, redirecting it to
+/// `$HOME/.local` when it cannot.
+async fn ensure_writable_npm_prefix(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    probed_env: Option<&ProbedEnv>,
+) {
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, ENSURE_WRITABLE_NPM_PREFIX_PROGRAM),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match result {
+        Ok(result) if result.exit_code == 0 => {}
+        Ok(result) => warn!(
+            "Failed to ensure writable npm prefix (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ),
+        Err(error) => warn!("Failed to ensure writable npm prefix: {error}"),
+    }
+}
+
 /// Check if an npm-installed CLI tool is already present at the desired version.
 pub async fn is_npm_tool_installed(
     client: &dyn ContainerBackend,
@@ -578,6 +623,9 @@ pub async fn is_npm_tool_installed(
 }
 
 /// Install an npm package globally inside the container.
+///
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// # Errors
 ///
@@ -640,7 +688,8 @@ pub async fn check_codex_sandbox_deps(client: &dyn ContainerBackend, container_i
 ///
 /// Checks bubblewrap availability for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
-/// Caller must ensure Node.js/npm are available before calling this.
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Codex is already present at the requested version.
@@ -692,7 +741,8 @@ pub async fn install_codex(
 /// Install Google Gemini CLI inside the container via npm.
 ///
 /// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
-/// Caller must ensure Node.js/npm are available before calling this.
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Gemini CLI is already present at the requested version.
@@ -1773,6 +1823,16 @@ async fn install_npm_branch(
         }
         return f;
     }
+    if !codex && !gemini {
+        return 0;
+    }
+    ensure_writable_npm_prefix(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        ctx.probed_env,
+    )
+    .await;
     let mut failures = 0;
     if codex {
         let step = phase.step("Codex");
@@ -2177,7 +2237,11 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::{Command, Output};
     use std::sync::Mutex;
 
     use cella_backend::{
@@ -2469,6 +2533,58 @@ mod tests {
 
     // ── check_codex_sandbox_deps ─────────────────────────────────────────
 
+    #[cfg(unix)]
+    fn test_process_is_root() -> bool {
+        let output = Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u should run");
+        assert!(output.status.success(), "id -u should succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -u should emit UTF-8")
+            .trim()
+            == "0"
+    }
+
+    #[cfg(unix)]
+    fn write_npm_prefix_stub(npm_path: &Path) {
+        std::fs::write(
+            npm_path,
+            r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "get" ] && [ "$3" = "prefix" ]; then
+    printf '%s\n' "$NPM_TEST_PREFIX"
+    exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "set" ] && [ "$3" = "prefix" ]; then
+    printf '%s\n' "$*" >> "$NPM_TEST_LOG"
+    exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("npm stub should be written");
+        std::fs::set_permissions(npm_path, std::fs::Permissions::from_mode(0o755))
+            .expect("npm stub should be executable");
+    }
+
+    #[cfg(unix)]
+    fn run_npm_prefix_program(home: &Path, npm_bin: &Path, prefix: &Path, log: &Path) -> Output {
+        let path = format!(
+            "{}:{}",
+            npm_bin.display(),
+            std::env::var("PATH").expect("test process should have PATH")
+        );
+        Command::new("sh")
+            .arg("-c")
+            .arg(ENSURE_WRITABLE_NPM_PREFIX_PROGRAM)
+            .env("HOME", home)
+            .env("PATH", path)
+            .env("NPM_TEST_PREFIX", prefix)
+            .env("NPM_TEST_LOG", log)
+            .output()
+            .expect("npm prefix program should run")
+    }
+
     #[tokio::test]
     async fn check_codex_sandbox_deps_bwrap_available() {
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
@@ -2508,6 +2624,101 @@ mod tests {
     async fn npm_available_on_path_returns_false_when_missing() {
         let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
         assert!(!npm_available_on_path(&backend, "test-container", "vscode", None).await);
+    }
+
+    #[tokio::test]
+    async fn ensure_writable_npm_prefix_uses_remote_user_env_and_shell_wrapping() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        ensure_writable_npm_prefix(&backend, "test-container", "vscode", Some(&env)).await;
+
+        let calls = backend.calls();
+        assert_eq!(calls[0].user.as_deref(), Some("vscode"));
+        assert_eq!(
+            calls[0].env,
+            Some(vec!["PATH=/opt/node/bin:/usr/bin".to_string()])
+        );
+        assert_eq!(
+            calls[0].cmd,
+            vec!["sh", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
+        );
+
+        let login_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        ensure_writable_npm_prefix(&login_backend, "test-container", "vscode", None).await;
+        assert_eq!(
+            login_backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
+        );
+        assert_eq!(login_backend.calls()[0].env, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_redirects_when_resolved_prefix_is_not_writable() {
+        // Root can write through the read-only directory, so this case cannot be simulated.
+        if test_process_is_root() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let npm_bin = temp.path().join("bin");
+        let read_only_parent = temp.path().join("read-only");
+        let prefix = read_only_parent.join("npm-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::create_dir_all(&read_only_parent).expect("read-only parent should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("parent should become read-only");
+
+        let output = run_npm_prefix_program(&home, &npm_bin, &prefix, &log);
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("parent permissions should be restored");
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", home.display())
+        );
+        assert!(home.join(".local/bin").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_preserves_an_existing_writable_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let npm_bin = temp.path().join("bin");
+        let prefix = temp.path().join("writable-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::create_dir_all(&prefix).expect("prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+
+        let output = run_npm_prefix_program(&home, &npm_bin, &prefix, &log);
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .expect("log should be readable")
+                .is_empty()
+        );
+        assert!(prefix.join("lib/node_modules").is_dir());
     }
 
     #[tokio::test]
@@ -2699,6 +2910,87 @@ mod tests {
             pinned_backend.calls()[0].cmd,
             vec!["sh", "-l", "-c", "npm install -g @google/gemini-cli@1.2.3"]
         );
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_sets_up_prefix_before_installing_codex() {
+        use cella_backend::progress::ProgressSender;
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // npm prefix setup
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex is callable
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        let calls = backend.calls();
+        let prefix_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part == ENSURE_WRITABLE_NPM_PREFIX_PROGRAM)
+            })
+            .expect("prefix setup should run");
+        let install_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part.contains("npm install -g @openai/codex"))
+            })
+            .expect("Codex install should run");
+        assert!(prefix_index < install_index);
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_continues_after_prefix_setup_nonzero_exit() {
+        use cella_backend::progress::ProgressSender;
+
+        let backend = MockBackend::new(vec![
+            Ok(fail_exit(1, "could not update npm config")),
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex is callable
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        assert!(backend.calls().iter().any(|call| {
+            call.cmd
+                .iter()
+                .any(|part| part.contains("npm install -g @openai/codex"))
+        }));
     }
 
     #[tokio::test]
