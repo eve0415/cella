@@ -455,6 +455,7 @@ All tool config sections use strict validation -- unknown fields are rejected at
 | Unknown tool name in `[tools] install` | Warning logged, tool skipped. Valid names: `claude-code`, `codex`, `gemini`, `nvim`, `tmux`. |
 | npm not available and required | Codex/Gemini step fails with "Node.js/npm not available". Other tools proceed. |
 | npm prefix cannot be made writable | Warning logged, the install is attempted anyway so npm's own error reaches the user. |
+| Another binary of the same name resolves first | Step marked failed, naming both the path installed to and the path that resolves. Only checked when the prefix was redirected. |
 | Installer exits non-zero | Step marked failed immediately. The installer's exit code and first line of stderr are included in the failure message. Verification is not attempted. |
 | Binary not on PATH after install | If found via interactive shell probe (`-lic`), a `/usr/local/bin` symlink is attempted. If still unreachable, step marked failed. |
 | Unsupported architecture (nvim) | Error returned with the detected architecture. User directed to install nvim in their container image. |
