@@ -130,7 +130,7 @@ When `version = "latest"`, the `@version` suffix is omitted. npm commands run as
 Before either install, cella checks that npm's resolved global prefix is writable by the remote user, and redirects it to `$HOME/.local` when it is not.
 This is what makes npm from a distro package work: Debian's npm pins `prefix=/usr/local`, which is root-owned, so a user-run `npm install -g` fails with `EACCES`.
 npm installed by the devcontainer `node` feature already has a user-writable prefix, so nothing is redirected there.
-The redirect is written to the user's `~/.npmrc` (so later manual upgrades keep working) and is also passed to the install and its verification as `NPM_CONFIG_PREFIX`, which outranks any prefix baked into the image's environment.
+The redirect is written to the user's `~/.npmrc` (so later manual upgrades keep working) and passed to the install as `NPM_CONFIG_PREFIX`; verification runs against the real login-shell environment, and when the binary is not reachable there, cella symlinks it into `/usr/local/bin`.
 `$HOME/.local/bin` is already on PATH via cella's shell integration, and is where the Claude Code installer lands too.
 
 **Neovim** downloads from GitHub releases:

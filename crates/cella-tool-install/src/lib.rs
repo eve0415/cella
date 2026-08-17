@@ -554,13 +554,15 @@ pub async fn run_claude_install(
 const NPM_PREFIX_MARKER: &str = "cella-npm-prefix=";
 const NPM_HOME_MARKER: &str = "cella-npm-home=";
 
-const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"user="$(id -un 2>/dev/null)"
-home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
-if [ -z "$home" ]; then
-    home="$(awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd 2>/dev/null | head -n 1)"
-fi
-if [ -z "$home" ] || [ ! -d "$home" ]; then
-    home="${HOME:-}"
+// A writable HOME may be an intentional container remap; reject an inherited,
+// unusable value before falling back to the passwd home.
+const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"home="${HOME:-}"
+if [ -z "$home" ] || [ ! -d "$home" ] || [ ! -w "$home" ]; then
+    user="$(id -un 2>/dev/null)"
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$home" ]; then
+        home="$(awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd 2>/dev/null | head -n 1)"
+    fi
 fi
 [ -n "$home" ] && [ -d "$home" ] || exit 1
 prefix="$(HOME="$home" npm config get prefix 2>/dev/null)"
@@ -1894,9 +1896,7 @@ async fn install_claude_branch(
 
 fn npm_install_env(probed_env: Option<&ProbedEnv>, setup: &NpmPrefixSetup) -> ProbedEnv {
     let mut env = probed_env.cloned().unwrap_or_default();
-    if !env.contains_key("HOME")
-        && let Some(home) = &setup.home
-    {
+    if let Some(home) = &setup.home {
         env.insert("HOME".to_string(), home.clone());
     }
     if let Some(prefix) = &setup.redirected_prefix {
@@ -2929,6 +2929,45 @@ exit 1
 
     #[cfg(unix)]
     #[test]
+    fn npm_prefix_program_prefers_writable_home_over_passwd_home() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("remapped-home");
+        let passwd_home = temp.path().join("passwd-home");
+        let npm_bin = temp.path().join("bin");
+        let blocked_prefix = temp.path().join("blocked-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("remapped home should be created");
+        std::fs::create_dir_all(&passwd_home).expect("passwd home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::write(&blocked_prefix, "not a directory")
+            .expect("blocked prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+
+        let output = run_npm_prefix_program(&home, &passwd_home, &npm_bin, &blocked_prefix, &log);
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!(
+                "{NPM_PREFIX_MARKER}{}/.local\n{NPM_HOME_MARKER}{}\n",
+                home.display(),
+                home.display()
+            )
+        );
+        assert!(home.join(".local/bin").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn npm_prefix_program_prefers_passwd_home_over_misleading_home() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let passwd_home = temp.path().join("passwd-home");
@@ -3164,6 +3203,40 @@ exit 1
         assert_eq!(
             pinned_backend.calls()[0].cmd,
             vec!["sh", "-l", "-c", "npm install -g @google/gemini-cli@1.2.3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_install_env_overrides_probed_home_in_install_exec() {
+        let mut probed_env = ProbedEnv::new();
+        probed_env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        probed_env.insert("HOME".to_string(), "/root".to_string());
+        let setup = NpmPrefixSetup {
+            home: Some("/home/vscode".to_string()),
+            redirected_prefix: None,
+        };
+        let install_env = npm_install_env(Some(&probed_env), &setup);
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        npm_install_global(
+            &backend,
+            "test-container",
+            "vscode",
+            "@openai/codex",
+            "latest",
+            Some(&install_env),
+        )
+        .await
+        .expect("npm install should run");
+
+        let call = &backend.calls()[0];
+        assert_eq!(call.cmd, vec!["sh", "-c", "npm install -g @openai/codex"]);
+        assert_eq!(
+            call.env,
+            Some(vec![
+                "PATH=/opt/node/bin:/usr/bin".to_string(),
+                "HOME=/home/vscode".to_string(),
+            ])
         );
     }
 
