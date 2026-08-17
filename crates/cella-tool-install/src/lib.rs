@@ -353,14 +353,20 @@ pub async fn verify_tmux(
 
 // ── Tool exec helpers ────────────────────────────────────────────────────────
 
-/// Extract PATH from the probed user environment for tool exec calls.
+/// Extract forwarded values from the probed user environment for tool exec calls.
 ///
-/// Returns `Some(vec!["PATH=..."])` when the probed env contains PATH,
-/// `None` otherwise (caller should fall back to a login shell).
+/// PATH is emitted first, followed by `NPM_CONFIG_PREFIX`, when present.
+/// Returns `None` when neither value is available.
 pub fn tool_exec_env(probed_env: Option<&ProbedEnv>) -> Option<Vec<String>> {
-    probed_env
-        .and_then(|env| env.get("PATH"))
-        .map(|path| vec![format!("PATH={path}")])
+    let env = probed_env?;
+    let mut forwarded = Vec::with_capacity(2);
+    if let Some(path) = env.get("PATH") {
+        forwarded.push(format!("PATH={path}"));
+    }
+    if let Some(prefix) = env.get("NPM_CONFIG_PREFIX") {
+        forwarded.push(format!("NPM_CONFIG_PREFIX={prefix}"));
+    }
+    (!forwarded.is_empty()).then_some(forwarded)
 }
 
 /// Build the shell command prefix for a tool exec call.
@@ -540,11 +546,17 @@ pub async fn run_claude_install(
 
 // ── npm tool helpers ─────────────────────────────────────────────────────────
 
-const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"home="${HOME:-}"
-if [ -z "$home" ] || [ ! -d "$home" ]; then
-    home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+const NPM_PREFIX_MARKER: &str = "cella-npm-prefix=";
+
+const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"user="$(id -un 2>/dev/null)"
+home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+if [ -z "$home" ]; then
+    home="$(awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd 2>/dev/null | head -n 1)"
 fi
-[ -n "$home" ] || exit 1
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+    home="${HOME:-}"
+fi
+[ -n "$home" ] && [ -d "$home" ] || exit 1
 prefix="$(HOME="$home" npm config get prefix 2>/dev/null)"
 if [ -n "$prefix" ] && [ "$prefix" != "undefined" ] \
     && mkdir -p "$prefix/lib/node_modules" "$prefix/bin" 2>/dev/null \
@@ -552,7 +564,8 @@ if [ -n "$prefix" ] && [ "$prefix" != "undefined" ] \
     exit 0
 fi
 mkdir -p "$home/.local/bin" "$home/.local/lib" || exit 1
-HOME="$home" npm config set prefix "$home/.local""#;
+HOME="$home" npm config set prefix "$home/.local" || exit 1
+printf 'cella-npm-prefix=%s\n' "$home/.local""#;
 
 /// Ensure the remote user can write to npm's global prefix, redirecting it to
 /// `$HOME/.local` when it cannot.
@@ -561,7 +574,7 @@ async fn ensure_writable_npm_prefix(
     container_id: &str,
     remote_user: &str,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<String> {
     let result = client
         .exec_command(
             container_id,
@@ -575,13 +588,24 @@ async fn ensure_writable_npm_prefix(
         .await;
 
     match result {
-        Ok(result) if result.exit_code == 0 => {}
-        Ok(result) => warn!(
-            "Failed to ensure writable npm prefix (exit {}): {}",
-            result.exit_code,
-            result.stderr.trim()
-        ),
-        Err(error) => warn!("Failed to ensure writable npm prefix: {error}"),
+        Ok(result) if result.exit_code == 0 => result
+            .stdout
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(NPM_PREFIX_MARKER))
+            .map(str::to_owned),
+        Ok(result) => {
+            warn!(
+                "Failed to ensure writable npm prefix (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            );
+            None
+        }
+        Err(error) => {
+            warn!("Failed to ensure writable npm prefix: {error}");
+            None
+        }
     }
 }
 
@@ -1803,6 +1827,15 @@ async fn install_claude_branch(
     usize::from(!verified_install_step(ctx, "claude", result, step).await)
 }
 
+fn npm_env_with_redirected_prefix(probed_env: Option<&ProbedEnv>, prefix: &str) -> ProbedEnv {
+    let mut env = probed_env.cloned().unwrap_or_default();
+    env.insert("NPM_CONFIG_PREFIX".to_string(), prefix.to_string());
+    if let Some(path) = env.get_mut("PATH") {
+        path.insert_str(0, &format!("{prefix}/bin:"));
+    }
+    env
+}
+
 async fn install_npm_branch(
     ctx: &InstallCtx<'_>,
     phase: &cella_backend::progress::PhaseHandle,
@@ -1826,13 +1859,23 @@ async fn install_npm_branch(
     if !codex && !gemini {
         return 0;
     }
-    ensure_writable_npm_prefix(
+    let redirected_prefix = ensure_writable_npm_prefix(
         ctx.client,
         ctx.container_id,
         ctx.remote_user,
         ctx.probed_env,
     )
     .await;
+    let redirected_env = redirected_prefix
+        .as_deref()
+        .map(|prefix| npm_env_with_redirected_prefix(ctx.probed_env, prefix));
+    let ctx = InstallCtx {
+        client: ctx.client,
+        container_id: ctx.container_id,
+        remote_user: ctx.remote_user,
+        shell: ctx.shell,
+        probed_env: redirected_env.as_ref().or(ctx.probed_env),
+    };
     let mut failures = 0;
     if codex {
         let step = phase.step("Codex");
@@ -1844,7 +1887,7 @@ async fn install_npm_branch(
             ctx.probed_env,
         )
         .await;
-        if !verified_install_step(ctx, "codex", r, step).await {
+        if !verified_install_step(&ctx, "codex", r, step).await {
             failures += 1;
         }
     }
@@ -1858,7 +1901,7 @@ async fn install_npm_branch(
             ctx.probed_env,
         )
         .await;
-        if !verified_install_step(ctx, "gemini", r, step).await {
+        if !verified_install_step(&ctx, "gemini", r, step).await {
             failures += 1;
         }
     }
@@ -2219,6 +2262,23 @@ mod tests {
     }
 
     #[test]
+    fn tool_exec_env_forwards_npm_config_prefix_after_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert(
+            "NPM_CONFIG_PREFIX".to_string(),
+            "/home/user/.local".to_string(),
+        );
+        assert_eq!(
+            tool_exec_env(Some(&env)),
+            Some(vec![
+                "PATH=/usr/bin".to_string(),
+                "NPM_CONFIG_PREFIX=/home/user/.local".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn tool_shell_cmd_preserves_complex_inner_command() {
         let complex = "cd /app && npm install && npm run build 2>&1 | tee build.log";
         let mut env = ProbedEnv::new();
@@ -2565,10 +2625,31 @@ exit 1
         .expect("npm stub should be written");
         std::fs::set_permissions(npm_path, std::fs::Permissions::from_mode(0o755))
             .expect("npm stub should be executable");
+
+        let getent_path = npm_path.with_file_name("getent");
+        std::fs::write(
+            &getent_path,
+            r#"#!/bin/sh
+if [ "$1" = "passwd" ] && [ -n "$2" ]; then
+    printf '%s:x:1000:1000::%s:/bin/sh\n' "$2" "$NPM_TEST_PASSWD_HOME"
+    exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("getent stub should be written");
+        std::fs::set_permissions(&getent_path, std::fs::Permissions::from_mode(0o755))
+            .expect("getent stub should be executable");
     }
 
     #[cfg(unix)]
-    fn run_npm_prefix_program(home: &Path, npm_bin: &Path, prefix: &Path, log: &Path) -> Output {
+    fn run_npm_prefix_program(
+        home: &Path,
+        passwd_home: &Path,
+        npm_bin: &Path,
+        prefix: &Path,
+        log: &Path,
+    ) -> Output {
         let path = format!(
             "{}:{}",
             npm_bin.display(),
@@ -2581,6 +2662,7 @@ exit 1
             .env("PATH", path)
             .env("NPM_TEST_PREFIX", prefix)
             .env("NPM_TEST_LOG", log)
+            .env("NPM_TEST_PASSWD_HOME", passwd_home)
             .output()
             .expect("npm prefix program should run")
     }
@@ -2632,7 +2714,10 @@ exit 1
         env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
 
-        ensure_writable_npm_prefix(&backend, "test-container", "vscode", Some(&env)).await;
+        assert_eq!(
+            ensure_writable_npm_prefix(&backend, "test-container", "vscode", Some(&env)).await,
+            None
+        );
 
         let calls = backend.calls();
         assert_eq!(calls[0].user.as_deref(), Some("vscode"));
@@ -2646,12 +2731,33 @@ exit 1
         );
 
         let login_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
-        ensure_writable_npm_prefix(&login_backend, "test-container", "vscode", None).await;
+        assert_eq!(
+            ensure_writable_npm_prefix(&login_backend, "test-container", "vscode", None).await,
+            None
+        );
         assert_eq!(
             login_backend.calls()[0].cmd,
             vec!["sh", "-l", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
         );
         assert_eq!(login_backend.calls()[0].env, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_writable_npm_prefix_parses_the_last_marker() {
+        let redirected = MockBackend::new(vec![Ok(ok_stdout(
+            0,
+            "npm notice\ncella-npm-prefix=/tmp/old\ncella-npm-prefix=/home/vscode/.local\n",
+        ))]);
+        assert_eq!(
+            ensure_writable_npm_prefix(&redirected, "test-container", "vscode", None).await,
+            Some("/home/vscode/.local".to_string())
+        );
+
+        let unchanged = MockBackend::new(vec![Ok(ok_stdout(0, "npm notice\n"))]);
+        assert_eq!(
+            ensure_writable_npm_prefix(&unchanged, "test-container", "vscode", None).await,
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -2676,7 +2782,7 @@ exit 1
         std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o555))
             .expect("parent should become read-only");
 
-        let output = run_npm_prefix_program(&home, &npm_bin, &prefix, &log);
+        let output = run_npm_prefix_program(&home, &home, &npm_bin, &prefix, &log);
         std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o755))
             .expect("parent permissions should be restored");
 
@@ -2688,6 +2794,10 @@ exit 1
         assert_eq!(
             std::fs::read_to_string(&log).expect("log should be readable"),
             format!("config set prefix {}/.local\n", home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!("cella-npm-prefix={}/.local\n", home.display())
         );
         assert!(home.join(".local/bin").is_dir());
     }
@@ -2706,7 +2816,7 @@ exit 1
         std::fs::write(&log, "").expect("log should be created");
         write_npm_prefix_stub(&npm_bin.join("npm"));
 
-        let output = run_npm_prefix_program(&home, &npm_bin, &prefix, &log);
+        let output = run_npm_prefix_program(&home, &home, &npm_bin, &prefix, &log);
 
         assert!(
             output.status.success(),
@@ -2718,7 +2828,53 @@ exit 1
                 .expect("log should be readable")
                 .is_empty()
         );
+        assert!(output.stdout.is_empty());
         assert!(prefix.join("lib/node_modules").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_prefers_passwd_home_over_misleading_home() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let passwd_home = temp.path().join("passwd-home");
+        let misleading_home = temp.path().join("misleading-home");
+        let npm_bin = temp.path().join("bin");
+        let blocked_prefix = temp.path().join("blocked-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&passwd_home).expect("passwd home should be created");
+        std::fs::create_dir_all(&misleading_home).expect("misleading home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::write(&blocked_prefix, "not a directory")
+            .expect("blocked prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+        std::fs::set_permissions(&misleading_home, std::fs::Permissions::from_mode(0o555))
+            .expect("misleading home should become read-only");
+
+        let output = run_npm_prefix_program(
+            &misleading_home,
+            &passwd_home,
+            &npm_bin,
+            &blocked_prefix,
+            &log,
+        );
+        std::fs::set_permissions(&misleading_home, std::fs::Permissions::from_mode(0o755))
+            .expect("misleading home permissions should be restored");
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", passwd_home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!("cella-npm-prefix={}/.local\n", passwd_home.display())
+        );
+        assert!(passwd_home.join(".local/bin").is_dir());
     }
 
     #[tokio::test]
@@ -2913,23 +3069,30 @@ exit 1
     }
 
     #[tokio::test]
-    async fn install_npm_branch_sets_up_prefix_before_installing_codex() {
+    async fn install_npm_branch_applies_redirect_to_install_and_verification() {
         use cella_backend::progress::ProgressSender;
 
+        let prefix = "/home/vscode/.local";
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // npm prefix setup
+            Ok(ok_stdout(0, &format!("{NPM_PREFIX_MARKER}{prefix}\n"))),
             Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
             Ok(ok_exit(0)), // codex is callable
         ]);
         let settings = cella_config::CellaConfig::default();
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        env.insert(
+            "NPM_CONFIG_PREFIX".to_string(),
+            "/unwritable/npm-prefix".to_string(),
+        );
         let ctx = InstallCtx {
             client: &backend,
             container_id: "test-container",
             remote_user: "vscode",
             shell: "/bin/bash",
-            probed_env: None,
+            probed_env: Some(&env),
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(32);
         let sender = ProgressSender::new(tx, false);
@@ -2957,6 +3120,62 @@ exit 1
             })
             .expect("Codex install should run");
         assert!(prefix_index < install_index);
+        let expected_env = Some(vec![
+            format!("PATH={prefix}/bin:/opt/node/bin:/usr/bin"),
+            format!("NPM_CONFIG_PREFIX={prefix}"),
+        ]);
+        assert_eq!(calls[install_index].env, expected_env);
+        assert_eq!(
+            calls.last().expect("verification should run").env,
+            expected_env
+        );
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_does_not_invent_path_after_redirect() {
+        use cella_backend::progress::ProgressSender;
+
+        let prefix = "/home/vscode/.local";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, &format!("{NPM_PREFIX_MARKER}{prefix}\n"))),
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex is callable
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        let calls = backend.calls();
+        let install = calls
+            .iter()
+            .find(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part.contains("npm install -g @openai/codex"))
+            })
+            .expect("Codex install should run");
+        assert_eq!(
+            install.cmd,
+            vec!["sh", "-l", "-c", "npm install -g @openai/codex"]
+        );
+        assert_eq!(
+            install.env,
+            Some(vec![format!("NPM_CONFIG_PREFIX={prefix}")])
+        );
     }
 
     #[tokio::test]
