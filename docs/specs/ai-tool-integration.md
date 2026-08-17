@@ -108,7 +108,7 @@ Tools that require runtime dependencies have them provisioned automatically:
 | Codex | `bubblewrap` (sandbox) | `apt-get` or `apk` depending on distro |
 | Codex, Gemini | Node.js / npm | If npm is not on PATH (including probed user env), installs via `apt-get` or `apk` |
 
-Node.js availability is checked using the probed user environment PATH (from `userEnvProbe`) to detect npm installed by devcontainer features (e.g., nvm). The implementation falls back to a login shell when no probed environment is available.
+Node.js availability is checked using the probed user environment PATH (from `userEnvProbe`) to detect npm installed by devcontainer features (e.g., nvm). The implementation falls back to a login shell when no probed environment is available. The check runs as the remote user, since that is the user who runs the install — probing as root hides a Node that is only on the user's PATH.
 
 ### Install Methods
 
@@ -126,6 +126,14 @@ npm install -g @google/gemini-cli     # latest
 npm install -g @google/gemini-cli@1.0  # pinned
 ```
 When `version = "latest"`, the `@version` suffix is omitted. npm commands run as the remote user with the probed PATH when available, falling back to a login shell otherwise.
+
+Before either install, cella checks that npm's resolved global prefix is writable by the remote user, and redirects it to `$HOME/.local` when it is not.
+This is what makes npm from a distro package work: Debian's npm pins `prefix=/usr/local`, which is root-owned, so a user-run `npm install -g` fails with `EACCES`.
+npm installed by the devcontainer `node` feature already has a user-writable prefix, so nothing is redirected there.
+The redirect is written to the user's `~/.npmrc` (so later manual upgrades keep working) and passed to the install as `NPM_CONFIG_PREFIX`.
+Verification then runs against the real login-shell environment, so it judges what `cella exec` will actually resolve.
+Because that check cannot tell a redirected binary from a same-named one already on PATH, the redirected binary is symlinked into `/usr/local/bin` before verifying; a symlink that cannot be created (a pre-existing regular file is never overwritten) is not fatal.
+`$HOME/.local/bin` is already on PATH via cella's shell integration, and is where the Claude Code installer lands too.
 
 **Neovim** downloads from GitHub releases:
 ```
@@ -446,6 +454,8 @@ All tool config sections use strict validation -- unknown fields are rejected at
 |---|---|
 | Unknown tool name in `[tools] install` | Warning logged, tool skipped. Valid names: `claude-code`, `codex`, `gemini`, `nvim`, `tmux`. |
 | npm not available and required | Codex/Gemini step fails with "Node.js/npm not available". Other tools proceed. |
+| npm prefix cannot be made writable | Warning logged, the install is attempted anyway so npm's own error reaches the user. |
+| Another binary of the same name resolves first | Step marked failed, naming both the path installed to and the path that resolves. Only checked when the prefix was redirected. |
 | Installer exits non-zero | Step marked failed immediately. The installer's exit code and first line of stderr are included in the failure message. Verification is not attempted. |
 | Binary not on PATH after install | If found via interactive shell probe (`-lic`), a `/usr/local/bin` symlink is attempted. If still unreachable, step marked failed. |
 | Unsupported architecture (nvim) | Error returned with the detected architecture. User directed to install nvim in their container image. |

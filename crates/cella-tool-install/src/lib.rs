@@ -353,14 +353,25 @@ pub async fn verify_tmux(
 
 // ── Tool exec helpers ────────────────────────────────────────────────────────
 
-/// Extract PATH from the probed user environment for tool exec calls.
+/// Extract forwarded values from the probed user environment for tool exec calls.
 ///
-/// Returns `Some(vec!["PATH=..."])` when the probed env contains PATH,
-/// `None` otherwise (caller should fall back to a login shell).
+/// `PATH`, `HOME`, and `NPM_CONFIG_PREFIX` are emitted in that order when
+/// present. `HOME` is forwarded because `docker exec -u` can retain the
+/// image's home even when the command runs as a different remote user.
+/// Returns `None` when none of the three values is available.
 pub fn tool_exec_env(probed_env: Option<&ProbedEnv>) -> Option<Vec<String>> {
-    probed_env
-        .and_then(|env| env.get("PATH"))
-        .map(|path| vec![format!("PATH={path}")])
+    let env = probed_env?;
+    let mut forwarded = Vec::with_capacity(3);
+    if let Some(path) = env.get("PATH") {
+        forwarded.push(format!("PATH={path}"));
+    }
+    if let Some(home) = env.get("HOME") {
+        forwarded.push(format!("HOME={home}"));
+    }
+    if let Some(prefix) = env.get("NPM_CONFIG_PREFIX") {
+        forwarded.push(format!("NPM_CONFIG_PREFIX={prefix}"));
+    }
+    (!forwarded.is_empty()).then_some(forwarded)
 }
 
 /// Build the shell command prefix for a tool exec call.
@@ -385,12 +396,14 @@ pub fn tool_shell_cmd(probed_env: Option<&ProbedEnv>, inner_cmd: &str) -> Vec<St
 
 /// Check whether npm is available on the container's PATH.
 ///
-/// Uses the probed user environment PATH (from `userEnvProbe`) to detect
-/// npm installed by devcontainer features (e.g. nvm). Falls back to a login
-/// shell when no probed env is available.
+/// Runs as the remote user because that user also runs the npm install. Uses
+/// the probed user environment PATH (from `userEnvProbe`) to detect npm
+/// installed by devcontainer features (e.g. nvm). Falls back to a login shell
+/// when no probed env is available.
 async fn npm_available_on_path(
     client: &dyn ContainerBackend,
     container_id: &str,
+    remote_user: &str,
     probed_env: Option<&ProbedEnv>,
 ) -> bool {
     client
@@ -398,7 +411,7 @@ async fn npm_available_on_path(
             container_id,
             &ExecOptions {
                 cmd: tool_shell_cmd(probed_env, "command -v npm"),
-                user: Some("root".to_string()),
+                user: Some(remote_user.to_string()),
                 env: tool_exec_env(probed_env),
                 working_dir: None,
             },
@@ -538,6 +551,86 @@ pub async fn run_claude_install(
 
 // ── npm tool helpers ─────────────────────────────────────────────────────────
 
+const NPM_PREFIX_MARKER: &str = "cella-npm-prefix=";
+const NPM_HOME_MARKER: &str = "cella-npm-home=";
+
+// A writable HOME may be an intentional container remap; reject an inherited,
+// unusable value before falling back to the passwd home.
+const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"home="${HOME:-}"
+if [ -z "$home" ] || [ ! -d "$home" ] || [ ! -w "$home" ]; then
+    user="$(id -un 2>/dev/null)"
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$home" ]; then
+        home="$(awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd 2>/dev/null | head -n 1)"
+    fi
+fi
+[ -n "$home" ] && [ -d "$home" ] || exit 1
+prefix="$(HOME="$home" npm config get prefix 2>/dev/null)"
+if [ -n "$prefix" ] && [ "$prefix" != "undefined" ] \
+    && mkdir -p "$prefix/lib/node_modules" "$prefix/bin" 2>/dev/null \
+    && [ -w "$prefix/lib/node_modules" ] && [ -w "$prefix/bin" ]; then
+    printf 'cella-npm-home=%s\n' "$home"
+    exit 0
+fi
+mkdir -p "$home/.local/bin" "$home/.local/lib" || exit 1
+HOME="$home" npm config set prefix "$home/.local" || exit 1
+printf 'cella-npm-prefix=%s\n' "$home/.local"
+printf 'cella-npm-home=%s\n' "$home""#;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NpmPrefixSetup {
+    home: Option<String>,
+    redirected_prefix: Option<String>,
+}
+
+/// Ensure the remote user can write to npm's global prefix, redirecting it to
+/// `$HOME/.local` when it cannot.
+async fn ensure_writable_npm_prefix(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    probed_env: Option<&ProbedEnv>,
+) -> NpmPrefixSetup {
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, ENSURE_WRITABLE_NPM_PREFIX_PROGRAM),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match result {
+        Ok(result) if result.exit_code == 0 => {
+            let mut setup = NpmPrefixSetup::default();
+            for line in result.stdout.lines() {
+                if let Some(home) = line.strip_prefix(NPM_HOME_MARKER) {
+                    setup.home = Some(home.to_string());
+                }
+                if let Some(prefix) = line.strip_prefix(NPM_PREFIX_MARKER) {
+                    setup.redirected_prefix = Some(prefix.to_string());
+                }
+            }
+            setup
+        }
+        Ok(result) => {
+            warn!(
+                "Failed to ensure writable npm prefix (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            );
+            NpmPrefixSetup::default()
+        }
+        Err(error) => {
+            warn!("Failed to ensure writable npm prefix: {error}");
+            NpmPrefixSetup::default()
+        }
+    }
+}
+
 /// Check if an npm-installed CLI tool is already present at the desired version.
 pub async fn is_npm_tool_installed(
     client: &dyn ContainerBackend,
@@ -576,6 +669,9 @@ pub async fn is_npm_tool_installed(
 }
 
 /// Install an npm package globally inside the container.
+///
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// # Errors
 ///
@@ -638,7 +734,8 @@ pub async fn check_codex_sandbox_deps(client: &dyn ContainerBackend, container_i
 ///
 /// Checks bubblewrap availability for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
-/// Caller must ensure Node.js/npm are available before calling this.
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Codex is already present at the requested version.
@@ -690,7 +787,8 @@ pub async fn install_codex(
 /// Install Google Gemini CLI inside the container via npm.
 ///
 /// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
-/// Caller must ensure Node.js/npm are available before calling this.
+/// Caller must ensure Node.js/npm are available and the global prefix is
+/// writable by the remote user before calling this.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Gemini CLI is already present at the requested version.
@@ -1319,8 +1417,10 @@ async fn container_file_exists(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
     /// `<shell> -lc "command -v <bin>"` returned exit 0 — the tool is on the
-    /// same PATH that `cella exec` uses, so no remediation is needed.
-    Reachable,
+    /// same PATH that `cella exec` uses. Contains the resolved path so callers
+    /// can confirm that the installed binary, rather than a foreign copy,
+    /// resolves first.
+    Reachable(String),
     /// The `-lc` probe failed but a login+interactive probe (`-lic`) found the
     /// binary at the contained absolute path. Caller may choose to symlink it
     /// into `/usr/local/bin` so that the `-lc` wrap `cella exec` uses can
@@ -1365,7 +1465,9 @@ pub async fn verify_tool_callable(
         )
         .await;
     match lc_result {
-        Ok(r) if r.exit_code == 0 => return VerifyOutcome::Reachable,
+        Ok(r) if r.exit_code == 0 => {
+            return VerifyOutcome::Reachable(r.stdout.trim().to_string());
+        }
         Ok(_) => {}
         Err(e) => return VerifyOutcome::ProbeError(e.to_string()),
     }
@@ -1465,13 +1567,125 @@ struct InstallCtx<'a> {
     remote_user: &'a str,
     shell: &'a str,
     probed_env: Option<&'a ProbedEnv>,
+    fallback_bin_dir: Option<&'a str>,
+}
+
+async fn executable_by_remote_user(ctx: &InstallCtx<'_>, path: &str) -> bool {
+    let escaped_path = path.replace('\'', "'\\''");
+    ctx.client
+        .exec_command(
+            ctx.container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("[ -x '{escaped_path}' ]"),
+                ],
+                user: Some(ctx.remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|result| result.exit_code == 0)
+}
+
+async fn proactively_expose_fallback_binary(ctx: &InstallCtx<'_>, binary: &str) -> bool {
+    let Some(dir) = ctx.fallback_bin_dir else {
+        return false;
+    };
+    let fallback_path = format!("{dir}/{binary}");
+    if !executable_by_remote_user(ctx, &fallback_path).await {
+        return false;
+    }
+
+    debug!("{binary}: exposing redirected binary at {fallback_path} before verification");
+    match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &fallback_path).await {
+        Ok(()) => true,
+        Err(error) => {
+            debug!("{binary}: could not proactively symlink {fallback_path}: {error}");
+            false
+        }
+    }
+}
+
+/// Confirm that a reachable binary is the redirected install.
+///
+/// `/usr/local/bin/<binary>` counts as ours only when this step successfully
+/// created or re-pointed that symlink to the fallback binary. A pre-existing
+/// regular file at the same path must not mask the pinned install.
+fn verify_resolved_fallback(
+    fallback_bin_dir: Option<&str>,
+    binary: &str,
+    resolved_path: &str,
+    exposed_at_usr_local: bool,
+) -> Result<(), String> {
+    let Some(dir) = fallback_bin_dir else {
+        return Ok(());
+    };
+    let fallback_path = format!("{dir}/{binary}");
+    let usr_local_path = format!("/usr/local/bin/{binary}");
+    if resolved_path == fallback_path || (exposed_at_usr_local && resolved_path == usr_local_path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "installed to {fallback_path} but {resolved_path} resolves first"
+        ))
+    }
+}
+
+async fn symlink_and_reverify(
+    ctx: &InstallCtx<'_>,
+    binary: &str,
+    source_path: &str,
+    install_result: Option<&ExecResult>,
+    step: PhaseChildHandle,
+) -> bool {
+    if let Err(error) =
+        symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, source_path).await
+    {
+        step.fail(&render_failure_reason(
+            install_result,
+            &format!("symlink failed: {error}"),
+        ));
+        return false;
+    }
+
+    let second = verify_tool_callable(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        ctx.shell,
+        binary,
+        ctx.probed_env,
+    )
+    .await;
+    match second {
+        VerifyOutcome::Reachable(path) => {
+            if let Err(error) = verify_resolved_fallback(ctx.fallback_bin_dir, binary, &path, true)
+            {
+                step.fail(&render_failure_reason(install_result, &error));
+                return false;
+            }
+            step.finish();
+            true
+        }
+        other => {
+            step.fail(&render_failure_reason(
+                install_result,
+                &format!("symlink created but still not reachable: {other:?}"),
+            ));
+            false
+        }
+    }
 }
 
 /// Finish a phase-child step after verifying the tool is callable via the same
-/// login-shell wrap `cella exec` uses. On `InstalledElsewhere` attempts a
-/// `/usr/local/bin` symlink and re-verifies. On any terminal failure, folds
-/// the installer's exit code and stderr into the `step.fail` message so the
-/// user sees why the `✗` appeared.
+/// login-shell wrap `cella exec` uses. When the binary is found outside that
+/// environment, or is executable in `fallback_bin_dir`, attempts a
+/// `/usr/local/bin` symlink and re-verifies. On any terminal failure, folds the
+/// installer's exit code and stderr into the `step.fail` message so the user
+/// sees why the `✗` appeared.
 ///
 /// If `install_result` indicates the installer itself exited non-zero, the
 /// step fails immediately without even asking `verify_tool_callable` — an
@@ -1495,6 +1709,8 @@ async fn verified_install_step(
         debug!("{binary}: install was idempotent, verifying reachability");
     }
 
+    let exposed_at_usr_local = proactively_expose_fallback_binary(ctx, binary).await;
+
     let verify = verify_tool_callable(
         ctx.client,
         ctx.container_id,
@@ -1506,47 +1722,37 @@ async fn verified_install_step(
     .await;
 
     match verify {
-        VerifyOutcome::Reachable => {
+        VerifyOutcome::Reachable(path) => {
+            if let Err(error) =
+                verify_resolved_fallback(ctx.fallback_bin_dir, binary, &path, exposed_at_usr_local)
+            {
+                step.fail(&render_failure_reason(install_result.as_ref(), &error));
+                return false;
+            }
             step.finish();
             true
         }
         VerifyOutcome::InstalledElsewhere(path) => {
             debug!("{binary}: found at {path} but not on login-shell PATH, symlinking");
-            match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
-                Ok(()) => {
-                    let second = verify_tool_callable(
-                        ctx.client,
-                        ctx.container_id,
-                        ctx.remote_user,
-                        ctx.shell,
-                        binary,
-                        ctx.probed_env,
-                    )
-                    .await;
-                    match second {
-                        VerifyOutcome::Reachable => {
-                            step.finish();
-                            true
-                        }
-                        other => {
-                            step.fail(&render_failure_reason(
-                                install_result.as_ref(),
-                                &format!("symlink created but still not reachable: {other:?}"),
-                            ));
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    step.fail(&render_failure_reason(
-                        install_result.as_ref(),
-                        &format!("symlink failed: {e}"),
-                    ));
-                    false
-                }
-            }
+            symlink_and_reverify(ctx, binary, &path, install_result.as_ref(), step).await
         }
         VerifyOutcome::NotInstalled => {
+            if let Some(dir) = ctx.fallback_bin_dir {
+                let fallback_path = format!("{dir}/{binary}");
+                if executable_by_remote_user(ctx, &fallback_path).await {
+                    debug!(
+                        "{binary}: executable at {fallback_path} but not on login-shell PATH, symlinking"
+                    );
+                    return symlink_and_reverify(
+                        ctx,
+                        binary,
+                        &fallback_path,
+                        install_result.as_ref(),
+                        step,
+                    )
+                    .await;
+                }
+            }
             step.fail(&render_failure_reason(
                 install_result.as_ref(),
                 "install did not produce a reachable binary",
@@ -1620,8 +1826,15 @@ pub async fn install_tools(
     let has = |t: ToolName| tools.contains(&t);
     let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
 
-    let (is_alpine, node_available) =
-        install_system_packages(client, container_id, probed_env, tools, needs_npm).await;
+    let (is_alpine, node_available) = install_system_packages(
+        client,
+        container_id,
+        remote_user,
+        probed_env,
+        tools,
+        needs_npm,
+    )
+    .await;
 
     let ctx = InstallCtx {
         client,
@@ -1629,6 +1842,7 @@ pub async fn install_tools(
         remote_user,
         shell,
         probed_env,
+        fallback_bin_dir: None,
     };
 
     let phase = progress.phase("Installing tools...");
@@ -1675,6 +1889,7 @@ pub async fn install_tools(
 async fn install_system_packages(
     client: &dyn ContainerBackend,
     container_id: &str,
+    remote_user: &str,
     probed_env: Option<&ProbedEnv>,
     tools: &[ToolName],
     needs_npm: bool,
@@ -1683,7 +1898,7 @@ async fn install_system_packages(
     let is_alpine = pkg_mgr.is_some_and(PackageManager::is_alpine);
 
     let npm_was_missing =
-        needs_npm && !npm_available_on_path(client, container_id, probed_env).await;
+        needs_npm && !npm_available_on_path(client, container_id, remote_user, probed_env).await;
 
     if let Some(mgr) = pkg_mgr {
         let mut needed: Vec<&pkg::PackageSpec> = Vec::new();
@@ -1712,7 +1927,7 @@ async fn install_system_packages(
 
     let node_available = needs_npm
         && if npm_was_missing {
-            npm_available_on_path(client, container_id, probed_env).await
+            npm_available_on_path(client, container_id, remote_user, probed_env).await
         } else {
             true
         };
@@ -1743,6 +1958,20 @@ async fn install_claude_branch(
     usize::from(!verified_install_step(ctx, "claude", result, step).await)
 }
 
+fn npm_install_env(probed_env: Option<&ProbedEnv>, setup: &NpmPrefixSetup) -> ProbedEnv {
+    let mut env = probed_env.cloned().unwrap_or_default();
+    if let Some(home) = &setup.home {
+        env.insert("HOME".to_string(), home.clone());
+    }
+    if let Some(prefix) = &setup.redirected_prefix {
+        env.insert("NPM_CONFIG_PREFIX".to_string(), prefix.clone());
+        if let Some(path) = env.get_mut("PATH") {
+            path.insert_str(0, &format!("{prefix}/bin:"));
+        }
+    }
+    env
+}
+
 async fn install_npm_branch(
     ctx: &InstallCtx<'_>,
     phase: &cella_backend::progress::PhaseHandle,
@@ -1763,6 +1992,30 @@ async fn install_npm_branch(
         }
         return f;
     }
+    if !codex && !gemini {
+        return 0;
+    }
+    let npm_setup = ensure_writable_npm_prefix(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        ctx.probed_env,
+    )
+    .await;
+    let install_env = npm_install_env(ctx.probed_env, &npm_setup);
+    let install_env = (!install_env.is_empty()).then_some(install_env);
+    let fallback_bin_dir = npm_setup
+        .redirected_prefix
+        .as_ref()
+        .map(|prefix| format!("{prefix}/bin"));
+    let verification_ctx = InstallCtx {
+        client: ctx.client,
+        container_id: ctx.container_id,
+        remote_user: ctx.remote_user,
+        shell: ctx.shell,
+        probed_env: ctx.probed_env,
+        fallback_bin_dir: fallback_bin_dir.as_deref(),
+    };
     let mut failures = 0;
     if codex {
         let step = phase.step("Codex");
@@ -1771,10 +2024,10 @@ async fn install_npm_branch(
             ctx.container_id,
             ctx.remote_user,
             &settings.tools.codex,
-            ctx.probed_env,
+            install_env.as_ref(),
         )
         .await;
-        if !verified_install_step(ctx, "codex", r, step).await {
+        if !verified_install_step(&verification_ctx, "codex", r, step).await {
             failures += 1;
         }
     }
@@ -1785,10 +2038,10 @@ async fn install_npm_branch(
             ctx.container_id,
             ctx.remote_user,
             &settings.tools.gemini,
-            ctx.probed_env,
+            install_env.as_ref(),
         )
         .await;
-        if !verified_install_step(ctx, "gemini", r, step).await {
+        if !verified_install_step(&verification_ctx, "gemini", r, step).await {
             failures += 1;
         }
     }
@@ -2130,22 +2383,39 @@ mod tests {
     }
 
     #[test]
-    fn tool_exec_env_ignores_non_path_keys() {
+    fn tool_exec_env_ignores_non_forwarded_keys() {
         let mut env = ProbedEnv::new();
-        env.insert("HOME".to_string(), "/home/user".to_string());
         env.insert("SHELL".to_string(), "/bin/bash".to_string());
         let result = tool_exec_env(Some(&env));
         assert!(result.is_none());
     }
 
     #[test]
-    fn tool_exec_env_extracts_only_path() {
+    fn tool_exec_env_forwards_path_and_home() {
         let mut env = ProbedEnv::new();
         env.insert("PATH".to_string(), "/usr/bin".to_string());
         env.insert("HOME".to_string(), "/home/user".to_string());
         let result = tool_exec_env(Some(&env)).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].starts_with("PATH="));
+        assert_eq!(result, vec!["PATH=/usr/bin", "HOME=/home/user"]);
+    }
+
+    #[test]
+    fn tool_exec_env_forwards_home_and_npm_config_prefix_after_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert(
+            "NPM_CONFIG_PREFIX".to_string(),
+            "/home/user/.local".to_string(),
+        );
+        assert_eq!(
+            tool_exec_env(Some(&env)),
+            Some(vec![
+                "PATH=/usr/bin".to_string(),
+                "HOME=/home/user".to_string(),
+                "NPM_CONFIG_PREFIX=/home/user/.local".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -2167,7 +2437,11 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::{Command, Output};
     use std::sync::Mutex;
 
     use cella_backend::{
@@ -2199,6 +2473,13 @@ mod tests {
 
         fn calls(&self) -> Vec<RecordedExec> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn assert_all_responses_consumed(&self) {
+            assert!(
+                self.responses.lock().unwrap().is_empty(),
+                "MockBackend: unused responses remain"
+            );
         }
     }
 
@@ -2459,6 +2740,80 @@ mod tests {
 
     // ── check_codex_sandbox_deps ─────────────────────────────────────────
 
+    #[cfg(unix)]
+    fn test_process_is_root() -> bool {
+        let output = Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u should run");
+        assert!(output.status.success(), "id -u should succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -u should emit UTF-8")
+            .trim()
+            == "0"
+    }
+
+    #[cfg(unix)]
+    fn write_npm_prefix_stub(npm_path: &Path) {
+        std::fs::write(
+            npm_path,
+            r#"#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "get" ] && [ "$3" = "prefix" ]; then
+    printf '%s\n' "$NPM_TEST_PREFIX"
+    exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "set" ] && [ "$3" = "prefix" ]; then
+    printf '%s\n' "$*" >> "$NPM_TEST_LOG"
+    exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("npm stub should be written");
+        std::fs::set_permissions(npm_path, std::fs::Permissions::from_mode(0o755))
+            .expect("npm stub should be executable");
+
+        let getent_path = npm_path.with_file_name("getent");
+        std::fs::write(
+            &getent_path,
+            r#"#!/bin/sh
+if [ "$1" = "passwd" ] && [ -n "$2" ]; then
+    printf '%s:x:1000:1000::%s:/bin/sh\n' "$2" "$NPM_TEST_PASSWD_HOME"
+    exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("getent stub should be written");
+        std::fs::set_permissions(&getent_path, std::fs::Permissions::from_mode(0o755))
+            .expect("getent stub should be executable");
+    }
+
+    #[cfg(unix)]
+    fn run_npm_prefix_program(
+        home: &Path,
+        passwd_home: &Path,
+        npm_bin: &Path,
+        prefix: &Path,
+        log: &Path,
+    ) -> Output {
+        let path = format!(
+            "{}:{}",
+            npm_bin.display(),
+            std::env::var("PATH").expect("test process should have PATH")
+        );
+        Command::new("sh")
+            .arg("-c")
+            .arg(ENSURE_WRITABLE_NPM_PREFIX_PROGRAM)
+            .env("HOME", home)
+            .env("PATH", path)
+            .env("NPM_TEST_PREFIX", prefix)
+            .env("NPM_TEST_LOG", log)
+            .env("NPM_TEST_PASSWD_HOME", passwd_home)
+            .output()
+            .expect("npm prefix program should run")
+    }
+
     #[tokio::test]
     async fn check_codex_sandbox_deps_bwrap_available() {
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
@@ -2482,11 +2837,12 @@ mod tests {
         );
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
 
-        assert!(npm_available_on_path(&backend, "test-container", Some(&env)).await);
+        assert!(npm_available_on_path(&backend, "test-container", "vscode", Some(&env)).await);
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].cmd, vec!["sh", "-c", "command -v npm"]);
+        assert_eq!(calls[0].user, Some("vscode".to_string()));
         assert_eq!(
             calls[0].env,
             Some(vec!["PATH=/home/vscode/.npm/bin:/usr/bin".to_string()])
@@ -2496,7 +2852,238 @@ mod tests {
     #[tokio::test]
     async fn npm_available_on_path_returns_false_when_missing() {
         let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
-        assert!(!npm_available_on_path(&backend, "test-container", None).await);
+        assert!(!npm_available_on_path(&backend, "test-container", "vscode", None).await);
+    }
+
+    #[tokio::test]
+    async fn ensure_writable_npm_prefix_uses_remote_user_env_and_shell_wrapping() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        assert_eq!(
+            ensure_writable_npm_prefix(&backend, "test-container", "vscode", Some(&env)).await,
+            NpmPrefixSetup::default()
+        );
+
+        let calls = backend.calls();
+        assert_eq!(calls[0].user.as_deref(), Some("vscode"));
+        assert_eq!(
+            calls[0].env,
+            Some(vec!["PATH=/opt/node/bin:/usr/bin".to_string()])
+        );
+        assert_eq!(
+            calls[0].cmd,
+            vec!["sh", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
+        );
+
+        let login_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        assert_eq!(
+            ensure_writable_npm_prefix(&login_backend, "test-container", "vscode", None).await,
+            NpmPrefixSetup::default()
+        );
+        assert_eq!(
+            login_backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
+        );
+        assert_eq!(login_backend.calls()[0].env, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_writable_npm_prefix_parses_home_and_prefix_independently() {
+        let redirected = MockBackend::new(vec![Ok(ok_stdout(
+            0,
+            &format!(
+                "npm notice\n{NPM_HOME_MARKER}/tmp/old\n{NPM_PREFIX_MARKER}/tmp/old\n\
+                 {NPM_PREFIX_MARKER}/home/vscode/.local\n{NPM_HOME_MARKER}/home/vscode\n"
+            ),
+        ))]);
+        assert_eq!(
+            ensure_writable_npm_prefix(&redirected, "test-container", "vscode", None).await,
+            NpmPrefixSetup {
+                home: Some("/home/vscode".to_string()),
+                redirected_prefix: Some("/home/vscode/.local".to_string()),
+            }
+        );
+
+        let unchanged = MockBackend::new(vec![Ok(ok_stdout(
+            0,
+            &format!("npm notice\n{NPM_HOME_MARKER}/home/vscode\n"),
+        ))]);
+        assert_eq!(
+            ensure_writable_npm_prefix(&unchanged, "test-container", "vscode", None).await,
+            NpmPrefixSetup {
+                home: Some("/home/vscode".to_string()),
+                redirected_prefix: None,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_redirects_when_resolved_prefix_is_not_writable() {
+        // Root can write through the read-only directory, so this case cannot be simulated.
+        if test_process_is_root() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let npm_bin = temp.path().join("bin");
+        let read_only_parent = temp.path().join("read-only");
+        let prefix = read_only_parent.join("npm-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::create_dir_all(&read_only_parent).expect("read-only parent should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("parent should become read-only");
+
+        let output = run_npm_prefix_program(&home, &home, &npm_bin, &prefix, &log);
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("parent permissions should be restored");
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!(
+                "{NPM_PREFIX_MARKER}{}/.local\n{NPM_HOME_MARKER}{}\n",
+                home.display(),
+                home.display()
+            )
+        );
+        assert!(home.join(".local/bin").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_preserves_an_existing_writable_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let npm_bin = temp.path().join("bin");
+        let prefix = temp.path().join("writable-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::create_dir_all(&prefix).expect("prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+
+        let output = run_npm_prefix_program(&home, &home, &npm_bin, &prefix, &log);
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .expect("log should be readable")
+                .is_empty()
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!("{NPM_HOME_MARKER}{}\n", home.display())
+        );
+        assert!(prefix.join("lib/node_modules").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_prefers_writable_home_over_passwd_home() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("remapped-home");
+        let passwd_home = temp.path().join("passwd-home");
+        let npm_bin = temp.path().join("bin");
+        let blocked_prefix = temp.path().join("blocked-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&home).expect("remapped home should be created");
+        std::fs::create_dir_all(&passwd_home).expect("passwd home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::write(&blocked_prefix, "not a directory")
+            .expect("blocked prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+
+        let output = run_npm_prefix_program(&home, &passwd_home, &npm_bin, &blocked_prefix, &log);
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!(
+                "{NPM_PREFIX_MARKER}{}/.local\n{NPM_HOME_MARKER}{}\n",
+                home.display(),
+                home.display()
+            )
+        );
+        assert!(home.join(".local/bin").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_prefix_program_prefers_passwd_home_over_misleading_home() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let passwd_home = temp.path().join("passwd-home");
+        let misleading_home = temp.path().join("misleading-home");
+        let npm_bin = temp.path().join("bin");
+        let blocked_prefix = temp.path().join("blocked-prefix");
+        let log = temp.path().join("npm.log");
+        std::fs::create_dir_all(&passwd_home).expect("passwd home should be created");
+        std::fs::create_dir_all(&misleading_home).expect("misleading home should be created");
+        std::fs::create_dir_all(&npm_bin).expect("stub bin should be created");
+        std::fs::write(&blocked_prefix, "not a directory")
+            .expect("blocked prefix should be created");
+        std::fs::write(&log, "").expect("log should be created");
+        write_npm_prefix_stub(&npm_bin.join("npm"));
+        std::fs::set_permissions(&misleading_home, std::fs::Permissions::from_mode(0o555))
+            .expect("misleading home should become read-only");
+
+        let output = run_npm_prefix_program(
+            &misleading_home,
+            &passwd_home,
+            &npm_bin,
+            &blocked_prefix,
+            &log,
+        );
+        std::fs::set_permissions(&misleading_home, std::fs::Permissions::from_mode(0o755))
+            .expect("misleading home permissions should be restored");
+
+        assert!(
+            output.status.success(),
+            "program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log should be readable"),
+            format!("config set prefix {}/.local\n", passwd_home.display())
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
+            format!(
+                "{NPM_PREFIX_MARKER}{}/.local\n{NPM_HOME_MARKER}{}\n",
+                passwd_home.display(),
+                passwd_home.display()
+            )
+        );
+        assert!(passwd_home.join(".local/bin").is_dir());
     }
 
     #[tokio::test]
@@ -2691,6 +3278,278 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npm_install_env_overrides_probed_home_in_install_exec() {
+        let mut probed_env = ProbedEnv::new();
+        probed_env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        probed_env.insert("HOME".to_string(), "/root".to_string());
+        let setup = NpmPrefixSetup {
+            home: Some("/home/vscode".to_string()),
+            redirected_prefix: None,
+        };
+        let install_env = npm_install_env(Some(&probed_env), &setup);
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        npm_install_global(
+            &backend,
+            "test-container",
+            "vscode",
+            "@openai/codex",
+            "latest",
+            Some(&install_env),
+        )
+        .await
+        .expect("npm install should run");
+
+        let call = &backend.calls()[0];
+        assert_eq!(call.cmd, vec!["sh", "-c", "npm install -g @openai/codex"]);
+        assert_eq!(
+            call.env,
+            Some(vec![
+                "PATH=/opt/node/bin:/usr/bin".to_string(),
+                "HOME=/home/vscode".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_applies_redirect_to_install_but_not_verification() {
+        use cella_backend::progress::ProgressSender;
+
+        let home = "/home/vscode";
+        let prefix = "/home/vscode/.local";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(
+                0,
+                &format!("{NPM_PREFIX_MARKER}{prefix}\n{NPM_HOME_MARKER}{home}\n"),
+            )),
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // redirected binary is executable
+            Ok(ok_exit(0)), // symlink pre-check
+            Ok(ok_exit(0)), // symlink creation
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/opt/node/bin:/usr/bin".to_string());
+        env.insert("HOME".to_string(), home.to_string());
+        env.insert(
+            "NPM_CONFIG_PREFIX".to_string(),
+            "/unwritable/npm-prefix".to_string(),
+        );
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: Some(&env),
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        let calls = backend.calls();
+        let prefix_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part == ENSURE_WRITABLE_NPM_PREFIX_PROGRAM)
+            })
+            .expect("prefix setup should run");
+        let install_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part.contains("npm install -g @openai/codex"))
+            })
+            .expect("Codex install should run");
+        assert!(prefix_index < install_index);
+        let expected_env = Some(vec![
+            format!("PATH={prefix}/bin:/opt/node/bin:/usr/bin"),
+            format!("HOME={home}"),
+            format!("NPM_CONFIG_PREFIX={prefix}"),
+        ]);
+        assert_eq!(calls[install_index].env, expected_env);
+        let executable_index = calls
+            .iter()
+            .position(|call| call.cmd == vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"])
+            .expect("redirected binary should be checked");
+        let symlink_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd.iter().any(|part| {
+                    part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
+                })
+            })
+            .expect("redirected binary should be symlinked");
+        let verification_index = calls
+            .iter()
+            .position(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
+            .expect("Codex verification should run");
+        assert!(install_index < executable_index);
+        assert!(executable_index < symlink_index);
+        assert!(symlink_index < verification_index);
+        assert_eq!(
+            calls[verification_index].env,
+            Some(vec![
+                "PATH=/opt/node/bin:/usr/bin".to_string(),
+                format!("HOME={home}"),
+                "NPM_CONFIG_PREFIX=/unwritable/npm-prefix".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_does_not_invent_path_after_redirect() {
+        use cella_backend::progress::ProgressSender;
+
+        let home = "/home/vscode";
+        let prefix = "/home/vscode/.local";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(
+                0,
+                &format!("{NPM_PREFIX_MARKER}{prefix}\n{NPM_HOME_MARKER}{home}\n"),
+            )),
+            Ok(ok_exit(0)),                       // bwrap available
+            Ok(ok_exit(1)),                       // codex --version missing
+            Ok(ok_exit(0)),                       // npm install succeeds
+            Ok(ok_exit(1)),                       // redirected binary is not executable
+            Ok(ok_stdout(0, "/usr/bin/codex\n")), // foreign binary resolves
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 1);
+        let calls = backend.calls();
+        let install = calls
+            .iter()
+            .find(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part.contains("npm install -g @openai/codex"))
+            })
+            .expect("Codex install should run");
+        assert_eq!(
+            install.cmd,
+            vec!["sh", "-l", "-c", "npm install -g @openai/codex"]
+        );
+        assert_eq!(
+            install.env,
+            Some(vec![
+                format!("HOME={home}"),
+                format!("NPM_CONFIG_PREFIX={prefix}"),
+            ])
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part.contains("ln -sfn")))
+        );
+        let verification = calls
+            .iter()
+            .find(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
+            .expect("Codex verification should run");
+        assert_eq!(verification.env, None);
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_uses_resolved_home_without_redirect() {
+        use cella_backend::progress::ProgressSender;
+
+        let home = "/home/vscode";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, &format!("{NPM_HOME_MARKER}{home}\n"))),
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        let install = backend
+            .calls()
+            .into_iter()
+            .find(|call| {
+                call.cmd
+                    .iter()
+                    .any(|part| part.contains("npm install -g @openai/codex"))
+            })
+            .expect("Codex install should run");
+        assert_eq!(install.env, Some(vec![format!("HOME={home}")]));
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_continues_after_prefix_setup_nonzero_exit() {
+        use cella_backend::progress::ProgressSender;
+
+        let backend = MockBackend::new(vec![
+            Ok(fail_exit(1, "could not update npm config")),
+            Ok(ok_exit(0)), // bwrap available
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex is callable
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        assert!(backend.calls().iter().any(|call| {
+            call.cmd
+                .iter()
+                .any(|part| part.contains("npm install -g @openai/codex"))
+        }));
+    }
+
+    #[tokio::test]
     async fn install_codex_checks_bwrap_then_installs_npm_package() {
         let backend = MockBackend::new(vec![
             Ok(ok_exit(0)), // bwrap available (batch step already installed it)
@@ -2805,7 +3664,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_tool_callable_reachable_via_lc() {
-        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let backend =
+            MockBackend::new(vec![Ok(ok_stdout(0, "  /home/vscode/.local/bin/claude\n"))]);
         let outcome = verify_tool_callable(
             &backend,
             "test-container",
@@ -2815,7 +3675,10 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(outcome, VerifyOutcome::Reachable);
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Reachable("/home/vscode/.local/bin/claude".to_string())
+        );
     }
 
     #[tokio::test]
@@ -2947,6 +3810,7 @@ mod tests {
             remote_user: "vscode",
             shell: "/bin/bash",
             probed_env: None,
+            fallback_bin_dir: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
@@ -2986,6 +3850,257 @@ mod tests {
         assert!(
             !saw_completed,
             "must not render ✓ when installer exited non-zero",
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_symlinks_executable_from_fallback_bin_dir() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),                             // fallback binary is executable
+            Ok(ok_exit(0)),                             // symlink pre-check
+            Ok(ok_exit(0)),                             // symlink creation
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")), // verification succeeds
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        let calls = backend.calls();
+        assert_eq!(
+            calls[0].cmd,
+            vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"]
+        );
+        assert_eq!(calls[0].user.as_deref(), Some("vscode"));
+        assert!(calls[2].cmd.iter().any(|part| {
+            part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
+        }));
+        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_without_fallback_only_verifies() {
+        use cella_backend::progress::ProgressSender;
+
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "/opt/tools/codex\n"))]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedExec {
+                cmd: vec![
+                    "/bin/bash".to_string(),
+                    "-lc".to_string(),
+                    "command -v codex".to_string(),
+                ],
+                user: Some("vscode".to_string()),
+                env: None,
+                working_dir: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_continues_after_proactive_symlink_failure() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),                        // fallback binary is executable
+            Ok(ok_exit(0)),                        // symlink pre-check
+            Ok(fail_exit(1, "Permission denied")), // symlink creation fails
+            Ok(ok_stdout(0, "/home/vscode/.local/bin/codex\n")),
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        backend.assert_all_responses_consumed();
+        let calls = backend.calls();
+        assert!(calls[2].cmd.iter().any(|part| part.contains("ln -sfn")));
+        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_rejects_foreign_binary_after_symlink_refusal() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),
+            Ok(ok_stdout(0, "regular\n")),
+            Ok(ok_stdout(0, "/usr/bin/codex\n")),
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(!succeeded);
+        backend.assert_all_responses_consumed();
+        let failure_message = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+            if let ProgressEvent::PhaseChildFailed { message, .. } = event {
+                Some(message)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            failure_message.as_deref(),
+            Some("installed to /home/vscode/.local/bin/codex but /usr/bin/codex resolves first")
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_rejects_preexisting_usr_local_binary() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),
+            Ok(ok_stdout(0, "regular\n")),
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(!succeeded);
+        backend.assert_all_responses_consumed();
+        let failure_message = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+            if let ProgressEvent::PhaseChildFailed { message, .. } = event {
+                Some(message)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            failure_message.as_deref(),
+            Some(
+                "installed to /home/vscode/.local/bin/codex but /usr/local/bin/codex resolves first"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_does_not_symlink_non_executable_fallback() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // proactive fallback check: not executable
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_exit(1)), // -lic: not found
+            Ok(ok_exit(1)), // remedial fallback check: still not executable
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(!succeeded);
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0].cmd,
+            vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"]
+        );
+        assert_eq!(calls[0], calls[3]);
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part.contains("ln -sfn")))
+        );
+        let failure_message = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+            if let ProgressEvent::PhaseChildFailed { message, .. } = event {
+                Some(message)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            failure_message.as_deref(),
+            Some("install did not produce a reachable binary")
         );
     }
 
