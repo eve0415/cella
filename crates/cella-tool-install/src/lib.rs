@@ -1586,6 +1586,23 @@ async fn executable_by_remote_user(ctx: &InstallCtx<'_>, path: &str) -> bool {
         .is_ok_and(|result| result.exit_code == 0)
 }
 
+async fn proactively_expose_fallback_binary(ctx: &InstallCtx<'_>, binary: &str) {
+    let Some(dir) = ctx.fallback_bin_dir else {
+        return;
+    };
+    let fallback_path = format!("{dir}/{binary}");
+    if !executable_by_remote_user(ctx, &fallback_path).await {
+        return;
+    }
+
+    debug!("{binary}: exposing redirected binary at {fallback_path} before verification");
+    if let Err(error) =
+        symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &fallback_path).await
+    {
+        debug!("{binary}: could not proactively symlink {fallback_path}: {error}");
+    }
+}
+
 async fn symlink_and_reverify(
     ctx: &InstallCtx<'_>,
     binary: &str,
@@ -1652,6 +1669,10 @@ async fn verified_install_step(
     if install_result.is_none() {
         debug!("{binary}: install was idempotent, verifying reachability");
     }
+
+    // Verification cannot distinguish our redirected binary from a same-named
+    // binary already on PATH, so make ours resolve before probing the name.
+    proactively_expose_fallback_binary(ctx, binary).await;
 
     let verify = verify_tool_callable(
         ctx.client,
@@ -3254,6 +3275,9 @@ exit 1
             Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // redirected binary is executable
+            Ok(ok_exit(0)), // symlink pre-check
+            Ok(ok_exit(0)), // symlink creation
             Ok(ok_exit(0)), // codex is callable
         ]);
         let settings = cella_config::CellaConfig::default();
@@ -3304,8 +3328,27 @@ exit 1
             format!("NPM_CONFIG_PREFIX={prefix}"),
         ]);
         assert_eq!(calls[install_index].env, expected_env);
+        let executable_index = calls
+            .iter()
+            .position(|call| call.cmd == vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"])
+            .expect("redirected binary should be checked");
+        let symlink_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd.iter().any(|part| {
+                    part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
+                })
+            })
+            .expect("redirected binary should be symlinked");
+        let verification_index = calls
+            .iter()
+            .position(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
+            .expect("Codex verification should run");
+        assert!(install_index < executable_index);
+        assert!(executable_index < symlink_index);
+        assert!(symlink_index < verification_index);
         assert_eq!(
-            calls.last().expect("verification should run").env,
+            calls[verification_index].env,
             Some(vec![
                 "PATH=/opt/node/bin:/usr/bin".to_string(),
                 format!("HOME={home}"),
@@ -3328,6 +3371,7 @@ exit 1
             Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(1)), // redirected binary is not executable
             Ok(ok_exit(0)), // codex is callable
         ]);
         let settings = cella_config::CellaConfig::default();
@@ -3750,12 +3794,10 @@ exit 1
         use cella_backend::progress::{ProgressEvent, ProgressSender};
 
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // -lc: not found
-            Ok(ok_exit(1)), // -lic: not found
             Ok(ok_exit(0)), // fallback binary is executable
             Ok(ok_exit(0)), // symlink pre-check
             Ok(ok_exit(0)), // symlink creation
-            Ok(ok_exit(0)), // re-verification succeeds
+            Ok(ok_exit(0)), // verification succeeds
         ]);
         let ctx = InstallCtx {
             client: &backend,
@@ -3776,15 +3818,87 @@ exit 1
         assert!(succeeded);
         let calls = backend.calls();
         assert_eq!(
-            calls[2].cmd,
+            calls[0].cmd,
             vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"]
         );
-        assert_eq!(calls[2].user.as_deref(), Some("vscode"));
-        assert!(calls.iter().any(|call| {
-            call.cmd
-                .iter()
-                .any(|part| part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex")
+        assert_eq!(calls[0].user.as_deref(), Some("vscode"));
+        assert!(calls[2].cmd.iter().any(|part| {
+            part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
         }));
+        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_without_fallback_only_verifies() {
+        use cella_backend::progress::ProgressSender;
+
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedExec {
+                cmd: vec![
+                    "/bin/bash".to_string(),
+                    "-lc".to_string(),
+                    "command -v codex".to_string(),
+                ],
+                user: Some("vscode".to_string()),
+                env: None,
+                working_dir: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_install_step_continues_after_proactive_symlink_failure() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),                        // fallback binary is executable
+            Ok(ok_exit(0)),                        // symlink pre-check
+            Ok(fail_exit(1, "Permission denied")), // symlink creation fails
+            Ok(ok_exit(0)),                        // verification still succeeds
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: Some("/home/vscode/.local/bin"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Codex");
+
+        let succeeded = verified_install_step(&ctx, "codex", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        let calls = backend.calls();
+        assert!(calls[2].cmd.iter().any(|part| part.contains("ln -sfn")));
+        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
                 .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
@@ -3796,9 +3910,10 @@ exit 1
         use cella_backend::progress::{ProgressEvent, ProgressSender};
 
         let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // proactive fallback check: not executable
             Ok(ok_exit(1)), // -lc: not found
             Ok(ok_exit(1)), // -lic: not found
-            Ok(ok_exit(1)), // fallback binary is not executable
+            Ok(ok_exit(1)), // remedial fallback check: still not executable
         ]);
         let ctx = InstallCtx {
             client: &backend,
@@ -3818,7 +3933,12 @@ exit 1
 
         assert!(!succeeded);
         let calls = backend.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0].cmd,
+            vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"]
+        );
+        assert_eq!(calls[0], calls[3]);
         assert!(
             !calls
                 .iter()
