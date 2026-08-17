@@ -385,12 +385,14 @@ pub fn tool_shell_cmd(probed_env: Option<&ProbedEnv>, inner_cmd: &str) -> Vec<St
 
 /// Check whether npm is available on the container's PATH.
 ///
-/// Uses the probed user environment PATH (from `userEnvProbe`) to detect
-/// npm installed by devcontainer features (e.g. nvm). Falls back to a login
-/// shell when no probed env is available.
+/// Runs as the remote user because that user also runs the npm install. Uses
+/// the probed user environment PATH (from `userEnvProbe`) to detect npm
+/// installed by devcontainer features (e.g. nvm). Falls back to a login shell
+/// when no probed env is available.
 async fn npm_available_on_path(
     client: &dyn ContainerBackend,
     container_id: &str,
+    remote_user: &str,
     probed_env: Option<&ProbedEnv>,
 ) -> bool {
     client
@@ -398,7 +400,7 @@ async fn npm_available_on_path(
             container_id,
             &ExecOptions {
                 cmd: tool_shell_cmd(probed_env, "command -v npm"),
-                user: Some("root".to_string()),
+                user: Some(remote_user.to_string()),
                 env: tool_exec_env(probed_env),
                 working_dir: None,
             },
@@ -1620,8 +1622,15 @@ pub async fn install_tools(
     let has = |t: ToolName| tools.contains(&t);
     let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
 
-    let (is_alpine, node_available) =
-        install_system_packages(client, container_id, probed_env, tools, needs_npm).await;
+    let (is_alpine, node_available) = install_system_packages(
+        client,
+        container_id,
+        remote_user,
+        probed_env,
+        tools,
+        needs_npm,
+    )
+    .await;
 
     let ctx = InstallCtx {
         client,
@@ -1675,6 +1684,7 @@ pub async fn install_tools(
 async fn install_system_packages(
     client: &dyn ContainerBackend,
     container_id: &str,
+    remote_user: &str,
     probed_env: Option<&ProbedEnv>,
     tools: &[ToolName],
     needs_npm: bool,
@@ -1683,7 +1693,7 @@ async fn install_system_packages(
     let is_alpine = pkg_mgr.is_some_and(PackageManager::is_alpine);
 
     let npm_was_missing =
-        needs_npm && !npm_available_on_path(client, container_id, probed_env).await;
+        needs_npm && !npm_available_on_path(client, container_id, remote_user, probed_env).await;
 
     if let Some(mgr) = pkg_mgr {
         let mut needed: Vec<&pkg::PackageSpec> = Vec::new();
@@ -1712,7 +1722,7 @@ async fn install_system_packages(
 
     let node_available = needs_npm
         && if npm_was_missing {
-            npm_available_on_path(client, container_id, probed_env).await
+            npm_available_on_path(client, container_id, remote_user, probed_env).await
         } else {
             true
         };
@@ -2482,11 +2492,12 @@ mod tests {
         );
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
 
-        assert!(npm_available_on_path(&backend, "test-container", Some(&env)).await);
+        assert!(npm_available_on_path(&backend, "test-container", "vscode", Some(&env)).await);
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].cmd, vec!["sh", "-c", "command -v npm"]);
+        assert_eq!(calls[0].user, Some("vscode".to_string()));
         assert_eq!(
             calls[0].env,
             Some(vec!["PATH=/home/vscode/.npm/bin:/usr/bin".to_string()])
@@ -2496,7 +2507,7 @@ mod tests {
     #[tokio::test]
     async fn npm_available_on_path_returns_false_when_missing() {
         let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
-        assert!(!npm_available_on_path(&backend, "test-container", None).await);
+        assert!(!npm_available_on_path(&backend, "test-container", "vscode", None).await);
     }
 
     #[tokio::test]
