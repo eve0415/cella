@@ -2797,7 +2797,7 @@ exit 1
         );
         assert_eq!(
             String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
-            format!("cella-npm-prefix={}/.local\n", home.display())
+            format!("{NPM_PREFIX_MARKER}{}/.local\n", home.display())
         );
         assert!(home.join(".local/bin").is_dir());
     }
@@ -2872,7 +2872,7 @@ exit 1
         );
         assert_eq!(
             String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
-            format!("cella-npm-prefix={}/.local\n", passwd_home.display())
+            format!("{NPM_PREFIX_MARKER}{}/.local\n", passwd_home.display())
         );
         assert!(passwd_home.join(".local/bin").is_dir());
     }
