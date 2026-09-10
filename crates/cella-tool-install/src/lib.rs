@@ -837,9 +837,7 @@ pub async fn check_codex_sandbox(
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Checks if Codex is already installed before running
-/// `npm install -g @openai/codex`.  Caller must ensure Node.js/npm are available
-/// and the global prefix is writable by the remote user before calling this.
+/// Checks if Codex is already installed before running `npm install -g @openai/codex`.  Caller must ensure Node.js/npm are available and the global prefix is writable by the remote user before calling this.
 ///
 /// The sandbox probe is not run here.  It needs a `codex` that the remote user's login shell can actually reach, and on a redirected npm prefix that only becomes true once `verified_install_step` has symlinked the binary into `/usr/local/bin`, so the caller probes after that step instead.
 ///
@@ -3056,8 +3054,7 @@ exit 1
 
     #[tokio::test]
     async fn check_codex_sandbox_reports_degraded_on_nonzero_exit() {
-        // The sandbox exits 1 when bubblewrap cannot mount a fresh procfs, which
-        // is the state the warning tells the user how to fix.
+        // The sandbox exits 1 when bubblewrap cannot mount a fresh procfs, which is the state the warning tells the user how to fix.
         let backend = MockBackend::new(vec![Ok(fail_exit(
             1,
             "bwrap: Can't mount proc on /proc: Operation not permitted",
