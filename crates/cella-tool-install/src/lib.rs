@@ -759,13 +759,13 @@ async fn bubblewrap_is_usable(
         Ok(result) if result.exit_code == 0 => true,
         Ok(result) if result.exit_code == SHELL_COMMAND_NOT_FOUND => {
             debug!(
-                "Skipping the bubblewrap install: unshare is not available to tell whether this container can mount a procfs in a user namespace. Codex will use its built-in sandbox."
+                "Skipping the bubblewrap install: unshare is not available to tell whether this container can mount a procfs in a user namespace. Codex will use the `bwrap` it bundles."
             );
             false
         }
         _ => {
             debug!(
-                "Skipping the bubblewrap install: this container cannot mount a procfs in a user namespace, so bubblewrap would not run. Codex will use its built-in sandbox."
+                "Skipping the bubblewrap install: this container cannot mount a procfs in a user namespace, so bubblewrap would not run. Codex will use the `bwrap` it bundles."
             );
             false
         }
