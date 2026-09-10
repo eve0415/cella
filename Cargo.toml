@@ -147,7 +147,6 @@ jsonc-parser = { version = "=0.33.1", features = ["cst"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls = { version = "=0.23.44", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-native-certs = "=0.8.4"
-rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.5"
 tokio-stream = "=0.1.19"
 

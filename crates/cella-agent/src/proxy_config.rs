@@ -4,13 +4,13 @@
 //! and builds the rule matcher for request evaluation.
 
 use std::collections::HashSet;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 use cella_network::rules::RuleMatcher;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 /// A credential-protected domain route.
 #[derive(Debug, Clone)]
@@ -97,10 +97,10 @@ impl AgentProxyConfig {
         // Open log file.
         let log_file = open_log_file(raw.log_path.as_deref());
 
-        let ca_cert_der = raw.ca_cert_pem.as_deref().and_then(|pem| {
-            let mut reader = BufReader::new(pem.as_bytes());
-            rustls_pemfile::certs(&mut reader).find_map(Result::ok)
-        });
+        let ca_cert_der = raw
+            .ca_cert_pem
+            .as_deref()
+            .and_then(|pem| CertificateDer::pem_slice_iter(pem.as_bytes()).find_map(Result::ok));
 
         let credential_routes = raw
             .credential_routes
