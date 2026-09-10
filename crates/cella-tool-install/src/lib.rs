@@ -705,37 +705,57 @@ pub async fn npm_install_global(
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
-/// Check if bubblewrap is available after the batch package install step.
-pub async fn check_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
-    let available = client
+/// Smallest sandboxed command that still exercises the full sandbox setup.
+const CODEX_SANDBOX_PROBE: &str = "codex sandbox -- /bin/true";
+
+/// Probe the sandbox Codex actually uses, warning when it comes up degraded.
+///
+/// `codex sandbox -- /bin/true` exits non-zero when bubblewrap cannot set up the
+/// sandbox, which is the normal outcome in a container whose `/proc` still
+/// carries Docker's default masked and read-only mounts.  Probing the real thing
+/// rather than a `bwrap` binary on PATH avoids both failure modes of a presence
+/// check: a `bwrap` that exists but cannot run, and a working sandbox driven by
+/// the copy Codex vendors alongside its own binary.
+///
+/// Runs as the remote user, since that is who will run Codex.  Requires Codex to
+/// be installed, so callers must invoke this after the install step.
+pub async fn check_codex_sandbox(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    probed_env: Option<&ProbedEnv>,
+) -> bool {
+    let healthy = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "command -v bwrap".to_string(),
-                ],
-                user: Some("root".to_string()),
-                env: None,
+                cmd: tool_shell_cmd(probed_env, CODEX_SANDBOX_PROBE),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
         .await
         .is_ok_and(|r| r.exit_code == 0);
 
-    if !available {
-        warn!("bubblewrap not available after package installation");
+    if !healthy {
+        warn!(
+            r#"Codex sandbox is degraded in this container; add "securityOpt": ["systempaths=unconfined"] to devcontainer.json to enable it."#
+        );
     }
-    available
+    healthy
 }
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Checks bubblewrap availability for sandbox support, then checks if
-/// Codex is already installed before running `npm install -g @openai/codex`.
-/// Caller must ensure Node.js/npm are available and the global prefix is
-/// writable by the remote user before calling this.
+/// Checks if Codex is already installed before running
+/// `npm install -g @openai/codex`.  Caller must ensure Node.js/npm are available
+/// and the global prefix is writable by the remote user before calling this.
+///
+/// Whenever Codex ends up present — freshly installed or already there — the
+/// sandbox is probed and a degraded one warned about.  That warning describes
+/// the container rather than the install, so it is worth emitting on every run
+/// and not only on the run that installed Codex.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Codex is already present at the requested version.
@@ -748,9 +768,7 @@ pub async fn install_codex(
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) -> Option<ExecResult> {
-    check_codex_sandbox_deps(client, container_id).await;
-
-    if is_npm_tool_installed(
+    let already_installed = is_npm_tool_installed(
         client,
         container_id,
         remote_user,
@@ -758,28 +776,34 @@ pub async fn install_codex(
         &settings.version,
         probed_env,
     )
-    .await
-    {
-        return None;
-    }
+    .await;
 
-    debug!("Installing Codex ({})...", settings.version);
-    Some(
-        npm_install_global(
-            client,
-            container_id,
-            remote_user,
-            "@openai/codex",
-            &settings.version,
-            probed_env,
+    let outcome = if already_installed {
+        None
+    } else {
+        debug!("Installing Codex ({})...", settings.version);
+        Some(
+            npm_install_global(
+                client,
+                container_id,
+                remote_user,
+                "@openai/codex",
+                &settings.version,
+                probed_env,
+            )
+            .await
+            .unwrap_or_else(|e| ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }),
         )
-        .await
-        .unwrap_or_else(|e| ExecResult {
-            exit_code: -1,
-            stdout: String::new(),
-            stderr: e.to_string(),
-        }),
-    )
+    };
+
+    if outcome.as_ref().is_none_or(|r| r.exit_code == 0) {
+        check_codex_sandbox(client, container_id, remote_user, probed_env).await;
+    }
+    outcome
 }
 
 // ── Gemini ───────────────────────────────────────────────────────────────────
@@ -2433,7 +2457,7 @@ mod tests {
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
     }
 
-    // ── MockBackend for check_codex_sandbox_deps tests ─────────────────────
+    // ── MockBackend for exec-driven tests ──────────────────────────────────
 
     use std::collections::VecDeque;
     use std::io::Write;
@@ -2738,7 +2762,7 @@ mod tests {
         }
     }
 
-    // ── check_codex_sandbox_deps ─────────────────────────────────────────
+    // ── check_codex_sandbox ──────────────────────────────────────────────
 
     #[cfg(unix)]
     fn test_process_is_root() -> bool {
@@ -2815,15 +2839,44 @@ exit 1
     }
 
     #[tokio::test]
-    async fn check_codex_sandbox_deps_bwrap_available() {
+    async fn check_codex_sandbox_runs_probe_as_remote_user() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/home/vscode/.local/bin".to_string());
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
-        assert!(check_codex_sandbox_deps(&backend, "test-container").await);
+
+        assert!(check_codex_sandbox(&backend, "test-container", "vscode", Some(&env)).await);
+
+        let call = &backend.calls()[0];
+        assert_eq!(call.cmd, vec!["sh", "-c", "codex sandbox -- /bin/true"]);
+        assert_eq!(call.user, Some("vscode".to_string()));
+        assert_eq!(
+            call.env,
+            Some(vec!["PATH=/home/vscode/.local/bin".to_string()])
+        );
     }
 
     #[tokio::test]
-    async fn check_codex_sandbox_deps_bwrap_missing() {
-        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
-        assert!(!check_codex_sandbox_deps(&backend, "test-container").await);
+    async fn check_codex_sandbox_reports_degraded_on_nonzero_exit() {
+        // The sandbox exits 1 when bubblewrap cannot mount a fresh procfs, which
+        // is the state the warning tells the user how to fix.
+        let backend = MockBackend::new(vec![Ok(fail_exit(
+            1,
+            "bwrap: Can't mount proc on /proc: Operation not permitted",
+        ))]);
+
+        assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
+        assert_eq!(
+            backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", "codex sandbox -- /bin/true"]
+        );
+    }
+
+    #[tokio::test]
+    async fn check_codex_sandbox_reports_degraded_when_probe_cannot_run() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContainerNotFound {
+            identifier: "test-container".to_string(),
+        })]);
+        assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
     }
 
     // ── npm_available_on_path ──────────────────────────────────────────────
@@ -3322,9 +3375,9 @@ exit 1
                 0,
                 &format!("{NPM_PREFIX_MARKER}{prefix}\n{NPM_HOME_MARKER}{home}\n"),
             )),
-            Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_exit(0)), // redirected binary is executable
             Ok(ok_exit(0)), // symlink pre-check
             Ok(ok_exit(0)), // symlink creation
@@ -3378,6 +3431,15 @@ exit 1
             format!("NPM_CONFIG_PREFIX={prefix}"),
         ]);
         assert_eq!(calls[install_index].env, expected_env);
+        let probe_index = calls
+            .iter()
+            .position(|call| call.cmd.iter().any(|part| part == CODEX_SANDBOX_PROBE))
+            .expect("Codex sandbox probe should run");
+        // The probe must see the redirected prefix so it finds the Codex that was
+        // just installed, and must run as the user who will run Codex.
+        assert!(install_index < probe_index);
+        assert_eq!(calls[probe_index].env, expected_env);
+        assert_eq!(calls[probe_index].user, Some("vscode".to_string()));
         let executable_index = calls
             .iter()
             .position(|call| call.cmd == vec!["sh", "-c", "[ -x '/home/vscode/.local/bin/codex' ]"])
@@ -3418,9 +3480,9 @@ exit 1
                 0,
                 &format!("{NPM_PREFIX_MARKER}{prefix}\n{NPM_HOME_MARKER}{home}\n"),
             )),
-            Ok(ok_exit(0)),                       // bwrap available
             Ok(ok_exit(1)),                       // codex --version missing
             Ok(ok_exit(0)),                       // npm install succeeds
+            Ok(ok_exit(0)),                       // codex sandbox probe is healthy
             Ok(ok_exit(1)),                       // redirected binary is not executable
             Ok(ok_stdout(0, "/usr/bin/codex\n")), // foreign binary resolves
         ]);
@@ -3480,9 +3542,9 @@ exit 1
         let home = "/home/vscode";
         let backend = MockBackend::new(vec![
             Ok(ok_stdout(0, &format!("{NPM_HOME_MARKER}{home}\n"))),
-            Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
         ]);
         let settings = cella_config::CellaConfig::default();
@@ -3520,9 +3582,9 @@ exit 1
 
         let backend = MockBackend::new(vec![
             Ok(fail_exit(1, "could not update npm config")),
-            Ok(ok_exit(0)), // bwrap available
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_exit(0)), // codex is callable
         ]);
         let settings = cella_config::CellaConfig::default();
@@ -3549,45 +3611,110 @@ exit 1
         }));
     }
 
-    #[tokio::test]
-    async fn install_codex_checks_bwrap_then_installs_npm_package() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // bwrap available (batch step already installed it)
-            Ok(ok_exit(1)), // codex --version missing
-            Ok(ok_exit(0)), // npm install succeeds
-        ]);
-        let settings = cella_config::settings::Codex {
+    fn codex_settings() -> cella_config::settings::Codex {
+        cella_config::settings::Codex {
             version: "0.42.0".to_string(),
             forward_config: false,
-        };
+        }
+    }
 
-        let result = install_codex(&backend, "test-container", "vscode", &settings, None)
-            .await
-            .expect("npm should run");
+    #[tokio::test]
+    async fn install_codex_installs_npm_package_then_probes_sandbox() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
+        ]);
+
+        let result = install_codex(
+            &backend,
+            "test-container",
+            "vscode",
+            &codex_settings(),
+            None,
+        )
+        .await
+        .expect("npm should run");
 
         assert_eq!(result.exit_code, 0);
         let calls = backend.calls();
         assert_eq!(
-            calls[2].cmd,
+            calls[1].cmd,
             vec!["sh", "-l", "-c", "npm install -g @openai/codex@0.42.0"]
         );
+        assert_eq!(calls[2].cmd, vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]);
+        backend.assert_all_responses_consumed();
+    }
+
+    #[tokio::test]
+    async fn install_codex_still_returns_npm_result_when_sandbox_is_degraded() {
+        // A degraded sandbox is a warning about the container, not an install
+        // failure — Codex is installed and usable either way.
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(fail_exit(
+                1,
+                "bwrap: Can't mount proc on /proc: Operation not permitted",
+            )),
+        ]);
+
+        let result = install_codex(
+            &backend,
+            "test-container",
+            "vscode",
+            &codex_settings(),
+            None,
+        )
+        .await
+        .expect("npm should run");
+
+        assert_eq!(result.exit_code, 0);
+        backend.assert_all_responses_consumed();
+    }
+
+    #[tokio::test]
+    async fn install_codex_skips_sandbox_probe_when_npm_install_fails() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)),                           // codex --version missing
+            Ok(fail_exit(1, "npm ERR! code EACCES")), // npm install fails
+        ]);
+
+        let result = install_codex(
+            &backend,
+            "test-container",
+            "vscode",
+            &codex_settings(),
+            None,
+        )
+        .await
+        .expect("npm should run");
+
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(backend.calls().len(), 2);
+        backend.assert_all_responses_consumed();
     }
 
     #[tokio::test]
     async fn install_codex_short_circuits_when_requested_version_exists() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // bwrap available
             Ok(ok_stdout(0, "codex 0.42.0\n")),
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
-        let settings = cella_config::settings::Codex {
-            version: "0.42.0".to_string(),
-            forward_config: false,
-        };
 
-        let result = install_codex(&backend, "test-container", "vscode", &settings, None).await;
+        let result = install_codex(
+            &backend,
+            "test-container",
+            "vscode",
+            &codex_settings(),
+            None,
+        )
+        .await;
 
         assert!(result.is_none());
-        assert_eq!(backend.calls().len(), 2);
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].cmd, vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]);
     }
 
     #[tokio::test]
