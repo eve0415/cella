@@ -119,7 +119,10 @@ dirs = "=7.0.0"
 # Compression
 # zlib-rs backend: pure Rust (no C toolchain), ~1.26x faster inflate than the
 # default miniz_oxide on realistic payloads. See benches/extract.rs.
-flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+# runtime_detection carries zlib-rs/std, which gates every SIMD dispatch in
+# zlib-rs cpu_features.rs; flate2 ships it in `default` only, so omitting it
+# alongside default-features = false silently drops back to scalar inflate.
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 
 # OCI registry
 # Renamed successor of oci-distribution (oras-project/rust-oci-client).
