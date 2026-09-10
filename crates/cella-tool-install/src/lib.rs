@@ -715,6 +715,59 @@ const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" c
 /// Exit status a POSIX shell reports when it could not find the command.
 const SHELL_COMMAND_NOT_FOUND: i64 = 127;
 
+/// Smallest command that fails where the sandbox argv Codex builds would.
+///
+/// `unshare` ships with util-linux rather than with bubblewrap, so this can be asked before deciding whether to install bubblewrap at all.
+/// Codex runs `bwrap` with `--unshare-pid --proc /proc`, and `--pid --fork --mount-proc` is the same request.
+/// `--mount-proc` is the part Docker's default masked and read-only `/proc` refuses; without it the command succeeds even here, so it is what makes the probe discriminate.
+/// Note that this is narrower than "bubblewrap works": a `bwrap` that does not ask for a new PID namespace runs fine in a container this probe rejects.
+const USERNS_PROCFS_PROBE: &str = "unshare --user --map-root-user --pid --fork --mount-proc true";
+
+/// Decide whether bubblewrap is worth installing in this container.
+///
+/// Codex ships its own `bwrap` but prefers any `bwrap` it finds on `PATH`, so a system package does not add a sandbox — it substitutes a different binary into one Codex would have run anyway.
+/// That substitution is only safe where the procfs mount succeeds outright.  Where it does not, Codex depends on its own retry that drops `--proc`, and that retry is keyed to the wording its bundled build emits, so a distro `bwrap` fails for real instead.
+///
+/// Only an exit 0 is a yes.  A missing `unshare` and any other failure both leave the verdict unknown, and skipping is the safe answer either way, since Codex is not left without a sandbox by the skip.
+///
+/// This gate only governs what cella installs.  It cannot help where the image already ships bubblewrap, which the `common-utils` dev container Feature does on every base image that includes it.
+///
+/// Runs as the remote user, since that is who will run Codex and therefore bubblewrap.
+async fn bubblewrap_is_usable(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    probed_env: Option<&ProbedEnv>,
+) -> bool {
+    let probe = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, USERNS_PROCFS_PROBE),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match probe {
+        Ok(result) if result.exit_code == 0 => true,
+        Ok(result) if result.exit_code == SHELL_COMMAND_NOT_FOUND => {
+            debug!(
+                "Skipping the bubblewrap install: unshare is not available to tell whether this container can mount a procfs in a user namespace. Codex will use its built-in sandbox."
+            );
+            false
+        }
+        _ => {
+            debug!(
+                "Skipping the bubblewrap install: this container cannot mount a procfs in a user namespace, so bubblewrap would not run. Codex will use its built-in sandbox."
+            );
+            false
+        }
+    }
+}
+
 /// What the sandbox probe's exit status says about the container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SandboxProbe {
@@ -1963,7 +2016,9 @@ async fn install_system_packages(
         if tools.contains(&ToolName::Tmux) {
             needed.push(&pkg::TMUX);
         }
-        if tools.contains(&ToolName::Codex) {
+        if tools.contains(&ToolName::Codex)
+            && bubblewrap_is_usable(client, container_id, remote_user, probed_env).await
+        {
             needed.push(&pkg::BUBBLEWRAP);
         }
         if tools.contains(&ToolName::ClaudeCode) && is_alpine {
@@ -2800,6 +2855,112 @@ mod tests {
             stdout: String::new(),
             stderr: stderr.to_string(),
         }
+    }
+
+    // ── bubblewrap_is_usable ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bubblewrap_is_usable_when_a_user_namespace_can_mount_procfs() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+
+        assert!(bubblewrap_is_usable(&backend, "test-container", "vscode", Some(&env)).await);
+        let call = &backend.calls()[0];
+        assert_eq!(call.cmd, vec!["sh", "-c", USERNS_PROCFS_PROBE]);
+        assert_eq!(call.user, Some("vscode".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bubblewrap_is_not_usable_when_the_procfs_mount_is_refused() {
+        // This is the container shape that breaks Codex: a distro bwrap would override the one Codex bundles and then fail to start.
+        let backend = MockBackend::new(vec![Ok(fail_exit(
+            1,
+            "unshare: mount /proc failed: Operation not permitted",
+        ))]);
+
+        assert!(!bubblewrap_is_usable(&backend, "test-container", "vscode", None).await);
+        assert_eq!(
+            backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", USERNS_PROCFS_PROBE]
+        );
+    }
+
+    #[tokio::test]
+    async fn bubblewrap_is_not_usable_when_unshare_is_missing() {
+        let backend = MockBackend::new(vec![Ok(fail_exit(127, "unshare: not found"))]);
+
+        assert!(!bubblewrap_is_usable(&backend, "test-container", "vscode", None).await);
+    }
+
+    #[tokio::test]
+    async fn bubblewrap_is_not_usable_when_the_probe_cannot_run() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContainerNotFound {
+            identifier: "test-container".to_string(),
+        })]);
+
+        assert!(!bubblewrap_is_usable(&backend, "test-container", "vscode", None).await);
+    }
+
+    // ── install_system_packages: conditional bubblewrap ────────────────────
+
+    #[tokio::test]
+    async fn install_system_packages_installs_bubblewrap_where_it_would_work() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // which apt-get
+            Ok(ok_exit(0)), // user namespace can mount a procfs
+            Ok(ok_exit(1)), // bwrap not present yet
+            Ok(ok_exit(0)), // package install succeeds
+        ]);
+
+        install_system_packages(
+            &backend,
+            "test-container",
+            "vscode",
+            None,
+            &[ToolName::Codex],
+            false,
+        )
+        .await;
+
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part.contains("bubblewrap"))),
+            "bubblewrap should be installed where the container can run it"
+        );
+        backend.assert_all_responses_consumed();
+    }
+
+    #[tokio::test]
+    async fn install_system_packages_skips_bubblewrap_where_it_would_break_codex() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // which apt-get
+            Ok(fail_exit(
+                1,
+                "unshare: mount /proc failed: Operation not permitted",
+            )),
+        ]);
+
+        install_system_packages(
+            &backend,
+            "test-container",
+            "vscode",
+            None,
+            &[ToolName::Codex],
+            false,
+        )
+        .await;
+
+        let calls = backend.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part.contains("bubblewrap"))),
+            "bubblewrap must not be installed where it cannot run"
+        );
+        backend.assert_all_responses_consumed();
     }
 
     // ── check_codex_sandbox ──────────────────────────────────────────────
