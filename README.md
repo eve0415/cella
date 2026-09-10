@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/eve0415/cella/main/install.sh | sh
 
 ### From source
 
-Requires a [Rust toolchain](https://rustup.rs/) (1.97+).
+Requires a [Rust toolchain](https://rustup.rs/) (1.98+).
 
 ```sh
 cargo install --git https://github.com/eve0415/cella cella-cli

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rust workspace (edition 2024, MSRV 1.97.1). Crates live in `crates/`.
+Rust workspace (edition 2024, MSRV 1.98.1). Crates live in `crates/`.
 
 ## Gates — run before declaring any change complete
 
