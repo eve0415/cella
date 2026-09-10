@@ -712,6 +712,32 @@ pub async fn npm_install_global(
 /// The probe's own exit status is what propagates; the cleanup's is discarded.
 const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" codex sandbox -- /bin/true; s=$?; rm -rf "$d"; exit $s"#;
 
+/// Exit status a POSIX shell reports when it could not find the command.
+const SHELL_COMMAND_NOT_FOUND: i64 = 127;
+
+/// What the sandbox probe's exit status says about the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxProbe {
+    /// The sandbox set itself up, so Codex can use it.
+    Healthy,
+    /// The shell never found `codex`, so nothing was probed.
+    BinaryMissing,
+    /// Codex is there but the sandbox could not set itself up.
+    Degraded,
+}
+
+/// Read the probe's outcome off its exit status.
+///
+/// A 127 says the shell never found `codex` at all, which is a PATH or install problem rather than a sandbox one, so it has to stay distinguishable from a sandbox that really is degraded.
+/// An exec that could not run at all is reported as degraded, matching the conservative reading the caller had before this split.
+const fn classify_sandbox_probe(probe: Result<&ExecResult, &BackendError>) -> SandboxProbe {
+    match probe {
+        Ok(result) if result.exit_code == 0 => SandboxProbe::Healthy,
+        Ok(result) if result.exit_code == SHELL_COMMAND_NOT_FOUND => SandboxProbe::BinaryMissing,
+        _ => SandboxProbe::Degraded,
+    }
+}
+
 /// Probe the sandbox Codex actually uses, warning when it comes up degraded.
 ///
 /// `codex sandbox -- /bin/true` exits non-zero when bubblewrap cannot set up the
@@ -721,6 +747,8 @@ const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" c
 /// check: a `bwrap` that exists but cannot run, and a working sandbox driven by
 /// the copy Codex vendors alongside its own binary.
 ///
+/// A missing `codex` binary gets its own warning without the `securityOpt` remedy, which would send the reader down a dead end.
+///
 /// Runs as the remote user, since that is who will run Codex.  Requires Codex to
 /// be installed, so callers must invoke this after the install step.
 pub async fn check_codex_sandbox(
@@ -729,7 +757,7 @@ pub async fn check_codex_sandbox(
     remote_user: &str,
     probed_env: Option<&ProbedEnv>,
 ) -> bool {
-    let healthy = client
+    let probe = client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -739,15 +767,21 @@ pub async fn check_codex_sandbox(
                 working_dir: None,
             },
         )
-        .await
-        .is_ok_and(|r| r.exit_code == 0);
+        .await;
 
-    if !healthy {
-        warn!(
-            r#"Codex sandbox is degraded in this container; add "securityOpt": ["systempaths=unconfined"] to devcontainer.json to enable it."#
-        );
+    match classify_sandbox_probe(probe.as_ref()) {
+        SandboxProbe::Healthy => true,
+        SandboxProbe::BinaryMissing => {
+            warn!("Could not probe the Codex sandbox: the codex binary was not found on PATH.");
+            false
+        }
+        SandboxProbe::Degraded => {
+            warn!(
+                r#"Codex sandbox is degraded in this container; add "securityOpt": ["systempaths=unconfined"] to devcontainer.json to enable it."#
+            );
+            false
+        }
     }
-    healthy
 }
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
@@ -2881,6 +2915,52 @@ exit 1
             identifier: "test-container".to_string(),
         })]);
         assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
+    }
+
+    #[test]
+    fn classify_sandbox_probe_separates_a_missing_binary_from_a_degraded_sandbox() {
+        // 127 is the shell failing to find codex, where the securityOpt remedy would be a dead end.
+        let healthy = ok_exit(0);
+        let missing = fail_exit(127, "sh: codex: not found");
+        let degraded = fail_exit(
+            1,
+            "bwrap: Can't mount proc on /proc: Operation not permitted",
+        );
+        let unreachable = BackendError::ContainerNotFound {
+            identifier: "test-container".to_string(),
+        };
+
+        assert_eq!(
+            classify_sandbox_probe(Ok(&healthy)),
+            SandboxProbe::Healthy,
+            "exit 0"
+        );
+        assert_eq!(
+            classify_sandbox_probe(Ok(&missing)),
+            SandboxProbe::BinaryMissing,
+            "exit 127"
+        );
+        assert_eq!(
+            classify_sandbox_probe(Ok(&degraded)),
+            SandboxProbe::Degraded,
+            "exit 1"
+        );
+        assert_eq!(
+            classify_sandbox_probe(Err(&unreachable)),
+            SandboxProbe::Degraded,
+            "exec could not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_codex_sandbox_reports_a_missing_binary_rather_than_a_degraded_sandbox() {
+        let backend = MockBackend::new(vec![Ok(fail_exit(127, "sh: codex: not found"))]);
+
+        assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
+        assert_eq!(
+            backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]
+        );
     }
 
     /// cella bind-mounts the host's `~/.codex` into the container, so a probe against the default `CODEX_HOME` would write Codex's helper binaries onto the user's host machine on every `cella up`.
