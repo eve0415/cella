@@ -705,10 +705,11 @@ pub async fn npm_install_global(
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
-/// Smallest sandboxed command that still exercises the full sandbox setup.
+/// Smallest sandboxed command that tells whether the sandbox backend can start.
 ///
 /// Codex materializes helper binaries under `$CODEX_HOME` the moment it runs, and `tools.codex.forward_config` bind-mounts the host's `~/.codex` into the container, so a probe run against the default home would write into the user's host machine on every `cella up`.
-/// Pointing `CODEX_HOME` at a throwaway directory for this one exec keeps the probe's residue off both the host and the container while still exercising the same sandbox setup.
+/// Pointing `CODEX_HOME` at a throwaway directory for this one exec keeps the probe's residue off both the host and the container.
+/// That is not the same run a real session gets — Codex skips materializing those helpers under a temp home — so what the exit status reports is narrower: whether the sandbox backend came up at all.
 /// The probe's own exit status is what propagates; the cleanup's is discarded.
 const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" codex sandbox -- /bin/true; s=$?; rm -rf "$d"; exit $s"#;
 
@@ -791,19 +792,16 @@ const fn classify_sandbox_probe(probe: Result<&ExecResult, &BackendError>) -> Sa
     }
 }
 
-/// Probe the sandbox Codex actually uses, warning when it comes up degraded.
+/// Probe the sandbox Codex actually uses, warning when it does not come up.
 ///
-/// `codex sandbox -- /bin/true` exits non-zero when bubblewrap cannot set up the
-/// sandbox, which is the normal outcome in a container whose `/proc` still
-/// carries Docker's default masked and read-only mounts.  Probing the real thing
-/// rather than a `bwrap` binary on PATH avoids both failure modes of a presence
-/// check: a `bwrap` that exists but cannot run, and a working sandbox driven by
-/// the copy Codex vendors alongside its own binary.
+/// `bubblewrap_is_usable` only governs cella's own package batch, so this is what catches a `bwrap` that reached `PATH` by another route — most often the `common-utils` Feature baked into the base image.
+/// Such a binary overrides the one Codex bundles, which is why a container can fail here even though cella installed nothing.
 ///
-/// A missing `codex` binary gets its own warning without the `securityOpt` remedy, which would send the reader down a dead end.
+/// Probing the real thing rather than a `bwrap` binary on `PATH` avoids both failure modes of a presence check: a `bwrap` that exists but cannot run, and a working sandbox driven by the copy Codex vendors alongside its own binary.
+/// A missing `codex` binary is a PATH or install problem rather than a sandbox one, so it gets its own message.
 ///
-/// Runs as the remote user, since that is who will run Codex.  Requires Codex to
-/// be installed, so callers must invoke this after the install step.
+/// Runs as the remote user, since that is who will run Codex.
+/// Requires Codex to be installed, so callers must invoke this after the install step.
 pub async fn check_codex_sandbox(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -830,7 +828,7 @@ pub async fn check_codex_sandbox(
         }
         SandboxProbe::Degraded => {
             warn!(
-                r#"Codex sandbox is degraded in this container; adding "securityOpt": ["systempaths=unconfined"] to devcontainer.json enables it by removing Docker's masked and read-only /proc and /sys paths, which relaxes container isolation."#
+                "The Codex sandbox did not start in this container; a bwrap on PATH may be overriding the one Codex bundles. Reproduce with: codex sandbox -- /bin/true"
             );
             false
         }
