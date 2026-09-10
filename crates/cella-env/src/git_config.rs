@@ -9,15 +9,20 @@ pub struct GitConfigEntry {
     pub value: String,
 }
 
+/// Arguments used to list the host's global git config.
+///
+/// `--includes` is required because git turns include-following off by
+/// default when a specific config file is selected with `--global`.
+/// Without it, keys set in a file pulled in via `include.path` are invisible.
+const LIST_ARGS: [&str; 5] = ["config", "--global", "--includes", "--list", "--null"];
+
 /// Read host git config and return the safe subset for container injection.
 ///
-/// Invokes `git config --global --list --null` on the host and filters
-/// through an allowlist of safe keys. Returns empty vec if git is not
-/// installed or has no global config.
+/// Invokes `git config --global --includes --list --null` on the host and
+/// filters through an allowlist of safe keys.
+/// Returns empty vec if git is not installed or has no global config.
 pub fn read_host_git_config() -> Vec<GitConfigEntry> {
-    let output = std::process::Command::new("git")
-        .args(["config", "--global", "--list", "--null"])
-        .output();
+    let output = std::process::Command::new("git").args(LIST_ARGS).output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -162,6 +167,38 @@ fn is_blocked_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn list_args_follow_include_directives() {
+        let tmp = TempDir::new().unwrap();
+        let included = tmp.path().join("included");
+        std::fs::write(&included, "[user]\n\tname = Included Name\n").unwrap();
+        let global = tmp.path().join("global");
+        std::fs::write(
+            &global,
+            format!("[include]\n\tpath = {}\n", included.display()),
+        )
+        .unwrap();
+
+        // Skips when git is unavailable, like the rest of the host-git tests.
+        let Ok(output) = std::process::Command::new("git")
+            .args(LIST_ARGS)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+        else {
+            return;
+        };
+        assert!(output.status.success(), "git config --list should succeed");
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let safe = filter_safe_config(&parse_null_delimited_config(&raw));
+        assert!(
+            safe.iter()
+                .any(|e| e.key == "user.name" && e.value == "Included Name"),
+            "a key set in an included file must be forwarded"
+        );
+    }
 
     #[test]
     fn safe_keys_allowed() {

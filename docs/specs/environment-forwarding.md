@@ -183,7 +183,7 @@ When all strategies are exhausted, cella logs a runtime-specific warning with ac
 
 ### Git Config Forwarding
 
-Host git global configuration is read via `git config --global --list --null` and filtered through a safe allowlist before injection into the container. Forwarded entries are applied as `git config --global` commands during Phase 2.
+Host git global configuration is read via `git config --global --includes --list --null` and filtered through a safe allowlist before injection into the container. Forwarded entries are applied as `git config --global` commands during Phase 2.
 
 **Allowlisted keys (exact match):**
 
