@@ -706,7 +706,11 @@ pub async fn npm_install_global(
 // ── Codex ────────────────────────────────────────────────────────────────────
 
 /// Smallest sandboxed command that still exercises the full sandbox setup.
-const CODEX_SANDBOX_PROBE: &str = "codex sandbox -- /bin/true";
+///
+/// Codex materializes helper binaries under `$CODEX_HOME` the moment it runs, and `tools.codex.forward_config` bind-mounts the host's `~/.codex` into the container, so a probe run against the default home would write into the user's host machine on every `cella up`.
+/// Pointing `CODEX_HOME` at a throwaway directory for this one exec keeps the probe's residue off both the host and the container while still exercising the same sandbox setup.
+/// The probe's own exit status is what propagates; the cleanup's is discarded.
+const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" codex sandbox -- /bin/true; s=$?; rm -rf "$d"; exit $s"#;
 
 /// Probe the sandbox Codex actually uses, warning when it comes up degraded.
 ///
@@ -2847,7 +2851,7 @@ exit 1
         assert!(check_codex_sandbox(&backend, "test-container", "vscode", Some(&env)).await);
 
         let call = &backend.calls()[0];
-        assert_eq!(call.cmd, vec!["sh", "-c", "codex sandbox -- /bin/true"]);
+        assert_eq!(call.cmd, vec!["sh", "-c", CODEX_SANDBOX_PROBE]);
         assert_eq!(call.user, Some("vscode".to_string()));
         assert_eq!(
             call.env,
@@ -2867,7 +2871,7 @@ exit 1
         assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
         assert_eq!(
             backend.calls()[0].cmd,
-            vec!["sh", "-l", "-c", "codex sandbox -- /bin/true"]
+            vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]
         );
     }
 
@@ -2877,6 +2881,51 @@ exit 1
             identifier: "test-container".to_string(),
         })]);
         assert!(!check_codex_sandbox(&backend, "test-container", "vscode", None).await);
+    }
+
+    /// cella bind-mounts the host's `~/.codex` into the container, so a probe against the default `CODEX_HOME` would write Codex's helper binaries onto the user's host machine on every `cella up`.
+    #[cfg(unix)]
+    #[test]
+    fn codex_sandbox_probe_writes_outside_the_mounted_codex_home() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&home).expect("home should be created");
+        std::fs::create_dir_all(&bin).expect("bin should be created");
+
+        let log = temp.path().join("codex-home.log");
+        let codex = bin.join("codex");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CODEX_HOME:-$HOME/.codex}}\" >> '{}'\nexit 3\n",
+                log.display()
+            ),
+        )
+        .expect("codex stub should be written");
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
+            .expect("codex stub should be executable");
+
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").expect("test process should have PATH")
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(CODEX_SANDBOX_PROBE)
+            .env("HOME", &home)
+            .env("PATH", path)
+            .status()
+            .expect("sandbox probe should run");
+
+        // The probe's exit status must survive the cleanup that follows it.
+        assert_eq!(status.code(), Some(3));
+
+        let observed = std::fs::read_to_string(&log).expect("codex stub should have logged");
+        let codex_home = Path::new(observed.trim());
+        assert!(!codex_home.starts_with(&home), "probed {}", observed.trim());
+        assert!(!codex_home.exists(), "probe left {}", observed.trim());
     }
 
     // ── npm_available_on_path ──────────────────────────────────────────────
