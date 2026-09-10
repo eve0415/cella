@@ -105,8 +105,10 @@ Tools that require runtime dependencies have them provisioned automatically:
 | Tool | Dependency | Provisioning |
 |---|---|---|
 | Claude Code (Alpine) | `libgcc`, `libstdc++`, `ripgrep` | `apk add --no-cache` before installer; sets `USE_BUILTIN_RIPGREP=0` |
-| Codex | `bubblewrap` (sandbox) | `apt-get` or `apk` depending on distro |
+| Codex | `bubblewrap` (sandbox binary) | `apt-get` or `apk` depending on distro |
 | Codex, Gemini | Node.js / npm | If npm is not on PATH (including probed user env), installs via `apt-get` or `apk` |
+
+Installing bubblewrap is not by itself enough for a working Codex sandbox. Under Docker's default `MaskedPaths` and `ReadonlyPaths` the sandbox cannot mount a fresh procfs, so a fully functional sandbox additionally requires `"securityOpt": ["systempaths=unconfined"]` in devcontainer.json. After the Codex install step, cella runs `codex sandbox -- /bin/true` as the remote user and warns with that remedy when the probe fails.
 
 Node.js availability is checked using the probed user environment PATH (from `userEnvProbe`) to detect npm installed by devcontainer features (e.g., nvm). The implementation falls back to a login shell when no probed environment is available. The check runs as the remote user, since that is the user who runs the install — probing as root hides a Node that is only on the user's PATH.
 

@@ -10,10 +10,12 @@ cella-tool-install centralizes the install, version-check, and config-mount logi
 
 Each tool installer:
 1. Checks if the requested version is already present (short-circuits when it is)
-2. Ensures prerequisites (Node.js/npm for npm-based tools, bubblewrap for Codex sandbox, Alpine native deps for Claude Code)
+2. Ensures prerequisites (Node.js/npm for npm-based tools, the bubblewrap binary for Codex, Alpine native deps for Claude Code)
 3. Runs the installer (curl-based for Claude Code, `npm install -g` for Codex/Gemini, GitHub release download for nvim, system package manager for tmux)
 4. Verifies the binary is callable via the same login-shell wrap `cella exec` uses
 5. Symlinks into `/usr/local/bin` when the binary is installed somewhere outside the login-shell PATH
+
+After the Codex install step, `codex sandbox -- /bin/true` is run as the remote user to check whether the sandbox actually works. Installing bubblewrap is not enough on its own: under Docker's default `MaskedPaths` and `ReadonlyPaths` the sandbox cannot mount a fresh procfs, so a fully functional sandbox additionally requires `"securityOpt": ["systempaths=unconfined"]` in devcontainer.json. A failing probe is a warning, not an install failure.
 
 Installers return `Option<ExecResult>` -- `None` when the idempotency guard short-circuited, `Some(...)` when the installer ran. Backend errors are flattened into synthetic `ExecResult { exit_code: -1 }` so callers handle all failure modes uniformly.
 
