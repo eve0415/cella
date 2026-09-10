@@ -128,13 +128,10 @@ pub fn dev_agent_override() -> Option<String> {
 
 /// Detect the target architecture for the agent binary.
 ///
-/// Maps from Rust's `std::env::consts::ARCH` to the volume path convention.
-pub fn detect_agent_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        arch => arch, // fallback: use as-is
-    }
+/// The volume path convention uses Rust's own `std::env::consts::ARCH`
+/// spelling (`x86_64`, `aarch64`), so this is a direct passthrough.
+pub const fn detect_agent_arch() -> &'static str {
+    std::env::consts::ARCH
 }
 
 /// Detect the target architecture from the Docker daemon.

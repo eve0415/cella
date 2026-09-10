@@ -8,6 +8,7 @@
 //! A [`MockFetcher`] is provided for unit testing code that depends on
 //! [`FeatureFetcher`] without requiring network or filesystem setup.
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use futures_util::StreamExt as _;
@@ -156,13 +157,12 @@ impl FeatureFetcher for HttpFetcher {
 /// original path is returned directly.
 pub struct LocalFetcher;
 
-impl FeatureFetcher for LocalFetcher {
-    async fn fetch(
-        &self,
-        reference: &NormalizedRef,
-        _platform: &Platform,
-        _cache: &FeatureCache,
-    ) -> Result<PathBuf, FeatureError> {
+impl LocalFetcher {
+    /// Validates the referenced directory and returns its path.
+    ///
+    /// Kept separate from [`FeatureFetcher::fetch`] because none of these
+    /// steps await: the trait impl wraps this in a ready future.
+    fn validate(reference: &NormalizedRef) -> Result<PathBuf, FeatureError> {
         let NormalizedRef::LocalTarget { absolute_path } = reference else {
             return Err(FeatureError::InvalidReference {
                 reference: reference.to_string(),
@@ -192,6 +192,17 @@ impl FeatureFetcher for LocalFetcher {
     }
 }
 
+impl FeatureFetcher for LocalFetcher {
+    fn fetch(
+        &self,
+        reference: &NormalizedRef,
+        _platform: &Platform,
+        _cache: &FeatureCache,
+    ) -> impl Future<Output = Result<PathBuf, FeatureError>> + Send {
+        std::future::ready(Self::validate(reference))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock fetcher (test support)
 // ---------------------------------------------------------------------------
@@ -208,20 +219,19 @@ pub struct MockFetcher {
 
 #[cfg(test)]
 impl FeatureFetcher for MockFetcher {
-    async fn fetch(
+    fn fetch(
         &self,
         reference: &NormalizedRef,
         _platform: &Platform,
         _cache: &FeatureCache,
-    ) -> Result<PathBuf, FeatureError> {
+    ) -> impl Future<Output = Result<PathBuf, FeatureError>> + Send {
         let key = reference.to_string();
-        self.responses
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| FeatureError::FetchFailed {
+        std::future::ready(self.responses.get(&key).cloned().ok_or_else(|| {
+            FeatureError::FetchFailed {
                 url: key,
                 message: "no mock response configured for this reference".to_owned(),
-            })
+            }
+        }))
     }
 }
 

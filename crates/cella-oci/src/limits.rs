@@ -276,8 +276,6 @@ impl<W: Unpin> Unpin for LimitedWriter<W> {}
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;

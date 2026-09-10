@@ -160,8 +160,7 @@ mod tests {
         let mut archive = tar::Archive::new(&tar_bytes[..]);
         let found = archive.entries().unwrap().filter_map(Result::ok).any(|e| {
             e.path()
-                .ok()
-                .is_some_and(|p| p.to_string_lossy().contains("file.json"))
+                .is_ok_and(|p| p.to_string_lossy().contains("file.json"))
         });
         assert!(found, "Long path file should be present in archive");
     }
