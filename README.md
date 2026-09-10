@@ -125,7 +125,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
 - [x] Bidirectional clipboard forwarding (xsel/xclip)
-- [x] Bubblewrap installed for Codex — a working sandbox also needs `"securityOpt": ["systempaths=unconfined"]` in devcontainer.json
+- [x] Bubblewrap installed for Codex — a working sandbox also needs `"securityOpt": ["systempaths=unconfined"]` in devcontainer.json, which removes Docker's masked and read-only `/proc` and `/sys` paths
 - [x] Credential protection — phantom tokens replace real credentials inside containers, daemon injects real values at request time ([guide](docs/guides/credential-protection.md))
 
 ### Spec Compliance

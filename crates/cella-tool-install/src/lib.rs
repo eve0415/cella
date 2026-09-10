@@ -777,7 +777,7 @@ pub async fn check_codex_sandbox(
         }
         SandboxProbe::Degraded => {
             warn!(
-                r#"Codex sandbox is degraded in this container; add "securityOpt": ["systempaths=unconfined"] to devcontainer.json to enable it."#
+                r#"Codex sandbox is degraded in this container; adding "securityOpt": ["systempaths=unconfined"] to devcontainer.json enables it by removing Docker's masked and read-only /proc and /sys paths, which relaxes container isolation."#
             );
             false
         }
