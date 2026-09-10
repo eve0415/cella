@@ -168,7 +168,7 @@ quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.26.0", features = ["v4"] }
+uuid = { version = "=1.26.1", features = ["v4"] }
 
 # Credential cache memory safety
 zeroize = "=1.9.0"
