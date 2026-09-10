@@ -790,10 +790,7 @@ pub async fn check_codex_sandbox(
 /// `npm install -g @openai/codex`.  Caller must ensure Node.js/npm are available
 /// and the global prefix is writable by the remote user before calling this.
 ///
-/// Whenever Codex ends up present — freshly installed or already there — the
-/// sandbox is probed and a degraded one warned about.  That warning describes
-/// the container rather than the install, so it is worth emitting on every run
-/// and not only on the run that installed Codex.
+/// The sandbox probe is not run here.  It needs a `codex` that the remote user's login shell can actually reach, and on a redirected npm prefix that only becomes true once `verified_install_step` has symlinked the binary into `/usr/local/bin`, so the caller probes after that step instead.
 ///
 /// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
 /// and `None` when Codex is already present at the requested version.
@@ -816,7 +813,7 @@ pub async fn install_codex(
     )
     .await;
 
-    let outcome = if already_installed {
+    if already_installed {
         None
     } else {
         debug!("Installing Codex ({})...", settings.version);
@@ -836,12 +833,7 @@ pub async fn install_codex(
                 stderr: e.to_string(),
             }),
         )
-    };
-
-    if outcome.as_ref().is_none_or(|r| r.exit_code == 0) {
-        check_codex_sandbox(client, container_id, remote_user, probed_env).await;
     }
-    outcome
 }
 
 // ── Gemini ───────────────────────────────────────────────────────────────────
@@ -2089,7 +2081,17 @@ async fn install_npm_branch(
             install_env.as_ref(),
         )
         .await;
-        if !verified_install_step(&verification_ctx, "codex", r, step).await {
+        if verified_install_step(&verification_ctx, "codex", r, step).await {
+            // Whenever Codex ends up present — freshly installed or already there — the sandbox is probed and a degraded one warned about.
+            // That warning describes the container rather than the install, so it is worth emitting on every run and not only on the run that installed Codex.
+            check_codex_sandbox(
+                ctx.client,
+                ctx.container_id,
+                ctx.remote_user,
+                install_env.as_ref(),
+            )
+            .await;
+        } else {
             failures += 1;
         }
     }
@@ -3506,11 +3508,11 @@ exit 1
             )),
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
-            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_exit(0)), // redirected binary is executable
             Ok(ok_exit(0)), // symlink pre-check
             Ok(ok_exit(0)), // symlink creation
             Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
         let settings = cella_config::CellaConfig::default();
         let mut env = ProbedEnv::new();
@@ -3564,9 +3566,7 @@ exit 1
             .iter()
             .position(|call| call.cmd.iter().any(|part| part == CODEX_SANDBOX_PROBE))
             .expect("Codex sandbox probe should run");
-        // The probe must see the redirected prefix so it finds the Codex that was
-        // just installed, and must run as the user who will run Codex.
-        assert!(install_index < probe_index);
+        // The probe must see the redirected prefix so it finds the Codex that was just installed, and must run as the user who will run Codex.
         assert_eq!(calls[probe_index].env, expected_env);
         assert_eq!(calls[probe_index].user, Some("vscode".to_string()));
         let executable_index = calls
@@ -3588,6 +3588,8 @@ exit 1
         assert!(install_index < executable_index);
         assert!(executable_index < symlink_index);
         assert!(symlink_index < verification_index);
+        // The symlink is what puts Codex on the login-shell PATH, so the probe cannot run before it.
+        assert!(verification_index < probe_index);
         assert_eq!(
             calls[verification_index].env,
             Some(vec![
@@ -3596,6 +3598,97 @@ exit 1
                 "NPM_CONFIG_PREFIX=/unwritable/npm-prefix".to_string(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_probes_the_sandbox_only_once_codex_is_reachable() {
+        use cella_backend::progress::ProgressSender;
+
+        // Regression: with no probed PATH and a redirected npm prefix, `codex` is only on the login-shell PATH once the `/usr/local/bin` symlink exists.
+        // Probing before that step reported a missing binary for an install that had in fact succeeded.
+        let home = "/home/vscode";
+        let prefix = "/home/vscode/.local";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(
+                0,
+                &format!("{NPM_PREFIX_MARKER}{prefix}\n{NPM_HOME_MARKER}{home}\n"),
+            )),
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_exit(0)), // redirected binary is executable
+            Ok(ok_exit(0)), // symlink pre-check
+            Ok(ok_exit(0)), // symlink creation
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        let calls = backend.calls();
+        let symlink_index = calls
+            .iter()
+            .position(|call| {
+                call.cmd.iter().any(|part| {
+                    part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
+                })
+            })
+            .expect("redirected binary should be symlinked");
+        let probe_index = calls
+            .iter()
+            .position(|call| call.cmd.iter().any(|part| part == CODEX_SANDBOX_PROBE))
+            .expect("Codex sandbox probe should run");
+        assert!(symlink_index < probe_index);
+        backend.assert_all_responses_consumed();
+    }
+
+    #[tokio::test]
+    async fn install_npm_branch_counts_a_degraded_sandbox_as_a_successful_install() {
+        use cella_backend::progress::ProgressSender;
+
+        // A degraded sandbox is a warning about the container, not an install failure — Codex is installed and usable either way.
+        let home = "/home/vscode";
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, &format!("{NPM_HOME_MARKER}{home}\n"))),
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+            Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+            Ok(fail_exit(
+                1,
+                "bwrap: Can't mount proc on /proc: Operation not permitted",
+            )),
+        ]);
+        let settings = cella_config::CellaConfig::default();
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+
+        let failures = install_npm_branch(&ctx, &phase, &settings, true, false, false).await;
+        phase.finish();
+
+        assert_eq!(failures, 0);
+        backend.assert_all_responses_consumed();
     }
 
     #[tokio::test]
@@ -3611,7 +3704,6 @@ exit 1
             )),
             Ok(ok_exit(1)),                       // codex --version missing
             Ok(ok_exit(0)),                       // npm install succeeds
-            Ok(ok_exit(0)),                       // codex sandbox probe is healthy
             Ok(ok_exit(1)),                       // redirected binary is not executable
             Ok(ok_stdout(0, "/usr/bin/codex\n")), // foreign binary resolves
         ]);
@@ -3657,6 +3749,12 @@ exit 1
                 .iter()
                 .any(|call| call.cmd.iter().any(|part| part.contains("ln -sfn")))
         );
+        // Verification failed, so there is no reachable Codex to probe.
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part == CODEX_SANDBOX_PROBE))
+        );
         let verification = calls
             .iter()
             .find(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
@@ -3673,8 +3771,8 @@ exit 1
             Ok(ok_stdout(0, &format!("{NPM_HOME_MARKER}{home}\n"))),
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
-            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_stdout(0, "/usr/local/bin/codex\n")),
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
         let settings = cella_config::CellaConfig::default();
         let ctx = InstallCtx {
@@ -3713,8 +3811,8 @@ exit 1
             Ok(fail_exit(1, "could not update npm config")),
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
-            Ok(ok_exit(0)), // codex sandbox probe is healthy
             Ok(ok_exit(0)), // codex is callable
+            Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
         let settings = cella_config::CellaConfig::default();
         let ctx = InstallCtx {
@@ -3748,11 +3846,11 @@ exit 1
     }
 
     #[tokio::test]
-    async fn install_codex_installs_npm_package_then_probes_sandbox() {
+    async fn install_codex_installs_npm_package_without_probing_the_sandbox() {
+        // The sandbox probe belongs to the caller, after the binary has been made reachable.
         let backend = MockBackend::new(vec![
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
-            Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
 
         let result = install_codex(
@@ -3767,43 +3865,16 @@ exit 1
 
         assert_eq!(result.exit_code, 0);
         let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[1].cmd,
             vec!["sh", "-l", "-c", "npm install -g @openai/codex@0.42.0"]
         );
-        assert_eq!(calls[2].cmd, vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]);
         backend.assert_all_responses_consumed();
     }
 
     #[tokio::test]
-    async fn install_codex_still_returns_npm_result_when_sandbox_is_degraded() {
-        // A degraded sandbox is a warning about the container, not an install
-        // failure — Codex is installed and usable either way.
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // codex --version missing
-            Ok(ok_exit(0)), // npm install succeeds
-            Ok(fail_exit(
-                1,
-                "bwrap: Can't mount proc on /proc: Operation not permitted",
-            )),
-        ]);
-
-        let result = install_codex(
-            &backend,
-            "test-container",
-            "vscode",
-            &codex_settings(),
-            None,
-        )
-        .await
-        .expect("npm should run");
-
-        assert_eq!(result.exit_code, 0);
-        backend.assert_all_responses_consumed();
-    }
-
-    #[tokio::test]
-    async fn install_codex_skips_sandbox_probe_when_npm_install_fails() {
+    async fn install_codex_reports_a_failed_npm_install() {
         let backend = MockBackend::new(vec![
             Ok(ok_exit(1)),                           // codex --version missing
             Ok(fail_exit(1, "npm ERR! code EACCES")), // npm install fails
@@ -3826,10 +3897,7 @@ exit 1
 
     #[tokio::test]
     async fn install_codex_short_circuits_when_requested_version_exists() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_stdout(0, "codex 0.42.0\n")),
-            Ok(ok_exit(0)), // codex sandbox probe is healthy
-        ]);
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "codex 0.42.0\n"))]);
 
         let result = install_codex(
             &backend,
@@ -3841,9 +3909,8 @@ exit 1
         .await;
 
         assert!(result.is_none());
-        let calls = backend.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].cmd, vec!["sh", "-l", "-c", CODEX_SANDBOX_PROBE]);
+        assert_eq!(backend.calls().len(), 1);
+        backend.assert_all_responses_consumed();
     }
 
     #[tokio::test]
