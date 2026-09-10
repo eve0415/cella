@@ -91,10 +91,15 @@ const SYSTEMPATHS_UNCONFINED: &str = "systempaths=unconfined";
 ///
 /// Only the exact value is intercepted.  Any other `systempaths=...` value stays
 /// in the list and is rejected by the daemon, which is what docker does too.
+///
+/// The value can arrive from the user's own `securityOpt` or `runArgs`, but also from feature metadata or a base image's `devcontainer.metadata` label, so the translation warns whenever it fires.
 fn apply_security_opt(host_config: &mut HostConfig, mut security_opt: Vec<String>) {
     let before = security_opt.len();
     security_opt.retain(|opt| opt != SYSTEMPATHS_UNCONFINED);
     if security_opt.len() != before {
+        tracing::warn!(
+            "securityOpt systempaths=unconfined: clearing Docker's masked and read-only paths for this container, which relaxes its isolation."
+        );
         // `Some(vec![])` serializes as `"MaskedPaths": []`, which tells the daemon
         // to override its defaults with nothing.  `None` is skipped by
         // `skip_serializing_if` and would leave the defaults in place.
