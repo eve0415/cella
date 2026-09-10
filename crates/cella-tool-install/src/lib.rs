@@ -716,6 +716,9 @@ const CODEX_SANDBOX_PROBE: &str = r#"d=$(mktemp -d) || exit 1; CODEX_HOME="$d" c
 /// Exit status a POSIX shell reports when it could not find the command.
 const SHELL_COMMAND_NOT_FOUND: i64 = 127;
 
+/// Exit status clap reports for an argument-parsing error, such as a `codex` old enough to lack the `sandbox` subcommand.
+const CLAP_USAGE_ERROR: i64 = 2;
+
 /// Smallest command that fails where the sandbox argv Codex builds would.
 ///
 /// `unshare` ships with util-linux rather than with bubblewrap, so this can be asked before deciding whether to install bubblewrap at all.
@@ -776,6 +779,8 @@ enum SandboxProbe {
     Healthy,
     /// The shell never found `codex`, so nothing was probed.
     BinaryMissing,
+    /// `codex sandbox` failed on a clap usage error, so this Codex version does not accept the probe command.
+    Unsupported,
     /// Codex is there but the sandbox could not set itself up.
     Degraded,
 }
@@ -783,11 +788,13 @@ enum SandboxProbe {
 /// Read the probe's outcome off its exit status.
 ///
 /// A 127 says the shell never found `codex` at all, which is a PATH or install problem rather than a sandbox one, so it has to stay distinguishable from a sandbox that really is degraded.
+/// A 2 says clap rejected the arguments before Codex ever tried to sandbox anything — an old Codex without the `sandbox` subcommand, or a changed CLI surface — which is also not a sandbox failure.
 /// An exec that could not run at all is reported as degraded, matching the conservative reading the caller had before this split.
 const fn classify_sandbox_probe(probe: Result<&ExecResult, &BackendError>) -> SandboxProbe {
     match probe {
         Ok(result) if result.exit_code == 0 => SandboxProbe::Healthy,
         Ok(result) if result.exit_code == SHELL_COMMAND_NOT_FOUND => SandboxProbe::BinaryMissing,
+        Ok(result) if result.exit_code == CLAP_USAGE_ERROR => SandboxProbe::Unsupported,
         _ => SandboxProbe::Degraded,
     }
 }
@@ -799,6 +806,7 @@ const fn classify_sandbox_probe(probe: Result<&ExecResult, &BackendError>) -> Sa
 ///
 /// Probing the real thing rather than a `bwrap` binary on `PATH` avoids both failure modes of a presence check: a `bwrap` that exists but cannot run, and a working sandbox driven by the copy Codex vendors alongside its own binary.
 /// A missing `codex` binary is a PATH or install problem rather than a sandbox one, so it gets its own message.
+/// A pinned Codex old enough to lack the `sandbox` subcommand also gets its own message, since that failure is a version mismatch rather than a sandbox one.
 ///
 /// Runs as the remote user, since that is who will run Codex.
 /// Requires Codex to be installed, so callers must invoke this after the install step.
@@ -824,6 +832,12 @@ pub async fn check_codex_sandbox(
         SandboxProbe::Healthy => true,
         SandboxProbe::BinaryMissing => {
             warn!("Could not probe the Codex sandbox: the codex binary was not found on PATH.");
+            false
+        }
+        SandboxProbe::Unsupported => {
+            warn!(
+                "Could not probe the Codex sandbox: this Codex version did not accept the probe command."
+            );
             false
         }
         SandboxProbe::Degraded => {
@@ -3080,6 +3094,7 @@ exit 1
         // 127 is the shell failing to find codex, where the securityOpt remedy would be a dead end.
         let healthy = ok_exit(0);
         let missing = fail_exit(127, "sh: codex: not found");
+        let usage_error = fail_exit(2, "error: unrecognized subcommand 'sandbox'");
         let degraded = fail_exit(
             1,
             "bwrap: Can't mount proc on /proc: Operation not permitted",
@@ -3097,6 +3112,11 @@ exit 1
             classify_sandbox_probe(Ok(&missing)),
             SandboxProbe::BinaryMissing,
             "exit 127"
+        );
+        assert_eq!(
+            classify_sandbox_probe(Ok(&usage_error)),
+            SandboxProbe::Unsupported,
+            "exit 2"
         );
         assert_eq!(
             classify_sandbox_probe(Ok(&degraded)),
