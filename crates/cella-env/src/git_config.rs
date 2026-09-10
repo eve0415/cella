@@ -21,7 +21,10 @@ const LIST_ARGS: [&str; 5] = ["config", "--global", "--includes", "--list", "--n
 /// Invokes `git config --global --includes --list --null` on the host and
 /// filters through an allowlist of safe keys.
 /// Returns empty vec if git is not installed or has no global config.
-pub fn read_host_git_config() -> Vec<GitConfigEntry> {
+///
+/// `allowed_signers_path` is the container-side path of the forwarded
+/// allowed-signers file, or `None` when it could not be forwarded.
+pub fn read_host_git_config(allowed_signers_path: Option<&str>) -> Vec<GitConfigEntry> {
     let output = std::process::Command::new("git").args(LIST_ARGS).output();
 
     let output = match output {
@@ -38,6 +41,7 @@ pub fn read_host_git_config() -> Vec<GitConfigEntry> {
     let mut safe = filter_safe_config(&entries);
 
     include_ssh_signing_keys(&entries, &mut safe);
+    include_allowed_signers_key(&mut safe, allowed_signers_path);
 
     safe
 }
@@ -116,27 +120,55 @@ fn is_ssh_signing_key(key: &str) -> bool {
     let key_lower = key.to_lowercase();
     matches!(
         key_lower.as_str(),
-        "gpg.format"
-            | "user.signingkey"
-            | "commit.gpgsign"
-            | "tag.gpgsign"
-            | "gpg.ssh.allowedsignersfile"
+        "gpg.format" | "user.signingkey" | "commit.gpgsign" | "tag.gpgsign"
     )
+}
+
+/// Check if a key points at the allowed-signers file.
+const fn is_allowed_signers_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("gpg.ssh.allowedsignersfile")
 }
 
 /// If SSH signing is configured, include related keys that aren't already present.
 fn include_ssh_signing_keys(entries: &[(String, String)], safe: &mut Vec<GitConfigEntry>) {
     let has_ssh_signing = entries.iter().any(|(k, v)| k == "gpg.format" && v == "ssh");
-    if has_ssh_signing {
-        for (key, value) in entries {
-            if is_ssh_signing_key(key) && !safe.iter().any(|e| e.key == *key) {
-                safe.push(GitConfigEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
+    if !has_ssh_signing {
+        return;
     }
+
+    for (key, value) in entries {
+        if !is_ssh_signing_key(key) || safe.iter().any(|e| e.key == *key) {
+            continue;
+        }
+        safe.push(GitConfigEntry {
+            key: key.clone(),
+            value: value.clone(),
+        });
+    }
+}
+
+/// Point the allowed-signers key at the file copied into the container.
+///
+/// Not gated on `gpg.format=ssh`: that selects the format commits are *signed*
+/// with, while git verifies an SSH-signed commit through this file whichever
+/// format the local user signs with. Gating it would leave someone who signs
+/// with GPG unable to verify a colleague's SSH-signed commits.
+///
+/// The host value is never forwarded — it names a path that does not exist in
+/// the container. When the file could not be copied the key is left out
+/// entirely, so git reports it as unconfigured rather than chasing a path that
+/// was never there.
+fn include_allowed_signers_key(safe: &mut Vec<GitConfigEntry>, allowed_signers_path: Option<&str>) {
+    let Some(container_path) = allowed_signers_path else {
+        return;
+    };
+    if safe.iter().any(|e| is_allowed_signers_key(&e.key)) {
+        return;
+    }
+    safe.push(GitConfigEntry {
+        key: "gpg.ssh.allowedSignersFile".to_string(),
+        value: container_path.to_string(),
+    });
 }
 
 /// Check if a git config key is in the blocklist (never copy).
@@ -252,7 +284,10 @@ mod tests {
         assert!(is_ssh_signing_key("user.signingkey"));
         assert!(is_ssh_signing_key("commit.gpgsign"));
         assert!(is_ssh_signing_key("tag.gpgsign"));
-        assert!(is_ssh_signing_key("gpg.ssh.allowedSignersFile"));
+        assert!(
+            !is_ssh_signing_key("gpg.ssh.allowedSignersFile"),
+            "the allowed-signers key is handled separately, not gated on gpg.format"
+        );
     }
 
     #[test]
@@ -306,5 +341,83 @@ mod tests {
         assert!(safe.iter().any(|e| e.key == "user.signingkey"));
         assert!(safe.iter().any(|e| e.key == "commit.gpgsign"));
         assert!(!safe.iter().any(|e| e.key == "credential.helper"));
+    }
+
+    /// Null-delimited config with SSH signing and a host allowed-signers path.
+    fn signing_entries() -> Vec<(String, String)> {
+        let raw = "gpg.format\nssh\0user.signingkey\n~/.ssh/id_ed25519.pub\0commit.gpgsign\ntrue\0tag.gpgsign\ntrue\0gpg.ssh.allowedsignersfile\n/Users/me/.config/git/allowed_signers\0";
+        parse_null_delimited_config(raw)
+    }
+
+    #[test]
+    fn allowed_signers_rewritten_to_container_path() {
+        let entries = signing_entries();
+        let mut safe = filter_safe_config(&entries);
+        include_allowed_signers_key(&mut safe, Some("/home/node/.ssh/allowed_signers"));
+
+        let entry = safe
+            .iter()
+            .find(|e| is_allowed_signers_key(&e.key))
+            .expect("allowed signers key should be forwarded");
+        assert_eq!(entry.value, "/home/node/.ssh/allowed_signers");
+    }
+
+    #[test]
+    fn other_signing_keys_stay_verbatim() {
+        let entries = signing_entries();
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe);
+
+        let signing_key = safe
+            .iter()
+            .find(|e| e.key == "user.signingkey")
+            .expect("signing key should be forwarded");
+        assert_eq!(signing_key.value, "~/.ssh/id_ed25519.pub");
+        assert!(safe.iter().any(|e| e.key == "tag.gpgsign"));
+    }
+
+    #[test]
+    fn allowed_signers_omitted_when_not_forwarded() {
+        let entries = signing_entries();
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe);
+        include_allowed_signers_key(&mut safe, None);
+
+        assert!(
+            !safe.iter().any(|e| is_allowed_signers_key(&e.key)),
+            "an unforwardable file must not leave a dangling host path behind"
+        );
+        assert!(
+            safe.iter().any(|e| e.key == "gpg.format"),
+            "the remaining signing keys are still forwarded"
+        );
+    }
+
+    #[test]
+    fn allowed_signers_forwarded_when_signing_format_is_not_ssh() {
+        let raw = "gpg.format
+openpgp user.signingkey
+ABCD1234 ";
+        let entries = parse_null_delimited_config(raw);
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe);
+        include_allowed_signers_key(&mut safe, Some("/home/node/.ssh/allowed_signers"));
+
+        let entry = safe
+            .iter()
+            .find(|e| is_allowed_signers_key(&e.key))
+            .expect("verification does not depend on the local signing format");
+        assert_eq!(entry.value, "/home/node/.ssh/allowed_signers");
+        assert!(
+            !safe.iter().any(|e| e.key == "user.signingkey"),
+            "a non-ssh signing format still forwards none of the gated keys"
+        );
+    }
+
+    #[test]
+    fn allowed_signers_key_matched_case_insensitively() {
+        assert!(is_allowed_signers_key("gpg.ssh.allowedSignersFile"));
+        assert!(is_allowed_signers_key("gpg.ssh.allowedsignersfile"));
+        assert!(!is_allowed_signers_key("gpg.ssh.defaultKeyCommand"));
     }
 }

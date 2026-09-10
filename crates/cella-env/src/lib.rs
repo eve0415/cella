@@ -20,6 +20,7 @@ pub mod platform;
 pub mod proxy;
 pub mod ssh_agent;
 pub mod ssh_config;
+pub mod ssh_signing;
 pub mod tmux;
 pub mod user_env_probe;
 
@@ -196,9 +197,21 @@ fn apply_ssh_config_files(fwd: &mut EnvForwarding, remote_user: &str) {
     }
 }
 
+/// Copy the host's git allowed-signers file into the container.
+///
+/// Returns the container-side path when the file was forwarded, so the
+/// forwarded `gpg.ssh.allowedSignersFile` value can be pointed at it.
+fn apply_ssh_signing(fwd: &mut EnvForwarding, remote_user: &str) -> Option<String> {
+    let upload = ssh_signing::read_allowed_signers_upload(remote_user)?;
+    let container_path = upload.container_path.clone();
+    tracing::info!("Copying git allowed signers file to {container_path}");
+    fwd.post_start.file_uploads.push(upload);
+    Some(container_path)
+}
+
 /// Apply host git config forwarding to the environment.
-fn apply_git_config(fwd: &mut EnvForwarding) {
-    let git_entries = git_config::read_host_git_config();
+fn apply_git_config(fwd: &mut EnvForwarding, allowed_signers_path: Option<&str>) {
+    let git_entries = git_config::read_host_git_config(allowed_signers_path);
     if !git_entries.is_empty() {
         tracing::info!(
             "Forwarding {} git config entries to container",
@@ -352,7 +365,8 @@ pub fn prepare_env_forwarding(
 
     apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
     apply_ssh_config_files(&mut fwd, remote_user);
-    apply_git_config(&mut fwd);
+    let allowed_signers = apply_ssh_signing(&mut fwd, remote_user);
+    apply_git_config(&mut fwd, allowed_signers.as_deref());
     apply_safe_directory(&mut fwd);
     apply_credential_forwarding(&mut fwd);
     apply_global_gitignore(&mut fwd, remote_user);

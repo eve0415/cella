@@ -164,6 +164,8 @@ For runtimes where direct socket forwarding is unreliable, the daemon runs a per
 
 Host SSH configuration files (`~/.ssh/known_hosts` and `~/.ssh/config`) are copied into the container during Phase 2 via file upload. Files are placed at the remote user's `~/.ssh/` directory with `0600` permissions. Missing or empty files are silently skipped.
 
+The git SSH signing allowed-signers file is copied into the same directory by the same mechanism, but its host source is resolved from the host git config rather than from a fixed name -- see [SSH Signing](#ssh-signing).
+
 ### User Override Detection
 
 If the devcontainer configuration already specifies SSH agent forwarding -- via `SSH_AUTH_SOCK` in `containerEnv` or `remoteEnv`, or via a mount targeting a path containing `ssh-auth`, `ssh_auth`, or `SSH_AUTH` -- cella skips automatic forwarding entirely. This prevents conflicts with user-managed SSH setups.
@@ -219,9 +221,23 @@ Host git global configuration is read via `git config --global --includes --list
 | `alias.*` | Git aliases |
 | `color.*` | Color configuration |
 
-**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`, `gpg.ssh.allowedSignersFile`.
+**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`. `gpg.ssh.allowedSignersFile` is handled separately and is not gated on the signing format -- see [SSH Signing](#ssh-signing).
 
 **Blocked keys** (never forwarded): `credential.*`, `gpg.*` (except SSH signing), `core.sshCommand`, `core.hooksPath`, `include.*`, `includeIf.*`, `safe.directory`, `http.*`, `url.*`, `remote.*`, `branch.*`. These are blocked because they reference host-specific paths, credentials, or network configuration that would be incorrect or dangerous inside the container.
+
+### SSH Signing
+
+The host value of `gpg.ssh.allowedSignersFile` names a path on the host, which usually does not exist in the container -- and on a macOS or Windows host is not even shaped like a container path. Forwarding it verbatim leaves git failing every `git verify-commit` and `git log --show-signature` with `gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification`. cella therefore copies the file into the container and points the forwarded value at the copy.
+
+The host source is resolved with `git config --global --includes --type=path --get gpg.ssh.allowedSignersFile`, so a value set in an included file is found and a leading `~` is expanded. Non-default locations such as `~/.config/git/allowed_signers` are handled the same as the conventional `~/.ssh/allowed_signers`.
+
+The file is copied verbatim, with every principal it lists, to the remote user's `~/.ssh/allowed_signers` with `0600` permissions -- regardless of where it lived on the host -- and the forwarded `gpg.ssh.allowedSignersFile` value is rewritten to that container path.
+
+Unlike the signing keys above, this is not gated on `gpg.format=ssh`.
+That setting selects the format commits are *signed* with, while git verifies an SSH-signed commit through the allowed-signers file whichever format the local user signs with.
+Gating it would leave someone who signs with GPG unable to verify a colleague's SSH-signed commits.
+
+Nothing is forwarded when the key is unset or the resolved file is missing or empty. The key is then omitted from the forwarded config entirely rather than injected as a path that does not exist. The copy is never gated on an `ssh` binary being present in the container: copying a text file needs no ssh client, and gating on one is what makes the equivalent VS Code behavior silently do nothing on images that ship without one.
 
 ### Safe Directory
 
