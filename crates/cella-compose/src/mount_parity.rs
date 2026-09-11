@@ -975,6 +975,14 @@ pub fn compute_mount_input_fingerprint(
     hasher.update([u8::from(t.nvim.forward_config)]);
     hasher.update([u8::from(t.tmux.forward_config)]);
 
+    // Codex database placement. This decides a create-time env var rather than
+    // a mount, but it is equally immutable afterwards, so a container created
+    // before the setting existed must still be nudged to rebuild.
+    hasher.update([match t.codex.database {
+        cella_config::settings::CodexDatabase::Container => 0u8,
+        cella_config::settings::CodexDatabase::Host => 1u8,
+    }]);
+
     // Tool config override paths (None is represented by a bare NUL separator).
     for path in [t.nvim.config_path.as_deref(), t.tmux.config_path.as_deref()] {
         if let Some(p) = path {
@@ -2690,6 +2698,24 @@ mod tests {
         assert_ne!(
             fp_a, fp_b,
             "fingerprint must change when nvim.config_path override differs"
+        );
+    }
+
+    #[test]
+    fn mount_input_fingerprint_changes_with_codex_database_placement() {
+        // The setting decides a create-time env var, which is as immutable as a
+        // mount, so drift detection must see it and ask for a rebuild.
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+
+        let container = cella_config::CellaConfig::default();
+        let mut host = cella_config::CellaConfig::default();
+        host.tools.codex.database = cella_config::settings::CodexDatabase::Host;
+
+        assert_ne!(
+            compute_mount_input_fingerprint(&container, &env_fwd, ws),
+            compute_mount_input_fingerprint(&host, &env_fwd, ws),
+            "fingerprint must change when codex.database differs"
         );
     }
 
