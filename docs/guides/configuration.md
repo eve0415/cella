@@ -164,10 +164,16 @@ version = "latest"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `forward_config` | bool | `true` | Bind-mount host config into the container |
+| `database` | `"container"` \| `"host"` | `"container"` | Where Codex keeps its SQLite databases |
 | `version` | string | `"latest"` | `"latest"` or a pinned version like `"0.1.2"` |
 
 Host paths mounted when `forward_config = true`:
 - `~/.codex/` → `$HOME/.codex/`
+
+Codex opens its SQLite databases in WAL mode, which only works while every process using them shares one kernel.
+The forwarded `~/.codex` is shared with the Codex app on your host, which does not, so by default cella points `CODEX_SQLITE_HOME` at `$HOME/.codex-db` inside the container and leaves the rest of `~/.codex` forwarded.
+Config, credentials and session transcripts stay shared, and Codex rebuilds its thread index from the forwarded transcripts, so history survives a container rebuild.
+Set `database = "host"` to keep the databases on the mount instead.
 
 ```toml
 [tools.codex]
