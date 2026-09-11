@@ -1192,11 +1192,19 @@ impl EnsureUpContext<'_> {
     /// `CODEX_SQLITE_HOME` belongs here rather than with the forwarded host env
     /// because it is a consequence of the `~/.codex` mount, not of anything the
     /// host environment carries.
+    ///
+    /// `container_env` is the user's `containerEnv` alone, deliberately not
+    /// `create_opts.env`: that vector is empty unless `containerEnv` is
+    /// non-empty and otherwise also carries the image's own `ENV`, so checking
+    /// it would make deference depend on an unrelated key, and would let an
+    /// image silently keep the databases on the mount this fix exists to
+    /// get them off.
     fn apply_tool_config(
         create_opts: &mut cella_backend::CreateContainerOptions,
         image_env: &[String],
         remote_user: &str,
         settings: &cella_config::CellaConfig,
+        container_env: &[String],
     ) {
         for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
             create_opts.mounts.push(spec.to_mount_config());
@@ -1204,7 +1212,7 @@ impl EnsureUpContext<'_> {
 
         let tool_env = retain_undefined_env(
             crate::tool_install::build_tool_config_env_specs(settings, remote_user),
-            &create_opts.env,
+            container_env,
         );
         if !tool_env.is_empty() {
             if create_opts.env.is_empty() {
@@ -1236,7 +1244,13 @@ impl EnsureUpContext<'_> {
             });
         }
 
-        Self::apply_tool_config(create_opts, image_env, remote_user, settings);
+        Self::apply_tool_config(
+            create_opts,
+            image_env,
+            remote_user,
+            settings,
+            &cella_config::config_map::env::map_container_env(&self.config.resolved.config),
+        );
 
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -2626,11 +2640,11 @@ fn resolved_remote_env(
     config.remote_env.to_vec()
 }
 
-/// Drop tool env entries whose key the resolved container env already defines.
+/// Drop tool env entries whose key the user's `containerEnv` already defines.
 ///
-/// `create_opts.env` carries the user's `containerEnv` by the time tool config
-/// is applied, and Docker resolves duplicates last-wins, so appending blindly
-/// would silently beat a value the user set deliberately.
+/// Docker resolves duplicate env last-wins, so appending blindly would silently
+/// beat a value the user set deliberately. Only `containerEnv` counts: the
+/// image's own `ENV` is not a statement about this project.
 fn retain_undefined_env(tool_env: Vec<String>, existing: &[String]) -> Vec<String> {
     let defined: std::collections::HashSet<&str> = existing
         .iter()
@@ -2671,6 +2685,22 @@ mod tests {
         let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
         let kept = retain_undefined_env(vec![entry.clone()], &existing);
         assert_eq!(kept, vec![entry]);
+    }
+
+    #[test]
+    fn the_override_check_is_fed_from_container_env_alone() {
+        // `apply_tool_config` passes this, not `create_opts.env`. An image's own
+        // ENV never appears here, so it cannot defeat cella's placement, and the
+        // result does not hinge on whether some unrelated containerEnv key
+        // happened to make `create_opts.env` non-empty.
+        let with_keys = cella_config::config_map::env::map_container_env(
+            &serde_json::json!({"containerEnv": {"FOO": "1"}}),
+        );
+        assert_eq!(with_keys, vec!["FOO=1"]);
+        assert!(
+            cella_config::config_map::env::map_container_env(&serde_json::json!({})).is_empty(),
+            "absent containerEnv must yield no override keys"
+        );
     }
 
     #[test]
