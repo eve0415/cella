@@ -268,6 +268,9 @@ Only the databases are split, and they are a derived cache rather than the syste
 
 `~/.codex/sqlite/codex-dev.db` is also a WAL database on the forwarded mount, but it belongs to the host Codex app: the CLI binary contains no reference to that filename and never opens it, so it is outside what this setting moves.
 
+A `CODEX_SQLITE_HOME` in devcontainer.json `containerEnv` or `remoteEnv` overrides cella's value on both paths.
+Setting it in a compose service's own `environment:` does not: cella's override file is appended last and compose resolves duplicate keys last-wins, so use `remoteEnv` or `database = "host"` there.
+
 `tools.codex.database = "host"` leaves the databases on the forwarded mount instead.
 That is the configuration described above as corrupting, and it exists as an escape hatch for hosts where `~/.codex` is not a cross-kernel share.
 

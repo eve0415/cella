@@ -1380,6 +1380,13 @@ async fn build_override_and_start(
     // agent env vars need `clipboard.wayland` and container env is immutable
     // after create — there is no later chance to add `WAYLAND_DISPLAY`.
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
+    // Asymmetry with the single-container path, which defers to `containerEnv`:
+    // cella's override file is appended last, and compose merges `environment`
+    // by key with the last file winning, so a `CODEX_SQLITE_HOME` set in the
+    // user's own service is overridden here. Detecting it would cost another
+    // `compose config` resolve on every `up`; `remoteEnv` (appended after
+    // `tool_env` below) and `tools.codex.database = "host"` both override it
+    // without that cost.
     let mut extra_env = build_extra_env(
         daemon_env,
         cella_tool_install::build_tool_config_env_specs(&settings, remote_user),
