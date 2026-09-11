@@ -1327,6 +1327,35 @@ pub fn build_tool_config_mount_specs(
     out
 }
 
+// ── Tool config env ──────────────────────────────────────────────────────────
+
+/// Build `KEY=VALUE` env entries that tool config forwarding needs at container creation.
+///
+/// Currently only Codex, which opens each of its runtime databases in WAL mode.
+/// WAL keeps its frame index in an mmapped `-shm` file that every accessor must see through one kernel's page cache, so a forwarded `~/.codex` shared with the host app corrupts those databases.
+/// Pointing `CODEX_SQLITE_HOME` at container-local storage keeps the databases single-kernel while `~/.codex` still forwards config, credentials and session transcripts.
+/// Codex rebuilds its thread index from the forwarded `sessions/` rollouts, so history survives a container rebuild.
+#[must_use]
+pub fn build_tool_config_env_specs(
+    settings: &cella_config::CellaConfig,
+    remote_user: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Only meaningful while the host directory is forwarded: without that mount
+    // `~/.codex` is already container-local and single-kernel.
+    if settings.tools.codex.forward_config
+        && settings.tools.codex.database == cella_config::settings::CodexDatabase::Container
+    {
+        out.push(format!(
+            "CODEX_SQLITE_HOME={}",
+            cella_env::codex::container_codex_db_dir(remote_user)
+        ));
+    }
+
+    out
+}
+
 // ── Single-file config seeding (anti-ghost) ──────────────────────────────────
 
 /// Build regular-file seed uploads for the single-file tool configs that are no
@@ -4018,6 +4047,7 @@ exit 1
         cella_config::settings::Codex {
             version: "0.42.0".to_string(),
             forward_config: false,
+            database: cella_config::settings::CodexDatabase::Container,
         }
     }
 
@@ -4144,6 +4174,40 @@ exit 1
         assert!(
             specs.is_empty(),
             "no mounts when all forward_config=false; got {specs:?}"
+        );
+    }
+
+    #[test]
+    fn codex_sqlite_home_points_outside_the_forwarded_mount_by_default() {
+        let settings = cella_config::CellaConfig::default();
+        let env = build_tool_config_env_specs(&settings, "vscode");
+        assert_eq!(env, vec!["CODEX_SQLITE_HOME=/home/vscode/.cella/codex-db"]);
+        let forwarded = cella_env::codex::container_codex_dir("vscode");
+        assert!(
+            !env[0].split_once('=').unwrap().1.starts_with(&forwarded),
+            "databases must not land under the bind-mounted {forwarded}"
+        );
+    }
+
+    #[test]
+    fn codex_sqlite_home_absent_when_database_left_on_host() {
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.codex.database = cella_config::settings::CodexDatabase::Host;
+        let env = build_tool_config_env_specs(&settings, "vscode");
+        assert!(
+            env.is_empty(),
+            "opting into host databases must not override CODEX_SQLITE_HOME; got {env:?}"
+        );
+    }
+
+    #[test]
+    fn codex_sqlite_home_absent_when_config_is_not_forwarded() {
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.codex.forward_config = false;
+        let env = build_tool_config_env_specs(&settings, "vscode");
+        assert!(
+            env.is_empty(),
+            "an unforwarded ~/.codex is already container-local; got {env:?}"
         );
     }
 
