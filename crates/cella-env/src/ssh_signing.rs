@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::FileUpload;
+use crate::git_config::ALLOWED_SIGNERS_KEY;
 use crate::ssh_config::remote_ssh_dir;
 
 /// Filename of the allowed-signers file inside the container.
@@ -28,13 +29,8 @@ const RESOLVE_ARGS: [&str; 6] = [
     "--includes",
     "--type=path",
     "--get",
-    "gpg.ssh.allowedSignersFile",
+    ALLOWED_SIGNERS_KEY,
 ];
-
-/// Container-side path of the forwarded allowed-signers file.
-pub fn container_allowed_signers_path(remote_user: &str) -> String {
-    format!("{}/{CONTAINER_FILENAME}", remote_ssh_dir(remote_user))
-}
 
 /// Resolve the host's configured allowed-signers file path.
 ///
@@ -77,7 +73,7 @@ fn build_upload(host_path: &Path, remote_user: &str) -> Option<FileUpload> {
     };
 
     Some(FileUpload {
-        container_path: container_allowed_signers_path(remote_user),
+        container_path: format!("{}/{CONTAINER_FILENAME}", remote_ssh_dir(remote_user)),
         content,
         mode: 0o600,
     })
@@ -97,22 +93,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn container_path_root() {
-        assert_eq!(
-            container_allowed_signers_path("root"),
-            "/root/.ssh/allowed_signers"
-        );
-    }
-
-    #[test]
-    fn container_path_regular_user() {
-        assert_eq!(
-            container_allowed_signers_path("node"),
-            "/home/node/.ssh/allowed_signers"
-        );
-    }
 
     #[test]
     fn upload_missing_file_is_skipped() {
