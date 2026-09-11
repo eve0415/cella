@@ -18,6 +18,13 @@ pub fn container_codex_dir(remote_user: &str) -> String {
     format!("{}/.codex", container_home(remote_user))
 }
 
+/// Container-side directory for Codex's `SQLite` databases.
+///
+/// Deliberately outside `~/.codex`: that path is a bind mount of the host directory, and Codex opens every database in WAL mode, which cannot survive accessors on two sides of the host/VM boundary.
+pub fn container_codex_db_dir(remote_user: &str) -> String {
+    format!("{}/.cella/codex-db", container_home(remote_user))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,6 +37,18 @@ mod tests {
     #[test]
     fn container_codex_dir_regular() {
         assert_eq!(container_codex_dir("vscode"), "/home/vscode/.codex");
+    }
+
+    #[test]
+    fn container_codex_db_dir_is_outside_the_forwarded_mount() {
+        let db = container_codex_db_dir("vscode");
+        assert_eq!(db, "/home/vscode/.cella/codex-db");
+        assert!(!db.starts_with(&container_codex_dir("vscode")));
+    }
+
+    #[test]
+    fn container_codex_db_dir_root() {
+        assert_eq!(container_codex_db_dir("root"), "/root/.cella/codex-db");
     }
 
     #[test]
