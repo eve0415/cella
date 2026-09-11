@@ -262,7 +262,7 @@ The forwarded `~/.codex` bind mount crosses exactly that boundary on macOS, wher
 Codex detects the result as `SQLITE_CORRUPT`, quarantines the database into `~/.codex/db-backups/sqlite-<timestamp>-<n>/`, and rebuilds an empty one.
 The journal mode is not configurable, and the same failure is tracked upstream for other shared filesystems in [openai/codex#30957](https://github.com/openai/codex/issues/30957) and for this container case in [openai/codex#44772](https://github.com/openai/codex/issues/44772).
 
-cella therefore sets `CODEX_SQLITE_HOME` to `$HOME/.cella/codex-db`, a container-local path outside the bind mount, so every WAL database is opened by one kernel only.
+cella therefore sets `CODEX_SQLITE_HOME` to `$HOME/.codex-db`, a container-local path outside the bind mount, so every WAL database is opened by one kernel only.
 `~/.codex` continues to forward normally, so `config.toml`, `auth.json`, `AGENTS.md`, `skills/` and the `sessions/` rollout transcripts stay shared with the host and with every other container.
 Only the databases are split, and they are a derived cache rather than a record of record: Codex reconstructs its thread index from the forwarded `sessions/` rollouts, so session history survives a container rebuild.
 

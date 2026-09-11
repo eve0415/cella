@@ -4181,8 +4181,10 @@ exit 1
     fn codex_sqlite_home_points_outside_the_forwarded_mount_by_default() {
         let settings = cella_config::CellaConfig::default();
         let env = build_tool_config_env_specs(&settings, "vscode");
-        assert_eq!(env, vec!["CODEX_SQLITE_HOME=/home/vscode/.cella/codex-db"]);
-        let forwarded = cella_env::codex::container_codex_dir("vscode");
+        assert_eq!(env, vec!["CODEX_SQLITE_HOME=/home/vscode/.codex-db"]);
+        // Trailing slash so the check tests path containment: `.codex-db` is a
+        // sibling of `.codex` that shares its string prefix.
+        let forwarded = format!("{}/", cella_env::codex::container_codex_dir("vscode"));
         assert!(
             !env[0].split_once('=').unwrap().1.starts_with(&forwarded),
             "databases must not land under the bind-mounted {forwarded}"

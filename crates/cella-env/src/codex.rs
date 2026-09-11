@@ -22,7 +22,7 @@ pub fn container_codex_dir(remote_user: &str) -> String {
 ///
 /// Deliberately outside `~/.codex`: that path is a bind mount of the host directory, and Codex opens every database in WAL mode, which cannot survive accessors on two sides of the host/VM boundary.
 pub fn container_codex_db_dir(remote_user: &str) -> String {
-    format!("{}/.cella/codex-db", container_home(remote_user))
+    format!("{}/.codex-db", container_home(remote_user))
 }
 
 #[cfg(test)]
@@ -42,13 +42,29 @@ mod tests {
     #[test]
     fn container_codex_db_dir_is_outside_the_forwarded_mount() {
         let db = container_codex_db_dir("vscode");
-        assert_eq!(db, "/home/vscode/.cella/codex-db");
-        assert!(!db.starts_with(&container_codex_dir("vscode")));
+        assert_eq!(db, "/home/vscode/.codex-db");
+        // Compare on a path boundary: `.codex-db` shares a string prefix with
+        // `.codex` while being a sibling of it, not a child.
+        assert!(!db.starts_with(&format!("{}/", container_codex_dir("vscode"))));
+    }
+
+    #[test]
+    fn container_codex_db_dir_sits_directly_in_the_home_directory() {
+        // Codex creates this path itself, as the remote user. Nesting it under a
+        // directory cella writes during `up` (`~/.cella`, created root-owned by
+        // the env-probe cache) would leave the remote user unable to create it.
+        let home = container_home("vscode");
+        let db = container_codex_db_dir("vscode");
+        let relative = db.strip_prefix(&format!("{home}/")).expect("under home");
+        assert!(
+            !relative.contains('/'),
+            "must be a direct child of {home}, got {db}"
+        );
     }
 
     #[test]
     fn container_codex_db_dir_root() {
-        assert_eq!(container_codex_db_dir("root"), "/root/.cella/codex-db");
+        assert_eq!(container_codex_db_dir("root"), "/root/.codex-db");
     }
 
     #[test]
