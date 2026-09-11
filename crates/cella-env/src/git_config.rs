@@ -115,13 +115,27 @@ fn is_safe_key(key: &str) -> bool {
     false
 }
 
-/// Check if a key is an SSH signing config key.
-fn is_ssh_signing_key(key: &str) -> bool {
-    let key_lower = key.to_lowercase();
-    matches!(
-        key_lower.as_str(),
-        "gpg.format" | "user.signingkey" | "commit.gpgsign" | "tag.gpgsign"
-    )
+/// Git config keys forwarded when the host signs commits with SSH.
+///
+/// `gpg.ssh.allowedSignersFile` is deliberately absent: verification does not
+/// depend on the signing format, so it is handled separately and ungated.
+const SSH_SIGNING_KEYS: [&str; 4] = [
+    "gpg.format",
+    "user.signingkey",
+    "commit.gpgsign",
+    "tag.gpgsign",
+];
+
+/// Resolve a key the way git does, to its last occurrence rather than its first.
+///
+/// A repeated key is routine once includes are followed: the global file and a
+/// file it includes can each set one, and git takes the later value.
+fn resolve_last(entries: &[(String, String)], wanted: &str) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value.clone())
 }
 
 /// Check if a key points at the allowed-signers file.
@@ -131,19 +145,20 @@ const fn is_allowed_signers_key(key: &str) -> bool {
 
 /// If SSH signing is configured, include related keys that aren't already present.
 fn include_ssh_signing_keys(entries: &[(String, String)], safe: &mut Vec<GitConfigEntry>) {
-    let has_ssh_signing = entries.iter().any(|(k, v)| k == "gpg.format" && v == "ssh");
-    if !has_ssh_signing {
+    if resolve_last(entries, "gpg.format").as_deref() != Some("ssh") {
         return;
     }
 
-    for (key, value) in entries {
-        if !is_ssh_signing_key(key) || safe.iter().any(|e| e.key == *key) {
+    for key in SSH_SIGNING_KEYS {
+        if safe.iter().any(|e| e.key.eq_ignore_ascii_case(key)) {
             continue;
         }
-        safe.push(GitConfigEntry {
-            key: key.clone(),
-            value: value.clone(),
-        });
+        if let Some(value) = resolve_last(entries, key) {
+            safe.push(GitConfigEntry {
+                key: key.to_string(),
+                value,
+            });
+        }
     }
 }
 
@@ -280,14 +295,49 @@ mod tests {
 
     #[test]
     fn ssh_signing_keys_detected() {
-        assert!(is_ssh_signing_key("gpg.format"));
-        assert!(is_ssh_signing_key("user.signingkey"));
-        assert!(is_ssh_signing_key("commit.gpgsign"));
-        assert!(is_ssh_signing_key("tag.gpgsign"));
+        assert_eq!(
+            SSH_SIGNING_KEYS,
+            [
+                "gpg.format",
+                "user.signingkey",
+                "commit.gpgsign",
+                "tag.gpgsign"
+            ]
+        );
         assert!(
-            !is_ssh_signing_key("gpg.ssh.allowedSignersFile"),
+            !SSH_SIGNING_KEYS.contains(&"gpg.ssh.allowedSignersFile"),
             "the allowed-signers key is handled separately, not gated on gpg.format"
         );
+    }
+
+    #[test]
+    fn signing_keys_resolve_to_the_last_occurrence() {
+        // An include that switches the host to GPG signing: git reads the later
+        // value, so nothing SSH-specific may reach the container.
+        let raw = "gpg.format\nssh\0user.signingkey\n~/.ssh/stale.pub\0gpg.format\nopenpgp\0user.signingkey\nABCD1234\0";
+        let entries = parse_null_delimited_config(raw);
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe);
+
+        assert!(
+            safe.is_empty(),
+            "a host that no longer signs with SSH must forward no signing keys"
+        );
+    }
+
+    #[test]
+    fn signing_keys_take_the_last_value_when_repeated() {
+        // The reverse: an include turns SSH signing on and names the real key.
+        let raw = "gpg.format\nopenpgp\0user.signingkey\nABCD1234\0gpg.format\nssh\0user.signingkey\n~/.ssh/real.pub\0";
+        let entries = parse_null_delimited_config(raw);
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe);
+
+        let signing_key = safe
+            .iter()
+            .find(|e| e.key == "user.signingkey")
+            .expect("signing key should be forwarded");
+        assert_eq!(signing_key.value, "~/.ssh/real.pub");
     }
 
     #[test]
@@ -395,9 +445,7 @@ mod tests {
 
     #[test]
     fn allowed_signers_forwarded_when_signing_format_is_not_ssh() {
-        let raw = "gpg.format
-openpgp user.signingkey
-ABCD1234 ";
+        let raw = "gpg.format\nopenpgp\0user.signingkey\nABCD1234\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
         include_ssh_signing_keys(&entries, &mut safe);
