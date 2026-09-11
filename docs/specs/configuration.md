@@ -287,6 +287,7 @@ install = ["claude-code", "nvim"]
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `forward_config` | `bool` | `true` | Bind-mount host config (`~/.codex/`) into the container |
+| `database` | `"container"` \| `"host"` | `"container"` | Where Codex keeps its SQLite databases |
 | `version` | `string` | `"latest"` | `"latest"` or a pinned version |
 
 #### `[tools.gemini]`
