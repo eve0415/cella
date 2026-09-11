@@ -1186,6 +1186,31 @@ impl EnsureUpContext<'_> {
         })
     }
 
+    /// Apply tool config forwarding: the host config bind mounts, plus the env
+    /// those mounts require.
+    ///
+    /// `CODEX_SQLITE_HOME` belongs here rather than with the forwarded host env
+    /// because it is a consequence of the `~/.codex` mount, not of anything the
+    /// host environment carries.
+    fn apply_tool_config(
+        create_opts: &mut cella_backend::CreateContainerOptions,
+        image_env: &[String],
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+    ) {
+        for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
+            create_opts.mounts.push(spec.to_mount_config());
+        }
+
+        let tool_env = crate::tool_install::build_tool_config_env_specs(settings, remote_user);
+        if !tool_env.is_empty() {
+            if create_opts.env.is_empty() {
+                create_opts.env = image_env.to_vec();
+            }
+            create_opts.env.extend(tool_env);
+        }
+    }
+
     async fn apply_env_and_mounts(
         &self,
         create_opts: &mut cella_backend::CreateContainerOptions,
@@ -1208,9 +1233,7 @@ impl EnsureUpContext<'_> {
             });
         }
 
-        for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
-            create_opts.mounts.push(spec.to_mount_config());
-        }
+        Self::apply_tool_config(create_opts, image_env, remote_user, settings);
 
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
