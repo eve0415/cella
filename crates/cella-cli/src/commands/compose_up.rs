@@ -167,8 +167,12 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
                 managed_agent,
                 skip_rules,
             );
-            let env_fwd =
-                cella_env::prepare_env_forwarding(config, remote_user, proxy_fwd.as_ref());
+            let env_fwd = cella_env::prepare_env_forwarding(
+                config,
+                remote_user,
+                workspace_root,
+                proxy_fwd.as_ref(),
+            );
             // Trait method can't return Result; fall back to defaults on config error.
             let settings =
                 cella_config::CellaConfig::load(workspace_root, Some(&self.ctx.resolved))

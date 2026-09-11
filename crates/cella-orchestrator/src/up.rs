@@ -319,7 +319,12 @@ impl EnsureUpContext<'_> {
     > {
         let config = self.config_json();
 
-        let mut env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
+        let mut env_fwd = cella_env::prepare_env_forwarding(
+            config,
+            remote_user,
+            &self.config.resolved.workspace_root,
+            None,
+        );
         if !self.client.capabilities().managed_agent {
             env_fwd
                 .post_start
@@ -1522,6 +1527,46 @@ impl EnsureUpContext<'_> {
         (final_probed, lifecycle_env)
     }
 
+    /// Probe the host environment for this container.
+    ///
+    /// Proxy blocking rules need the agent-side proxy, and the credential
+    /// helper needs the agent binary, so both are dropped on backends that
+    /// never provision one — upstream proxy env vars still pass through.
+    fn resolve_env_forwarding(
+        &self,
+        config: &serde_json::Value,
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+    ) -> cella_env::EnvForwarding {
+        let net_config = settings.network.to_network_config();
+        let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
+        let has_rules = net_config.has_rules() && !skip_rules;
+
+        let managed_agent = self.client.capabilities().managed_agent;
+        let needs_proxy = (has_rules || settings.credentials.protect) && managed_agent;
+        let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: needs_proxy,
+            full_config: if needs_proxy { Some(net_config) } else { None },
+            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+            credentials_protect: settings.credentials.protect && managed_agent,
+        });
+        let mut env_fwd = cella_env::prepare_env_forwarding(
+            config,
+            remote_user,
+            &self.config.resolved.workspace_root,
+            proxy_fwd.as_ref(),
+        );
+
+        if !managed_agent {
+            env_fwd
+                .post_start
+                .git_config_commands
+                .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
+        }
+        env_fwd
+    }
+
     fn resolve_image_config(
         &self,
         img_name: &str,
@@ -1545,34 +1590,8 @@ impl EnsureUpContext<'_> {
             &self.config.resolved.workspace_root,
             Some(self.config.resolved),
         )?;
-        let net_config = settings.network.to_network_config();
-        let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
-        let has_rules = net_config.has_rules() && !skip_rules;
-
-        // For unmanaged backends, still forward upstream proxy env vars for
-        // direct passthrough, but disable blocking rules (which require the
-        // agent-side proxy that won't be provisioned).
         let managed_agent = self.client.capabilities().managed_agent;
-        let needs_proxy = (has_rules || settings.credentials.protect) && managed_agent;
-        let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
-            proxy: net_config.proxy.clone(),
-            has_blocking_rules: needs_proxy,
-            full_config: if needs_proxy { Some(net_config) } else { None },
-            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-            credentials_protect: settings.credentials.protect && managed_agent,
-        });
-        let mut env_fwd =
-            cella_env::prepare_env_forwarding(config, &remote_user, proxy_fwd.as_ref());
-
-        // Strip agent-dependent credential helper for unmanaged backends —
-        // the cella-agent binary won't be provisioned, so the helper would
-        // fail with "not found" on every git credential request.
-        if !managed_agent {
-            env_fwd
-                .post_start
-                .git_config_commands
-                .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
-        }
+        let mut env_fwd = self.resolve_env_forwarding(config, &remote_user, &settings);
 
         if settings.credentials.protect && managed_agent {
             crate::credential_protect::inject_routes_into_proxy_config(

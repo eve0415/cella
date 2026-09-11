@@ -164,6 +164,8 @@ For runtimes where direct socket forwarding is unreliable, the daemon runs a per
 
 Host SSH configuration files (`~/.ssh/known_hosts` and `~/.ssh/config`) are copied into the container during Phase 2 via file upload. Files are placed at the remote user's `~/.ssh/` directory with `0600` permissions. Missing or empty files are silently skipped.
 
+The git SSH signing allowed-signers file and a path-valued `user.signingKey` are copied into the same directory by the same mechanism, but their host sources are resolved from the host git config rather than from fixed names -- see [SSH Signing](#ssh-signing).
+
 ### User Override Detection
 
 If the devcontainer configuration already specifies SSH agent forwarding -- via `SSH_AUTH_SOCK` in `containerEnv` or `remoteEnv`, or via a mount targeting a path containing `ssh-auth`, `ssh_auth`, or `SSH_AUTH` -- cella skips automatic forwarding entirely. This prevents conflicts with user-managed SSH setups.
@@ -183,7 +185,9 @@ When all strategies are exhausted, cella logs a runtime-specific warning with ac
 
 ### Git Config Forwarding
 
-Host git global configuration is read via `git config --global --list --null` and filtered through a safe allowlist before injection into the container. Forwarded entries are applied as `git config --global` commands during Phase 2.
+Host git global configuration is read via `git config --global --includes --list --null` and filtered through a safe allowlist before injection into the container. Forwarded entries are applied as `git config --global` commands during Phase 2.
+
+The read runs with the workspace folder as its working directory. `--global` still decides which files git reads; the working directory only decides which `includeIf gitdir:` and `onbranch:` conditions match, so a user who narrows their identity or signing setup to one repository gets in the container the config git gives them while standing in that repository. Two cases fall back to reading without a working directory, because losing `includeIf` matching costs one conditional value while failing the read costs every forwarded key: a workspace folder that does not exist, and one git refuses to stand in at all -- which a `.git` file naming a gitdir that no longer exists, such as a worktree whose parent repository was moved or deleted, produces.
 
 **Allowlisted keys (exact match):**
 
@@ -219,9 +223,31 @@ Host git global configuration is read via `git config --global --list --null` an
 | `alias.*` | Git aliases |
 | `color.*` | Color configuration |
 
-**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`, `gpg.ssh.allowedSignersFile`.
+**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`. `user.signingKey` is the one value that may name a host file rather than carry one, so it is rewritten or dropped rather than forwarded blindly, and `gpg.ssh.allowedSignersFile` is handled separately and is not gated on the signing format -- see [SSH Signing](#ssh-signing).
 
 **Blocked keys** (never forwarded): `credential.*`, `gpg.*` (except SSH signing), `core.sshCommand`, `core.hooksPath`, `include.*`, `includeIf.*`, `safe.directory`, `http.*`, `url.*`, `remote.*`, `branch.*`. These are blocked because they reference host-specific paths, credentials, or network configuration that would be incorrect or dangerous inside the container.
+
+### SSH Signing
+
+The host value of `gpg.ssh.allowedSignersFile` names a path on the host, which usually does not exist in the container -- and on a macOS or Windows host is not even shaped like a container path. Forwarding it verbatim leaves git failing every `git verify-commit` and `git log --show-signature` with `gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification`. cella therefore copies the file into the container and points the forwarded value at the copy.
+
+The host source is resolved with `git config --global --includes --type=path --get gpg.ssh.allowedSignersFile`, run from the workspace folder like the rest of the host config read, so a value set in an included file -- conditional includes included -- is found and a leading `~` is expanded. Non-default locations such as `~/.config/git/allowed_signers` are handled the same as the conventional `~/.ssh/allowed_signers`.
+
+The file is copied verbatim, with every principal it lists, to the remote user's `~/.ssh/allowed_signers` with `0600` permissions -- regardless of where it lived on the host -- and the forwarded `gpg.ssh.allowedSignersFile` value is rewritten to that container path.
+
+Unlike the signing keys above, this is not gated on `gpg.format=ssh`.
+That setting selects the format commits are *signed* with, while git verifies an SSH-signed commit through the allowed-signers file whichever format the local user signs with.
+Gating it would leave someone who signs with GPG unable to verify a colleague's SSH-signed commits.
+
+Nothing is forwarded when the key is unset or the resolved file is missing or empty. The key is then omitted from the forwarded config entirely rather than injected as a path that does not exist. The copy is never gated on an `ssh` binary being present in the container: copying a text file needs no ssh client, and gating on one is what makes the equivalent VS Code behavior silently do nothing on images that ship without one.
+
+**Signing key:** `user.signingKey` has the same dangling-path problem in its path-valued form. Git reads the value either as literal SSH key material or as a filename, and the rule is the one git's own `is_literal_ssh_key` applies: a `key::` prefix marks key material, a bare `ssh-` prefix is the deprecated spelling of the same thing, and anything else is a filename. Both checks are byte-exact, so a value like `~/.ssh/ssh-key.pub` stays a filename.
+
+Literal key material is forwarded verbatim -- it carries the key with it and needs nothing on disk. A filename is resolved with `git config --global --includes --type=path --get user.signingKey` from the workspace folder, copied to the remote user's `~/.ssh/signing_key.pub` with `0600` permissions, and the forwarded value is rewritten to that container path. The filename is fixed rather than carried over from the host, so a host key named `config`, `known_hosts` or `allowed_signers` cannot overwrite another file cella writes into the same directory.
+
+Only the public half is ever copied. Git's config documentation notes the value "can contain the path to either your private ssh key or the public key when ssh-agent is used", so a value naming the private key is swapped for its conventional `.pub` sibling; signing still works because `ssh-keygen -Y sign` takes the private half from the forwarded SSH agent. A private key with no usable public counterpart is not forwarded at all.
+
+This is gated on `gpg.format` resolving to `ssh`. Under `openpgp` the value is a GPG key id, means nothing on the filesystem, and is forwarded untouched. As with the allowed-signers file, a filename whose file cannot be read drops the key from the forwarded config rather than injecting a path the container never had.
 
 ### Safe Directory
 

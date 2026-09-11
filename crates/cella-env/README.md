@@ -49,6 +49,7 @@ This is the main entry point. It detects the runtime, probes the host environmen
 | `proxy` | Network proxy environment forwarding |
 | `ssh_agent` | SSH agent socket detection and mount configuration (platform-aware) |
 | `ssh_config` | SSH config file reading (`~/.ssh/config`, `~/.ssh/known_hosts`) for upload into container |
+| `ssh_signing` | Git SSH signing material (allowed-signers file, signing key) resolution, upload, and config path rewriting |
 | `git_config` | Host git config reading (safe subset of `user.name`, `user.email`, etc.) |
 | `gh_credential` | gh CLI credential forwarding (auto-on when gh is installed) |
 | `user_env_probe` | Host environment variable probing for `userEnvProbe` spec support |
