@@ -515,8 +515,12 @@ async fn resolve_user_and_env(
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
     let proxy_fwd = build_proxy_forwarding_config(cfg.resolved, managed_agent, skip_rules);
-    let mut env_fwd =
-        cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
+    let mut env_fwd = cella_env::prepare_env_forwarding(
+        cfg.config,
+        &remote_user,
+        cfg.workspace_root,
+        proxy_fwd.as_ref(),
+    );
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
         &mut env_fwd,
         cfg.workspace_root,
@@ -871,7 +875,8 @@ async fn handle_compose_running(
 
     // Mount-input drift (settings, env forwarding, parent-git) — catches
     // mount-affecting changes that `config_hash` does not cover.
-    let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    let env_fwd_now =
+        cella_env::prepare_env_forwarding(config, &remote_user, cfg.workspace_root, None);
     let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     let current_mount_fp = crate::mount_parity::compute_mount_input_fingerprint(
         &settings_now,

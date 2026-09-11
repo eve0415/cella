@@ -1,5 +1,8 @@
 //! Host git config parsing and safe subset filtering.
 
+use std::path::Path;
+use std::process::Output;
+
 use tracing::warn;
 
 /// A git config key-value pair to inject into the container.
@@ -16,16 +19,67 @@ pub struct GitConfigEntry {
 /// Without it, keys set in a file pulled in via `include.path` are invisible.
 const LIST_ARGS: [&str; 5] = ["config", "--global", "--includes", "--list", "--null"];
 
+/// Exit status git uses for a fatal error.
+///
+/// `git config` reports on the config itself with small codes — 1 for a key
+/// that is not set — and uses this one when it gave up before reading any
+/// config at all. A directory git refuses to run in is one cause; a global
+/// config file that is not there is another, which is why the retry below
+/// decides between them rather than the code alone.
+const GIT_FATAL: i32 = 128;
+
+/// Run a host `git` invocation, optionally from a given directory.
+fn run_host_git(args: &[&str], from: Option<&Path>) -> std::io::Result<Output> {
+    let mut command = std::process::Command::new("git");
+    command.args(args);
+    if let Some(dir) = from {
+        command.current_dir(dir);
+    }
+    command.output()
+}
+
+/// Run a host `git` invocation from the workspace folder.
+///
+/// `--global` still decides which files are read; the working directory only decides which `includeIf gitdir:` and `onbranch:` conditions match, so a user who narrows their signing config to one repository gets the config git would give them while standing in it.
+///
+/// Two cases fall back to running without a working directory, because losing `includeIf` matching costs one conditional value while failing the read costs every forwarded key. A folder that is not there cannot be a working directory at all — `Command::current_dir` would turn that into a spawn failure indistinguishable from git being missing. A folder git refuses to stand in, which a `.git` file naming a gitdir that no longer exists produces, fails every invocation with `fatal: not a git repository` before reading any config.
+pub(crate) fn host_git_output(args: &[&str], workspace_folder: &Path) -> std::io::Result<Output> {
+    if !workspace_folder.is_dir() {
+        return run_host_git(args, None);
+    }
+
+    let output = run_host_git(args, Some(workspace_folder))?;
+    if output.status.code() != Some(GIT_FATAL) {
+        return Ok(output);
+    }
+
+    // Git gave up before reading any config. Retrying without the working directory says which cause it was: succeeding means the workspace folder was the problem, and failing the same way means it was not, so the original result stands.
+    let fallback = run_host_git(args, None)?;
+    if fallback.status.code() == Some(GIT_FATAL) {
+        return Ok(output);
+    }
+
+    warn!(
+        "Reading host git config from {} failed ({}), falling back to the unconditional global config",
+        workspace_folder.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(fallback)
+}
+
 /// Read host git config and return the safe subset for container injection.
 ///
-/// Invokes `git config --global --includes --list --null` on the host and
-/// filters through an allowlist of safe keys.
+/// Invokes `git config --global --includes --list --null` on the host, from
+/// `workspace_folder`, and filters through an allowlist of safe keys.
 /// Returns empty vec if git is not installed or has no global config.
 ///
 /// `allowed_signers_path` is the container-side path of the forwarded
 /// allowed-signers file, or `None` when it could not be forwarded.
-pub fn read_host_git_config(allowed_signers_path: Option<&str>) -> Vec<GitConfigEntry> {
-    let output = std::process::Command::new("git").args(LIST_ARGS).output();
+pub fn read_host_git_config(
+    workspace_folder: &Path,
+    allowed_signers_path: Option<&str>,
+) -> Vec<GitConfigEntry> {
+    let output = host_git_output(&LIST_ARGS, workspace_folder);
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -242,6 +296,147 @@ mod tests {
             safe.iter()
                 .any(|e| e.key == "user.name" && e.value == "Included Name"),
             "a key set in an included file must be forwarded"
+        );
+    }
+
+    #[test]
+    fn working_directory_selects_the_matching_conditional_include() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+
+        let included = tmp.path().join("included");
+        std::fs::write(&included, "[user]\n\tname = Workspace Name\n").unwrap();
+        let global = tmp.path().join("global");
+        std::fs::write(
+            &global,
+            format!(
+                "[user]\n\tname = Global Name\n[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+                workspace.display(),
+                included.display()
+            ),
+        )
+        .unwrap();
+
+        // Skips when git is unavailable, like the rest of the host-git tests.
+        let Ok(status) = std::process::Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(&workspace)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .status()
+        else {
+            return;
+        };
+        assert!(status.success(), "git init should succeed");
+
+        // Mirrors `host_git_output`, with `GIT_CONFIG_GLOBAL` scoped to the child rather than set on this process.
+        let name_in = |dir: &Path| {
+            let output = std::process::Command::new("git")
+                .args(LIST_ARGS)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .output()
+                .expect("git was available a moment ago");
+            let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+            resolve_last(&parse_null_delimited_config(&raw), "user.name")
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        assert_eq!(
+            name_in(&workspace),
+            "Workspace Name",
+            "a gitdir-conditional include must match when git runs in the workspace folder"
+        );
+        assert_eq!(
+            name_in(&elsewhere),
+            "Global Name",
+            "a folder outside the condition must fall back to the unconditional value"
+        );
+    }
+
+    #[test]
+    fn a_workspace_folder_git_refuses_falls_back_to_the_unconditional_read() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        std::fs::write(&global, "[user]\n\tname = Global Name\n").unwrap();
+
+        // A stale worktree pointer: `.git` names a gitdir that is not there, and git refuses to run in the directory at all.
+        let stale = tmp.path().join("stale");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join(".git"), "gitdir: /nonexistent/path\n").unwrap();
+
+        // Skips when git is unavailable, like the rest of the host-git tests.
+        let Ok(refused) = std::process::Command::new("git")
+            .args(LIST_ARGS)
+            .current_dir(&stale)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+        else {
+            return;
+        };
+        assert_eq!(
+            refused.status.code(),
+            Some(GIT_FATAL),
+            "the fixture must be a directory git actually refuses"
+        );
+
+        let recovered = std::process::Command::new("git")
+            .args(LIST_ARGS)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+            .expect("git was available a moment ago");
+        let raw = String::from_utf8_lossy(&recovered.stdout).into_owned();
+        assert_eq!(
+            resolve_last(&parse_null_delimited_config(&raw), "user.name"),
+            Some("Global Name"),
+            "dropping the working directory must recover every forwarded key"
+        );
+    }
+
+    #[test]
+    fn an_unset_key_is_not_mistaken_for_a_refused_directory() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        std::fs::write(&global, "[user]\n\tname = Global Name\n").unwrap();
+
+        // Skips when git is unavailable, like the rest of the host-git tests.
+        let Ok(output) = std::process::Command::new("git")
+            .args([
+                "config",
+                "--global",
+                "--includes",
+                "--get",
+                "user.signingkey",
+            ])
+            .current_dir(tmp.path())
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+        else {
+            return;
+        };
+        assert!(!output.status.success(), "the key is not set");
+        assert_ne!(
+            output.status.code(),
+            Some(GIT_FATAL),
+            "an unset key must not trigger the fallback, which would resolve it from cella's own directory"
+        );
+    }
+
+    #[test]
+    fn host_git_output_tolerates_a_missing_workspace_folder() {
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("gone");
+
+        // Skips when git is unavailable, like the rest of the host-git tests.
+        let Ok(output) = host_git_output(&["--version"], &absent) else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "a workspace folder that is not there must not turn into a spawn failure"
         );
     }
 

@@ -201,8 +201,12 @@ fn apply_ssh_config_files(fwd: &mut EnvForwarding, remote_user: &str) {
 ///
 /// Returns the container-side path when the file was forwarded, so the
 /// forwarded `gpg.ssh.allowedSignersFile` value can be pointed at it.
-fn apply_ssh_signing(fwd: &mut EnvForwarding, remote_user: &str) -> Option<String> {
-    let upload = ssh_signing::read_allowed_signers_upload(remote_user)?;
+fn apply_ssh_signing(
+    fwd: &mut EnvForwarding,
+    remote_user: &str,
+    workspace_folder: &std::path::Path,
+) -> Option<String> {
+    let upload = ssh_signing::read_allowed_signers_upload(remote_user, workspace_folder)?;
     let container_path = upload.container_path.clone();
     tracing::info!("Copying git allowed signers file to {container_path}");
     fwd.post_start.file_uploads.push(upload);
@@ -210,8 +214,12 @@ fn apply_ssh_signing(fwd: &mut EnvForwarding, remote_user: &str) -> Option<Strin
 }
 
 /// Apply host git config forwarding to the environment.
-fn apply_git_config(fwd: &mut EnvForwarding, allowed_signers_path: Option<&str>) {
-    let git_entries = git_config::read_host_git_config(allowed_signers_path);
+fn apply_git_config(
+    fwd: &mut EnvForwarding,
+    workspace_folder: &std::path::Path,
+    allowed_signers_path: Option<&str>,
+) {
+    let git_entries = git_config::read_host_git_config(workspace_folder, allowed_signers_path);
     if !git_entries.is_empty() {
         tracing::info!(
             "Forwarding {} git config entries to container",
@@ -351,11 +359,15 @@ fn inject_mitm_ca_trust(
 /// Detects the Docker runtime, probes host SSH agent and git config,
 /// and assembles the forwarding configuration.
 ///
+/// `workspace_folder` is the host directory the container is being brought up for.
+/// Host git config is read from there so that `includeIf` conditions resolve the way they would for the user working in that repository.
+///
 /// Never fails — individual features log warnings and are skipped
 /// on error, per the design principle of never failing `cella up`.
 pub fn prepare_env_forwarding(
     config: &serde_json::Value,
     remote_user: &str,
+    workspace_folder: &std::path::Path,
     network: Option<&ProxyForwardingConfig>,
 ) -> EnvForwarding {
     let runtime = platform::detect_runtime();
@@ -365,8 +377,8 @@ pub fn prepare_env_forwarding(
 
     apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
     apply_ssh_config_files(&mut fwd, remote_user);
-    let allowed_signers = apply_ssh_signing(&mut fwd, remote_user);
-    apply_git_config(&mut fwd, allowed_signers.as_deref());
+    let allowed_signers = apply_ssh_signing(&mut fwd, remote_user, workspace_folder);
+    apply_git_config(&mut fwd, workspace_folder, allowed_signers.as_deref());
     apply_safe_directory(&mut fwd);
     apply_credential_forwarding(&mut fwd);
     apply_global_gitignore(&mut fwd, remote_user);
@@ -497,7 +509,8 @@ mod tests {
     #[test]
     fn test_prepare_env_forwarding_minimal() {
         let config: serde_json::Value = serde_json::from_str("{}").unwrap();
-        let fwd = prepare_env_forwarding(&config, "root", None);
+        let workspace = tempfile::TempDir::new().unwrap();
+        let fwd = prepare_env_forwarding(&config, "root", workspace.path(), None);
 
         // Credential forwarding is always added regardless of other config.
         let has_credential_helper = fwd

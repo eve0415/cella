@@ -187,6 +187,8 @@ When all strategies are exhausted, cella logs a runtime-specific warning with ac
 
 Host git global configuration is read via `git config --global --includes --list --null` and filtered through a safe allowlist before injection into the container. Forwarded entries are applied as `git config --global` commands during Phase 2.
 
+The read runs with the workspace folder as its working directory. `--global` still decides which files git reads; the working directory only decides which `includeIf gitdir:` and `onbranch:` conditions match, so a user who narrows their identity or signing setup to one repository gets in the container the config git gives them while standing in that repository. Two cases fall back to reading without a working directory, because losing `includeIf` matching costs one conditional value while failing the read costs every forwarded key: a workspace folder that does not exist, and one git refuses to stand in at all -- which a `.git` file naming a gitdir that no longer exists, such as a worktree whose parent repository was moved or deleted, produces.
+
 **Allowlisted keys (exact match):**
 
 | Key | Description |
@@ -229,7 +231,7 @@ Host git global configuration is read via `git config --global --includes --list
 
 The host value of `gpg.ssh.allowedSignersFile` names a path on the host, which usually does not exist in the container -- and on a macOS or Windows host is not even shaped like a container path. Forwarding it verbatim leaves git failing every `git verify-commit` and `git log --show-signature` with `gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification`. cella therefore copies the file into the container and points the forwarded value at the copy.
 
-The host source is resolved with `git config --global --includes --type=path --get gpg.ssh.allowedSignersFile`, so a value set in an included file is found and a leading `~` is expanded. Non-default locations such as `~/.config/git/allowed_signers` are handled the same as the conventional `~/.ssh/allowed_signers`.
+The host source is resolved with `git config --global --includes --type=path --get gpg.ssh.allowedSignersFile`, run from the workspace folder like the rest of the host config read, so a value set in an included file -- conditional includes included -- is found and a leading `~` is expanded. Non-default locations such as `~/.config/git/allowed_signers` are handled the same as the conventional `~/.ssh/allowed_signers`.
 
 The file is copied verbatim, with every principal it lists, to the remote user's `~/.ssh/allowed_signers` with `0600` permissions -- regardless of where it lived on the host -- and the forwarded `gpg.ssh.allowedSignersFile` value is rewritten to that container path.
 

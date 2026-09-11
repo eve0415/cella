@@ -34,12 +34,10 @@ const RESOLVE_ARGS: [&str; 6] = [
 
 /// Resolve the host's configured allowed-signers file path.
 ///
+/// Resolved from `workspace_folder` so a value set behind an `includeIf gitdir:` condition is the one the user sees in that repository.
 /// Returns `None` when git is missing or the key is unset.
-fn resolve_host_path() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(RESOLVE_ARGS)
-        .output()
-        .ok()?;
+fn resolve_host_path(workspace_folder: &Path) -> Option<PathBuf> {
+    let output = crate::git_config::host_git_output(&RESOLVE_ARGS, workspace_folder).ok()?;
 
     if !output.status.success() {
         return None;
@@ -83,8 +81,11 @@ fn build_upload(host_path: &Path, remote_user: &str) -> Option<FileUpload> {
 ///
 /// Returns `None` when SSH signing is not configured on the host or the
 /// configured file cannot be read, in which case nothing is forwarded.
-pub fn read_allowed_signers_upload(remote_user: &str) -> Option<FileUpload> {
-    let host_path = resolve_host_path()?;
+pub fn read_allowed_signers_upload(
+    remote_user: &str,
+    workspace_folder: &Path,
+) -> Option<FileUpload> {
+    let host_path = resolve_host_path(workspace_folder)?;
     build_upload(&host_path, remote_user)
 }
 
