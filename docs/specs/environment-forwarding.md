@@ -164,7 +164,7 @@ For runtimes where direct socket forwarding is unreliable, the daemon runs a per
 
 Host SSH configuration files (`~/.ssh/known_hosts` and `~/.ssh/config`) are copied into the container during Phase 2 via file upload. Files are placed at the remote user's `~/.ssh/` directory with `0600` permissions. Missing or empty files are silently skipped.
 
-The git SSH signing allowed-signers file is copied into the same directory by the same mechanism, but its host source is resolved from the host git config rather than from a fixed name -- see [SSH Signing](#ssh-signing).
+The git SSH signing allowed-signers file and a path-valued `user.signingKey` are copied into the same directory by the same mechanism, but their host sources are resolved from the host git config rather than from fixed names -- see [SSH Signing](#ssh-signing).
 
 ### User Override Detection
 
@@ -223,7 +223,7 @@ The read runs with the workspace folder as its working directory. `--global` sti
 | `alias.*` | Git aliases |
 | `color.*` | Color configuration |
 
-**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`. `gpg.ssh.allowedSignersFile` is handled separately and is not gated on the signing format -- see [SSH Signing](#ssh-signing).
+**SSH signing exception:** When `gpg.format=ssh` is detected in the host config, the following keys are additionally forwarded: `gpg.format`, `user.signingKey`, `commit.gpgSign`, `tag.gpgSign`. `user.signingKey` is the one value that may name a host file rather than carry one, so it is rewritten or dropped rather than forwarded blindly, and `gpg.ssh.allowedSignersFile` is handled separately and is not gated on the signing format -- see [SSH Signing](#ssh-signing).
 
 **Blocked keys** (never forwarded): `credential.*`, `gpg.*` (except SSH signing), `core.sshCommand`, `core.hooksPath`, `include.*`, `includeIf.*`, `safe.directory`, `http.*`, `url.*`, `remote.*`, `branch.*`. These are blocked because they reference host-specific paths, credentials, or network configuration that would be incorrect or dangerous inside the container.
 
@@ -240,6 +240,14 @@ That setting selects the format commits are *signed* with, while git verifies an
 Gating it would leave someone who signs with GPG unable to verify a colleague's SSH-signed commits.
 
 Nothing is forwarded when the key is unset or the resolved file is missing or empty. The key is then omitted from the forwarded config entirely rather than injected as a path that does not exist. The copy is never gated on an `ssh` binary being present in the container: copying a text file needs no ssh client, and gating on one is what makes the equivalent VS Code behavior silently do nothing on images that ship without one.
+
+**Signing key:** `user.signingKey` has the same dangling-path problem in its path-valued form. Git reads the value either as literal SSH key material or as a filename, and the rule is the one git's own `is_literal_ssh_key` applies: a `key::` prefix marks key material, a bare `ssh-` prefix is the deprecated spelling of the same thing, and anything else is a filename. Both checks are byte-exact, so a value like `~/.ssh/ssh-key.pub` stays a filename.
+
+Literal key material is forwarded verbatim -- it carries the key with it and needs nothing on disk. A filename is resolved with `git config --global --includes --type=path --get user.signingKey` from the workspace folder, copied to the remote user's `~/.ssh/signing_key.pub` with `0600` permissions, and the forwarded value is rewritten to that container path. The filename is fixed rather than carried over from the host, so a host key named `config`, `known_hosts` or `allowed_signers` cannot overwrite another file cella writes into the same directory.
+
+Only the public half is ever copied. Git's config documentation notes the value "can contain the path to either your private ssh key or the public key when ssh-agent is used", so a value naming the private key is swapped for its conventional `.pub` sibling; signing still works because `ssh-keygen -Y sign` takes the private half from the forwarded SSH agent. A private key with no usable public counterpart is not forwarded at all.
+
+This is gated on `gpg.format` resolving to `ssh`. Under `openpgp` the value is a GPG key id, means nothing on the filesystem, and is forwarded untouched. As with the allowed-signers file, a filename whose file cannot be read drops the key from the forwarded config rather than injecting a path the container never had.
 
 ### Safe Directory
 

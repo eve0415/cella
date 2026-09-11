@@ -213,13 +213,32 @@ fn apply_ssh_signing(
     Some(container_path)
 }
 
+/// Copy the host's SSH signing key into the container.
+///
+/// Returns the value the forwarded `user.signingKey` must carry: the container path when the host value named a file, and nothing at all when that file could not be copied.
+fn apply_signing_key(
+    fwd: &mut EnvForwarding,
+    host_config: &[(String, String)],
+    remote_user: &str,
+    workspace_folder: &std::path::Path,
+) -> ssh_signing::SigningKeyValue {
+    let forwarding = ssh_signing::read_signing_key(host_config, remote_user, workspace_folder);
+    if let Some(upload) = forwarding.upload {
+        tracing::info!("Copying git signing key to {}", upload.container_path);
+        fwd.post_start.file_uploads.push(upload);
+    }
+    forwarding.value
+}
+
 /// Apply host git config forwarding to the environment.
 fn apply_git_config(
     fwd: &mut EnvForwarding,
-    workspace_folder: &std::path::Path,
+    host_config: &[(String, String)],
     allowed_signers_path: Option<&str>,
+    signing_key: &ssh_signing::SigningKeyValue,
 ) {
-    let git_entries = git_config::read_host_git_config(workspace_folder, allowed_signers_path);
+    let git_entries =
+        git_config::select_forwarded_config(host_config, allowed_signers_path, signing_key);
     if !git_entries.is_empty() {
         tracing::info!(
             "Forwarding {} git config entries to container",
@@ -377,8 +396,15 @@ pub fn prepare_env_forwarding(
 
     apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
     apply_ssh_config_files(&mut fwd, remote_user);
+    let host_config = git_config::list_host_git_config(workspace_folder);
     let allowed_signers = apply_ssh_signing(&mut fwd, remote_user, workspace_folder);
-    apply_git_config(&mut fwd, workspace_folder, allowed_signers.as_deref());
+    let signing_key = apply_signing_key(&mut fwd, &host_config, remote_user, workspace_folder);
+    apply_git_config(
+        &mut fwd,
+        &host_config,
+        allowed_signers.as_deref(),
+        &signing_key,
+    );
     apply_safe_directory(&mut fwd);
     apply_credential_forwarding(&mut fwd);
     apply_global_gitignore(&mut fwd, remote_user);

@@ -5,6 +5,8 @@ use std::process::Output;
 
 use tracing::warn;
 
+use crate::ssh_signing::SigningKeyValue;
+
 /// A git config key-value pair to inject into the container.
 #[derive(Debug, Clone)]
 pub struct GitConfigEntry {
@@ -67,18 +69,13 @@ pub(crate) fn host_git_output(args: &[&str], workspace_folder: &Path) -> std::io
     Ok(fallback)
 }
 
-/// Read host git config and return the safe subset for container injection.
+/// List the host's global git config as git itself resolves it in `workspace_folder`.
 ///
-/// Invokes `git config --global --includes --list --null` on the host, from
-/// `workspace_folder`, and filters through an allowlist of safe keys.
+/// Invokes `git config --global --includes --list --null` on the host and
+/// returns the key-value pairs in listing order, so a key set more than once
+/// keeps every occurrence for `resolve_last` to settle.
 /// Returns empty vec if git is not installed or has no global config.
-///
-/// `allowed_signers_path` is the container-side path of the forwarded
-/// allowed-signers file, or `None` when it could not be forwarded.
-pub fn read_host_git_config(
-    workspace_folder: &Path,
-    allowed_signers_path: Option<&str>,
-) -> Vec<GitConfigEntry> {
+pub fn list_host_git_config(workspace_folder: &Path) -> Vec<(String, String)> {
     let output = host_git_output(&LIST_ARGS, workspace_folder);
 
     let output = match output {
@@ -90,11 +87,23 @@ pub fn read_host_git_config(
         }
     };
 
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let entries = parse_null_delimited_config(&raw);
-    let mut safe = filter_safe_config(&entries);
+    parse_null_delimited_config(&String::from_utf8_lossy(&output.stdout))
+}
 
-    include_ssh_signing_keys(&entries, &mut safe);
+/// Return the safe subset of host git config for container injection.
+///
+/// `allowed_signers_path` is the container-side path of the forwarded
+/// allowed-signers file, or `None` when it could not be forwarded.
+/// `signing_key` says what to forward for `user.signingKey` once the host value
+/// has been inspected for a path that only exists on the host.
+pub fn select_forwarded_config(
+    entries: &[(String, String)],
+    allowed_signers_path: Option<&str>,
+    signing_key: &SigningKeyValue,
+) -> Vec<GitConfigEntry> {
+    let mut safe = filter_safe_config(entries);
+
+    include_ssh_signing_keys(entries, &mut safe, signing_key);
     include_allowed_signers_key(&mut safe, allowed_signers_path);
 
     safe
@@ -173,21 +182,22 @@ fn is_safe_key(key: &str) -> bool {
 ///
 /// `gpg.ssh.allowedSignersFile` is deliberately absent: verification does not
 /// depend on the signing format, so it is handled separately and ungated.
-const SSH_SIGNING_KEYS: [&str; 4] = [
-    "gpg.format",
-    "user.signingkey",
-    "commit.gpgsign",
-    "tag.gpgsign",
-];
+const SSH_SIGNING_KEYS: [&str; 4] = [GPG_FORMAT_KEY, SIGNING_KEY, "commit.gpgsign", "tag.gpgsign"];
 
 /// The key naming the file git verifies SSH signatures against.
 pub(crate) const ALLOWED_SIGNERS_KEY: &str = "gpg.ssh.allowedSignersFile";
+
+/// The key selecting the format commits are signed with.
+pub(crate) const GPG_FORMAT_KEY: &str = "gpg.format";
+
+/// The key naming the key commits are signed with.
+pub(crate) const SIGNING_KEY: &str = "user.signingkey";
 
 /// Resolve a key the way git does, to its last occurrence rather than its first.
 ///
 /// A repeated key is routine once includes are followed: the global file and a
 /// file it includes can each set one, and git takes the later value.
-fn resolve_last<'a>(entries: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
+pub(crate) fn resolve_last<'a>(entries: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
     entries
         .iter()
         .rev()
@@ -209,13 +219,35 @@ fn push_if_absent(safe: &mut Vec<GitConfigEntry>, key: &str, value: &str) {
 }
 
 /// If SSH signing is configured, include related keys that aren't already present.
-fn include_ssh_signing_keys(entries: &[(String, String)], safe: &mut Vec<GitConfigEntry>) {
-    if resolve_last(entries, "gpg.format") != Some("ssh") {
+///
+/// `user.signingKey` is the one key whose host value may name a file rather
+/// than carry one: it is forwarded verbatim only when git reads it as literal
+/// key material, rewritten to the copy when the named file was copied into the
+/// container, and left out entirely when it was not — the same rule the
+/// allowed-signers key follows, so neither key points at a host path the
+/// container never had.
+fn include_ssh_signing_keys(
+    entries: &[(String, String)],
+    safe: &mut Vec<GitConfigEntry>,
+    signing_key: &SigningKeyValue,
+) {
+    if resolve_last(entries, GPG_FORMAT_KEY) != Some("ssh") {
         return;
     }
 
     for key in SSH_SIGNING_KEYS {
-        if let Some(value) = resolve_last(entries, key) {
+        let Some(value) = resolve_last(entries, key) else {
+            continue;
+        };
+        if key == SIGNING_KEY {
+            match signing_key {
+                SigningKeyValue::Verbatim => push_if_absent(safe, key, value),
+                SigningKeyValue::Rewritten(container_path) => {
+                    push_if_absent(safe, key, container_path);
+                }
+                SigningKeyValue::Omitted => {}
+            }
+        } else {
             push_if_absent(safe, key, value);
         }
     }
@@ -493,7 +525,7 @@ mod tests {
         let raw = "gpg.format\nssh\0user.signingkey\n~/.ssh/stale.pub\0gpg.format\nopenpgp\0user.signingkey\nABCD1234\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
 
         assert!(
             safe.is_empty(),
@@ -507,7 +539,7 @@ mod tests {
         let raw = "gpg.format\nopenpgp\0user.signingkey\nABCD1234\0gpg.format\nssh\0user.signingkey\n~/.ssh/real.pub\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
 
         let signing_key = safe
             .iter()
@@ -561,7 +593,7 @@ mod tests {
         let raw = "gpg.format\nssh\0user.signingkey\n~/.ssh/id_ed25519.pub\0commit.gpgsign\ntrue\0credential.helper\nstore\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
 
         assert!(safe.iter().any(|e| e.key == "gpg.format"));
         assert!(safe.iter().any(|e| e.key == "user.signingkey"));
@@ -592,7 +624,7 @@ mod tests {
     fn other_signing_keys_stay_verbatim() {
         let entries = signing_entries();
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
 
         let signing_key = safe
             .iter()
@@ -603,10 +635,47 @@ mod tests {
     }
 
     #[test]
+    fn signing_key_rewritten_to_the_copied_container_path() {
+        let entries = signing_entries();
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(
+            &entries,
+            &mut safe,
+            &SigningKeyValue::Rewritten("/home/node/.ssh/signing_key.pub".to_string()),
+        );
+
+        let signing_key = safe
+            .iter()
+            .find(|e| e.key == SIGNING_KEY)
+            .expect("signing key should be forwarded");
+        assert_eq!(signing_key.value, "/home/node/.ssh/signing_key.pub");
+        assert!(
+            safe.iter().any(|e| e.key == GPG_FORMAT_KEY),
+            "the remaining signing keys are still forwarded"
+        );
+    }
+
+    #[test]
+    fn signing_key_omitted_when_its_file_could_not_be_copied() {
+        let entries = signing_entries();
+        let mut safe = filter_safe_config(&entries);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Omitted);
+
+        assert!(
+            !safe.iter().any(|e| e.key == SIGNING_KEY),
+            "an uncopyable key must not leave a dangling host path behind"
+        );
+        assert!(
+            safe.iter().any(|e| e.key == "commit.gpgsign"),
+            "the remaining signing keys are still forwarded"
+        );
+    }
+
+    #[test]
     fn allowed_signers_omitted_when_not_forwarded() {
         let entries = signing_entries();
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
         include_allowed_signers_key(&mut safe, None);
 
         assert!(
@@ -626,7 +695,7 @@ mod tests {
         let raw = "gpg.format\nopenpgp\0user.signingkey\nABCD1234\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
-        include_ssh_signing_keys(&entries, &mut safe);
+        include_ssh_signing_keys(&entries, &mut safe, &SigningKeyValue::Verbatim);
         include_allowed_signers_key(&mut safe, Some("/home/node/.ssh/allowed_signers"));
 
         let entry = safe
