@@ -125,7 +125,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
 - [x] Bidirectional clipboard forwarding (xsel/xclip)
-- [x] Bubblewrap installed for Codex sandbox support
+- [x] Bubblewrap installed for Codex only where the container can run it — elsewhere cella installs nothing and Codex uses the `bwrap` it bundles, which enforces without relaxing the container
 - [x] Credential protection — phantom tokens replace real credentials inside containers, daemon injects real values at request time ([guide](docs/guides/credential-protection.md))
 
 ### Spec Compliance

@@ -36,11 +36,7 @@ pub fn to_bollard_config(opts: &CreateContainerOptions) -> ContainerCreateBody {
     } else {
         Some(merged.cap_add)
     };
-    host_config.security_opt = if merged.security_opt.is_empty() {
-        None
-    } else {
-        Some(merged.security_opt)
-    };
+    apply_security_opt(&mut host_config, merged.security_opt);
     host_config.privileged = Some(merged.privileged);
     host_config.init = Some(merged.init);
 
@@ -78,6 +74,30 @@ pub fn to_bollard_config(opts: &CreateContainerOptions) -> ContainerCreateBody {
         host_config: Some(host_config),
         ..Default::default()
     }
+}
+
+/// The one `--security-opt` value the docker CLI never sends to the daemon.
+const SYSTEMPATHS_UNCONFINED: &str = "systempaths=unconfined";
+
+/// Apply the merged `security_opt` list, translating `systempaths=unconfined` the way the docker CLI does.
+///
+/// docker/cli strips that value in `parseSystemPaths` and turns it into empty `MaskedPaths`/`ReadonlyPaths` on the create request; the daemon only accepts `label|apparmor|seccomp|no-new-privileges|writable-cgroups` and errors on the literal string.  The official devcontainer CLI spawns the `docker` binary, so `"securityOpt": ["systempaths=unconfined"]` reaches that translation there — talking to the Engine API directly means doing it here instead.
+///
+/// Only the exact value is intercepted.  Any other `systempaths=...` value stays in the list and is rejected by the daemon, which is what docker does too.
+///
+/// The value can arrive from the user's own `securityOpt` or `runArgs`, but also from feature metadata or a base image's `devcontainer.metadata` label, so the translation warns whenever it fires.
+fn apply_security_opt(host_config: &mut HostConfig, mut security_opt: Vec<String>) {
+    let before = security_opt.len();
+    security_opt.retain(|opt| opt != SYSTEMPATHS_UNCONFINED);
+    if security_opt.len() != before {
+        tracing::warn!(
+            "securityOpt systempaths=unconfined: clearing Docker's masked and read-only paths for this container, which relaxes its isolation."
+        );
+        // `Some(vec![])` serializes as `"MaskedPaths": []`, which tells the daemon to override its defaults with nothing.  `None` is skipped by `skip_serializing_if` and would leave the defaults in place.
+        host_config.masked_paths = Some(Vec::new());
+        host_config.readonly_paths = Some(Vec::new());
+    }
+    host_config.security_opt = (!security_opt.is_empty()).then_some(security_opt);
 }
 
 /// Build exposed ports and port bindings, converting `PortForward` to
@@ -1515,6 +1535,72 @@ mod tests {
         let so = hc.security_opt.unwrap();
         assert!(so.contains(&"apparmor=unconfined".to_string()));
         assert!(so.contains(&"no-new-privileges".to_string()));
+    }
+
+    #[test]
+    fn systempaths_unconfined_alone_becomes_empty_masked_and_readonly_paths() {
+        let mut opts = minimal_opts();
+        opts.security_opt = vec!["systempaths=unconfined".to_string()];
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert!(hc.security_opt.is_none());
+        assert_eq!(hc.masked_paths, Some(Vec::new()));
+        assert_eq!(hc.readonly_paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn systempaths_unconfined_leaves_other_security_opts_in_place() {
+        let mut opts = minimal_opts();
+        opts.security_opt = vec![
+            "seccomp=unconfined".to_string(),
+            "systempaths=unconfined".to_string(),
+        ];
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+        assert_eq!(hc.masked_paths, Some(Vec::new()));
+        assert_eq!(hc.readonly_paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn systempaths_unconfined_from_run_args_is_translated_too() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            security_opt: vec!["systempaths=unconfined".to_string()],
+            ..Default::default()
+        });
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert!(hc.security_opt.is_none());
+        assert_eq!(hc.masked_paths, Some(Vec::new()));
+        assert_eq!(hc.readonly_paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn without_systempaths_masked_and_readonly_paths_stay_unset() {
+        let mut opts = minimal_opts();
+        opts.security_opt = vec!["seccomp=unconfined".to_string()];
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+        assert!(hc.masked_paths.is_none());
+        assert!(hc.readonly_paths.is_none());
+    }
+
+    #[test]
+    fn other_systempaths_values_are_passed_through_untouched() {
+        // docker/cli only intercepts the exact `unconfined` value; anything else travels to the daemon, which rejects it.
+        let mut opts = minimal_opts();
+        opts.security_opt = vec!["systempaths=confined".to_string()];
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["systempaths=confined".to_string()])
+        );
+        assert!(hc.masked_paths.is_none());
+        assert!(hc.readonly_paths.is_none());
     }
 
     // -----------------------------------------------------------------------

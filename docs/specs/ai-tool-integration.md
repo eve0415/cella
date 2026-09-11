@@ -17,7 +17,7 @@ flowchart TB
         cli["cella install<br/>(interactive / named)"]
         config --> resolve["resolve tool names"]
         cli --> resolve
-        resolve --> deps["ensure dependencies<br/>(Node.js, bubblewrap,<br/>Alpine libs)"]
+        resolve --> deps["ensure dependencies<br/>(Node.js, bubblewrap where<br/>usable, Alpine libs)"]
         deps --> install["run installer<br/>(curl, npm, apt/apk,<br/>GitHub release)"]
         install --> verify["verify callable<br/>(login-shell probe)"]
         verify -->|not on PATH| symlink["/usr/local/bin symlink"]
@@ -105,8 +105,16 @@ Tools that require runtime dependencies have them provisioned automatically:
 | Tool | Dependency | Provisioning |
 |---|---|---|
 | Claude Code (Alpine) | `libgcc`, `libstdc++`, `ripgrep` | `apk add --no-cache` before installer; sets `USE_BUILTIN_RIPGREP=0` |
-| Codex | `bubblewrap` (sandbox) | `apt-get` or `apk` depending on distro |
+| Codex | `bubblewrap` (sandbox binary) | `apt-get` or `apk` depending on distro, and only where a user-namespace procfs mount succeeds |
 | Codex, Gemini | Node.js / npm | If npm is not on PATH (including probed user env), installs via `apt-get` or `apk` |
+
+Codex ships its own `bwrap` and prefers any `bwrap` it finds on `PATH`, so installing the system package does not add a sandbox — it substitutes a different binary into one Codex runs either way. That substitution is only safe where a new PID namespace can mount a fresh procfs, which Docker's default `MaskedPaths` and `ReadonlyPaths` refuse; elsewhere Codex relies on its own retry that drops `--proc`, and that retry only recognises the wording its bundled build emits, so a distro `bwrap` fails outright instead. cella therefore runs `unshare --user --map-root-user --pid --fork --mount-proc true` as the remote user before assembling the system-package batch, and adds bubblewrap only on exit 0. Where it does not pass, cella installs nothing and Codex uses the `bwrap` it bundles, which starts and enforces with no changes to the container.
+
+This gate only governs what cella installs; it cannot help where the image already ships bubblewrap. The `common-utils` Feature installs it unconditionally, so the dev container base images and anything layered on them arrive with one already present, and cella does not remove packages the image shipped. On those images the post-install probe still reports a sandbox that did not come up.
+
+Once Codex is installed and verified reachable, cella runs `codex sandbox -- /bin/true` as the remote user and warns if the sandbox does not come up, which after the install-time probe means a `bwrap` arrived by some route other than cella's own package batch. The probe is given a throwaway `CODEX_HOME` that is removed afterwards, so the helper binaries Codex materializes on startup never reach the host `~/.codex` that `tools.codex.forward_config` bind-mounts into the container; Codex skips those helpers under a temp home, so the exit status reports whether the sandbox backend started rather than reproducing a full session. Not every non-zero exit is a degraded sandbox: exit 127 is the shell never finding `codex`, and exit 2 is clap rejecting the arguments — a Codex too old for the `sandbox` subcommand, or a changed CLI surface. Both get their own message, without the bwrap-override remedy that would not apply to either.
+
+`"securityOpt": ["systempaths=unconfined"]` in devcontainer.json lets the procfs mount succeed, so the sandbox gets a private `/proc` instead of the retry's fallback of reusing the container's. It buys that by dropping both of Docker's default sets. `ReadonlyPaths` (`/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys`, `/proc/sysrq-trigger`) become writable, and `/proc/sysrq-trigger` is a host-kernel action primitive — writing to it can reboot, panic, or remount on the host. `MaskedPaths` (`/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/kcore`, `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`, `/proc/timer_stats`, `/sys/firmware`, `/sys/devices/virtual/powercap`, plus one `thermal_throttle` entry per host CPU) become readable.
 
 Node.js availability is checked using the probed user environment PATH (from `userEnvProbe`) to detect npm installed by devcontainer features (e.g., nvm). The implementation falls back to a login shell when no probed environment is available. The check runs as the remote user, since that is the user who runs the install — probing as root hides a Node that is only on the user's PATH.
 
