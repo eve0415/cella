@@ -1202,7 +1202,10 @@ impl EnsureUpContext<'_> {
             create_opts.mounts.push(spec.to_mount_config());
         }
 
-        let tool_env = crate::tool_install::build_tool_config_env_specs(settings, remote_user);
+        let tool_env = retain_undefined_env(
+            crate::tool_install::build_tool_config_env_specs(settings, remote_user),
+            &create_opts.env,
+        );
         if !tool_env.is_empty() {
             if create_opts.env.is_empty() {
                 create_opts.env = image_env.to_vec();
@@ -2623,8 +2626,61 @@ fn resolved_remote_env(
     config.remote_env.to_vec()
 }
 
+/// Drop tool env entries whose key the resolved container env already defines.
+///
+/// `create_opts.env` carries the user's `containerEnv` by the time tool config
+/// is applied, and Docker resolves duplicates last-wins, so appending blindly
+/// would silently beat a value the user set deliberately.
+fn retain_undefined_env(tool_env: Vec<String>, existing: &[String]) -> Vec<String> {
+    let defined: std::collections::HashSet<&str> = existing
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+        .collect();
+    tool_env
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .split_once('=')
+                .is_none_or(|(key, _)| !defined.contains(key))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_env_yields_to_a_user_supplied_container_env() {
+        let existing = vec![
+            "PATH=/usr/bin".to_string(),
+            "CODEX_SQLITE_HOME=/db".to_string(),
+        ];
+        let kept = retain_undefined_env(
+            vec!["CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string()],
+            &existing,
+        );
+        assert!(
+            kept.is_empty(),
+            "a containerEnv value the user set must win; got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn tool_env_applies_when_the_user_defined_nothing() {
+        let existing = vec!["PATH=/usr/bin".to_string()];
+        let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
+        let kept = retain_undefined_env(vec![entry.clone()], &existing);
+        assert_eq!(kept, vec![entry]);
+    }
+
+    #[test]
+    fn tool_env_matches_on_the_whole_key_only() {
+        // A longer key sharing a prefix must not be mistaken for a definition.
+        let existing = vec!["CODEX_SQLITE_HOME_EXTRA=/db".to_string()];
+        let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
+        let kept = retain_undefined_env(vec![entry.clone()], &existing);
+        assert_eq!(kept, vec![entry]);
+    }
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
