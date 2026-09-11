@@ -13,7 +13,7 @@ mod tools;
 pub use ai_credentials::AiCredentials;
 pub use claude_code::ClaudeCode;
 pub use clipboard::Clipboard;
-pub use codex::Codex;
+pub use codex::{Codex, CodexDatabase};
 pub use credentials::{Credentials, CustomCredentialProvider};
 pub use gemini::Gemini;
 pub use network::Network;
