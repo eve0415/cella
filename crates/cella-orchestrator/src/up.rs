@@ -1214,12 +1214,7 @@ impl EnsureUpContext<'_> {
             crate::tool_install::build_tool_config_env_specs(settings, remote_user),
             container_env,
         );
-        if !tool_env.is_empty() {
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(tool_env);
-        }
+        extend_container_env(create_opts, image_env, tool_env);
     }
 
     async fn apply_env_and_mounts(
@@ -1258,10 +1253,7 @@ impl EnsureUpContext<'_> {
                 .iter()
                 .map(|e| format!("{}={}", e.key, e.value))
                 .collect();
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(fwd_env);
+            extend_container_env(create_opts, image_env, fwd_env);
         }
 
         if capabilities.managed_agent {
@@ -1269,12 +1261,7 @@ impl EnsureUpContext<'_> {
                 .hooks
                 .daemon_env(self.config.container_name, self.client.host_gateway())
                 .await;
-            if !daemon_env.is_empty() {
-                if create_opts.env.is_empty() {
-                    create_opts.env = image_env.to_vec();
-                }
-                create_opts.env.extend(daemon_env);
-            }
+            extend_container_env(create_opts, image_env, daemon_env);
         }
 
         if capabilities.managed_agent {
@@ -1302,9 +1289,9 @@ impl EnsureUpContext<'_> {
 
             self.hooks.sync_agent_runtime(self.client).await;
 
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
+            // Seeded before the read, not via `extend_container_env`, because
+            // `agent_env_vars` inspects the env it is about to extend.
+            seed_container_env(create_opts, image_env);
             let agent_env = agent_env_vars(settings.clipboard.wayland, &create_opts.env);
             create_opts.env.extend(agent_env);
         } else {
@@ -1328,12 +1315,7 @@ impl EnsureUpContext<'_> {
             .map(|m| (m.target.as_str(), std::path::Path::new(m.source.as_str())));
         let tool_env =
             crate::tool_install::tool_config_env_vars(settings, remote_user, workspace_pair);
-        if !tool_env.is_empty() {
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(tool_env);
-        }
+        extend_container_env(create_opts, image_env, tool_env);
 
         append_extra_mounts(
             &mut create_opts.mounts,
@@ -2638,6 +2620,36 @@ fn resolved_remote_env(
         return ctx.substitute_remote_env(raw);
     }
     config.remote_env.to_vec()
+}
+
+/// Populate the container env from the image's own `ENV` if nothing has yet.
+///
+/// `create_opts.env` is left empty when the config declares no `containerEnv`,
+/// and handing Docker a list that holds only cella's additions would drop the
+/// image's environment entirely.
+fn seed_container_env(
+    create_opts: &mut cella_backend::CreateContainerOptions,
+    image_env: &[String],
+) {
+    if create_opts.env.is_empty() {
+        create_opts.env = image_env.to_vec();
+    }
+}
+
+/// Append `additions` to the container env, seeding from the image first.
+///
+/// A no-op for an empty `additions`, so the image env is not materialised by a
+/// contributor that had nothing to add.
+fn extend_container_env(
+    create_opts: &mut cella_backend::CreateContainerOptions,
+    image_env: &[String],
+    additions: Vec<String>,
+) {
+    if additions.is_empty() {
+        return;
+    }
+    seed_container_env(create_opts, image_env);
+    create_opts.env.extend(additions);
 }
 
 /// Drop tool env entries whose key the user's `containerEnv` already defines.
