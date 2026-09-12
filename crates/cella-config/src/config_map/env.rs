@@ -1,4 +1,4 @@
-pub(super) fn map_container_env(config: &serde_json::Value) -> Vec<String> {
+pub fn map_container_env(config: &serde_json::Value) -> Vec<String> {
     let Some(env_obj) = config.get("containerEnv").and_then(|v| v.as_object()) else {
         return Vec::new();
     };

@@ -40,7 +40,8 @@ Installers return `Option<ExecResult>` -- `None` when the idempotency guard shor
 - `build_tool_config_mount_specs()` -- produces bind/tmpfs mounts for forwarding host tool configs (~/.claude, ~/.codex, ~/.gemini, ~/.config/nvim, ~/.tmux.conf) into the container
 - `ensure_tool_config_paths()` -- pre-creates missing config files/dirs on the host so mount specs can detect them
 - `setup_plugin_manifests()` -- populates the tmpfs-backed plugin directory with symlinks and path-rewritten manifest JSONs
-- `tool_config_env_vars()` -- pins the paths agent-side document sync needs: the container plugin directory, the host home, and the container/host workspace pair used to translate `projectPath`
+- `tool_config_env_vars()` -- create-time env *pins*: values the agent protocol depends on and a user must not override, currently the container plugin directory, the host home, and the container/host workspace pair used to translate `projectPath`
+- `build_tool_config_env_defaults()` -- create-time env *defaults*: knobs owned by the tool itself that a user's `containerEnv` may override, currently `CODEX_SQLITE_HOME`
 - `verify_tool_callable()` -- two-phase probe (login shell, then interactive) matching `cella exec`'s wrapping
 - `symlink_to_usr_local_bin()` -- idempotent symlink creation with safety check against overwriting regular files
 
@@ -67,5 +68,7 @@ When adding a new tool, follow the existing pattern:
 3. Wire it into `install_tools` (choose the appropriate parallel branch)
 4. Add config mount specs in `build_tool_config_mount_specs` if the tool has host config to forward
 5. Add host path pre-creation in `ensure_tool_config_paths_in` if needed
+6. Add create-time env in `build_tool_config_env_defaults` (tool-owned, user-overridable) or `tool_config_env_vars` (protocol pins) if the tool needs any
+7. Hash any new setting that decides a mount or create-time env into `compute_mount_input_fingerprint` (`cella-compose`), or a change to it will not prompt a rebuild
 
 The `verified_install_step` helper handles post-install verification and PATH remediation -- new tools get this for free by returning their `ExecResult` through the existing branch functions.

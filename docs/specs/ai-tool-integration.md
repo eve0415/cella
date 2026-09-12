@@ -254,6 +254,26 @@ stat ~/.claude.json && cat ~/.claude.json   # expect: succeeds, valid JSON (no ?
 # host: trigger Claude Code's atomic save repeatedly -> the container copy never ghosts
 ```
 
+### Codex Databases: Container-Local
+
+The Codex CLI keeps six runtime SQLite databases (`state_5`, `thread_history_1`, `memories_1`, `queue_1`, `logs_2` and `goals_1`) directly inside `CODEX_HOME`, and opens every one of them in WAL mode.
+WAL keeps its frame index and reader marks in a `-shm` file that each connection maps with `MAP_SHARED`, which is coherent only among processes sharing one kernel's page cache; SQLite states the requirement as "all processes using a database must be on the same host computer" ([sqlite.org/wal.html](https://sqlite.org/wal.html)).
+The forwarded `~/.codex` bind mount crosses exactly that boundary on macOS, where the host Codex app and the containers run under different kernels, so a checkpoint on one side can reset the WAL underneath a reader on the other.
+Codex detects the result as `SQLITE_CORRUPT`, quarantines the database into `~/.codex/db-backups/sqlite-<timestamp>-<n>/`, and rebuilds an empty one.
+The journal mode is not configurable, and the same failure is tracked upstream for other shared filesystems in [openai/codex#30957](https://github.com/openai/codex/issues/30957) and for this container case in [openai/codex#44772](https://github.com/openai/codex/issues/44772).
+
+cella therefore sets `CODEX_SQLITE_HOME` to `$HOME/.codex-db`, a container-local path outside the bind mount, so every database the CLI opens is opened by one kernel only.
+`~/.codex` continues to forward normally, so `config.toml`, `auth.json`, `AGENTS.md`, `skills/` and the `sessions/` rollout transcripts stay shared with the host and with every other container.
+Only the databases are split, and they are a derived cache rather than the system of record: Codex reconstructs its thread index from the forwarded `sessions/` rollouts, so session history survives a container rebuild.
+
+`~/.codex/sqlite/codex-dev.db` is also a WAL database on the forwarded mount, but it belongs to the host Codex app: the CLI binary contains no reference to that filename and never opens it, so it is outside what this setting moves.
+
+A `CODEX_SQLITE_HOME` in devcontainer.json `containerEnv` or `remoteEnv` overrides cella's value on both paths.
+Setting it in a compose service's own `environment:` does not: cella's override file is appended last and compose resolves duplicate keys last-wins, so use `remoteEnv` or `database = "host"` there.
+
+`tools.codex.database = "host"` leaves the databases on the forwarded mount instead.
+That is the configuration described above as corrupting, and it exists as an escape hatch for hosts where `~/.codex` is not a cross-kernel share.
+
 ### Claude Code Specifics
 
 Claude Code has additional forwarding logic beyond the basic bind mount:
@@ -392,6 +412,7 @@ version = "latest"        # "latest", "stable", or pinned e.g. "1.0.58" (default
 
 [tools.codex]
 forward_config = true     # bind-mount ~/.codex/ (default: true)
+database = "container"    # "container" or "host" (default: "container")
 version = "latest"        # "latest" or pinned e.g. "0.1.2" (default: "latest")
 
 [tools.gemini]
@@ -428,6 +449,7 @@ forward_config = true     # bind-mount tmux config (default: true)
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `forward_config` | `bool` | `true` | Bind-mount `~/.codex/` from host |
+| `database` | `"container"` \| `"host"` | `"container"` | Where Codex keeps its SQLite databases |
 | `version` | `string` | `"latest"` | `"latest"` or pinned semver |
 
 #### `[tools.gemini]`

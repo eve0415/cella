@@ -1380,8 +1380,21 @@ async fn build_override_and_start(
     // agent env vars need `clipboard.wayland` and container env is immutable
     // after create — there is no later chance to add `WAYLAND_DISPLAY`.
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
+    // Asymmetry with the single-container path, which defers to `containerEnv`:
+    // cella's override file is appended last, and compose merges `environment`
+    // by key with the last file winning, so a `CODEX_SQLITE_HOME` set in the
+    // user's own service is overridden here.
+    //
+    // Closing it needs an `environment` field on `ResolvedService`, which does
+    // not capture one today. The `compose config` resolve is not the obstacle —
+    // `resolve_workspace_bind` below already pays it in this same function.
+    // Left open deliberately: reading env from that resolve would make
+    // precedence depend on it succeeding, where today a failure degrades
+    // silently to "no mapping". `remoteEnv` (appended after `tool_env` below)
+    // and `tools.codex.database = "host"` both override without that coupling.
     let mut extra_env = build_extra_env(
         daemon_env,
+        cella_tool_install::build_tool_config_env_defaults(&settings, remote_user),
         env_fwd,
         cfg.remote_env,
         managed,
@@ -1727,12 +1740,14 @@ async fn resolve_workspace_bind(
 
 fn build_extra_env(
     daemon_env: Vec<String>,
+    tool_env: Vec<String>,
     env_fwd: &cella_env::EnvForwarding,
     remote_env: &[String],
     managed_agent: bool,
     wayland_clipboard: bool,
 ) -> Vec<String> {
     let mut extra_env = daemon_env;
+    extra_env.extend(tool_env);
     extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
     extra_env.extend(remote_env.iter().cloned());
     if managed_agent {
@@ -2050,7 +2065,7 @@ mod tests {
     #[test]
     fn build_extra_env_injects_browser_when_managed_agent() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], true, true);
+        let extra = build_extra_env(vec![], vec![], &env_fwd, &[], true, true);
         assert!(
             extra
                 .iter()
@@ -2066,7 +2081,7 @@ mod tests {
     #[test]
     fn build_extra_env_injects_wayland_display_when_clipboard_enabled() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], true, true);
+        let extra = build_extra_env(vec![], vec![], &env_fwd, &[], true, true);
         assert!(
             extra.iter().any(|v| v
                 == &format!(
@@ -2081,6 +2096,7 @@ mod tests {
     fn build_extra_env_yields_to_a_user_supplied_wayland_display() {
         let env_fwd = cella_env::EnvForwarding::default();
         let extra = build_extra_env(
+            vec![],
             vec![],
             &env_fwd,
             &["WAYLAND_DISPLAY=wayland-0".to_string()],
@@ -2101,7 +2117,7 @@ mod tests {
     #[test]
     fn build_extra_env_omits_wayland_display_when_clipboard_disabled() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], true, false);
+        let extra = build_extra_env(vec![], vec![], &env_fwd, &[], true, false);
         assert!(
             !extra.iter().any(|v| v.starts_with("WAYLAND_DISPLAY=")),
             "clipboard.wayland=false must NOT inject WAYLAND_DISPLAY; got {extra:?}"
@@ -2111,7 +2127,7 @@ mod tests {
     #[test]
     fn build_extra_env_omits_browser_when_not_managed() {
         let env_fwd = cella_env::EnvForwarding::default();
-        let extra = build_extra_env(vec![], &env_fwd, &[], false, true);
+        let extra = build_extra_env(vec![], vec![], &env_fwd, &[], false, true);
         assert!(
             !extra.iter().any(|v| v.starts_with("BROWSER=")),
             "managed_agent=false must NOT inject BROWSER; got {extra:?}"
@@ -2446,6 +2462,7 @@ mod tests {
         };
         let extra = build_extra_env(
             vec!["CELLA_DAEMON_ADDR=h:1".to_string()],
+            vec![],
             &env_fwd,
             &["USER_KEY=user_val".to_string()],
             true,

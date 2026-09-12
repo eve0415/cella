@@ -975,6 +975,24 @@ pub fn compute_mount_input_fingerprint(
     hasher.update([u8::from(t.nvim.forward_config)]);
     hasher.update([u8::from(t.tmux.forward_config)]);
 
+    // Codex database placement. This decides a create-time env var rather than a
+    // mount, but it is equally immutable afterwards, so a container that predates
+    // the setting still needs a rebuild nudge.
+    //
+    // Gated on `forward_config` to match exactly when `CODEX_SQLITE_HOME` is
+    // emitted: hashing it unconditionally would also nudge projects that forward
+    // no Codex config, where nothing about the container changed.
+    //
+    // Only the compose path consults this fingerprint. The single-container path
+    // compares `config_hash` and the runtime label, so a change here reaches
+    // those containers at their next `--rebuild` rather than as a warning.
+    if t.codex.forward_config {
+        hasher.update([match t.codex.database {
+            cella_config::settings::CodexDatabase::Container => 0u8,
+            cella_config::settings::CodexDatabase::Host => 1u8,
+        }]);
+    }
+
     // Tool config override paths (None is represented by a bare NUL separator).
     for path in [t.nvim.config_path.as_deref(), t.tmux.config_path.as_deref()] {
         if let Some(p) = path {
@@ -2690,6 +2708,43 @@ mod tests {
         assert_ne!(
             fp_a, fp_b,
             "fingerprint must change when nvim.config_path override differs"
+        );
+    }
+
+    #[test]
+    fn mount_input_fingerprint_changes_with_codex_database_placement() {
+        // The setting decides a create-time env var, which is as immutable as a
+        // mount, so drift detection must see it and ask for a rebuild.
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+
+        let container = cella_config::CellaConfig::default();
+        let mut host = cella_config::CellaConfig::default();
+        host.tools.codex.database = cella_config::settings::CodexDatabase::Host;
+
+        assert_ne!(
+            compute_mount_input_fingerprint(&container, &env_fwd, ws),
+            compute_mount_input_fingerprint(&host, &env_fwd, ws),
+            "fingerprint must change when codex.database differs"
+        );
+    }
+
+    #[test]
+    fn mount_input_fingerprint_ignores_codex_database_when_config_is_not_forwarded() {
+        // No forwarding means no CODEX_SQLITE_HOME either way, so the setting
+        // changes nothing about the container and must not demand a rebuild.
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+
+        let mut container = cella_config::CellaConfig::default();
+        container.tools.codex.forward_config = false;
+        let mut host = container.clone();
+        host.tools.codex.database = cella_config::settings::CodexDatabase::Host;
+
+        assert_eq!(
+            compute_mount_input_fingerprint(&container, &env_fwd, ws),
+            compute_mount_input_fingerprint(&host, &env_fwd, ws),
+            "an unforwarded Codex config must not produce a rebuild nudge"
         );
     }
 

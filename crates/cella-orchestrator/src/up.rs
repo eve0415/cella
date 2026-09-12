@@ -1186,6 +1186,37 @@ impl EnsureUpContext<'_> {
         })
     }
 
+    /// Apply tool config forwarding: the host config bind mounts, plus the env
+    /// those mounts require.
+    ///
+    /// `CODEX_SQLITE_HOME` belongs here rather than with the forwarded host env
+    /// because it is a consequence of the `~/.codex` mount, not of anything the
+    /// host environment carries.
+    ///
+    /// `container_env` is the user's `containerEnv` alone, deliberately not
+    /// `create_opts.env`: that vector is empty unless `containerEnv` is
+    /// non-empty and otherwise also carries the image's own `ENV`, so checking
+    /// it would make deference depend on an unrelated key, and would let an
+    /// image silently keep the databases on the mount this fix exists to
+    /// get them off.
+    fn apply_tool_config(
+        create_opts: &mut cella_backend::CreateContainerOptions,
+        image_env: &[String],
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+        container_env: &[String],
+    ) {
+        for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
+            create_opts.mounts.push(spec.to_mount_config());
+        }
+
+        let tool_env = retain_undefined_env(
+            crate::tool_install::build_tool_config_env_defaults(settings, remote_user),
+            container_env,
+        );
+        extend_container_env(create_opts, image_env, tool_env);
+    }
+
     async fn apply_env_and_mounts(
         &self,
         create_opts: &mut cella_backend::CreateContainerOptions,
@@ -1208,9 +1239,13 @@ impl EnsureUpContext<'_> {
             });
         }
 
-        for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
-            create_opts.mounts.push(spec.to_mount_config());
-        }
+        Self::apply_tool_config(
+            create_opts,
+            image_env,
+            remote_user,
+            settings,
+            &cella_config::config_map::env::map_container_env(&self.config.resolved.config),
+        );
 
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -1218,10 +1253,7 @@ impl EnsureUpContext<'_> {
                 .iter()
                 .map(|e| format!("{}={}", e.key, e.value))
                 .collect();
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(fwd_env);
+            extend_container_env(create_opts, image_env, fwd_env);
         }
 
         if capabilities.managed_agent {
@@ -1229,12 +1261,7 @@ impl EnsureUpContext<'_> {
                 .hooks
                 .daemon_env(self.config.container_name, self.client.host_gateway())
                 .await;
-            if !daemon_env.is_empty() {
-                if create_opts.env.is_empty() {
-                    create_opts.env = image_env.to_vec();
-                }
-                create_opts.env.extend(daemon_env);
-            }
+            extend_container_env(create_opts, image_env, daemon_env);
         }
 
         if capabilities.managed_agent {
@@ -1262,9 +1289,9 @@ impl EnsureUpContext<'_> {
 
             self.hooks.sync_agent_runtime(self.client).await;
 
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
+            // Seeded before the read, not via `extend_container_env`, because
+            // `agent_env_vars` inspects the env it is about to extend.
+            seed_container_env(create_opts, image_env);
             let agent_env = agent_env_vars(settings.clipboard.wayland, &create_opts.env);
             create_opts.env.extend(agent_env);
         } else {
@@ -1288,12 +1315,7 @@ impl EnsureUpContext<'_> {
             .map(|m| (m.target.as_str(), std::path::Path::new(m.source.as_str())));
         let tool_env =
             crate::tool_install::tool_config_env_vars(settings, remote_user, workspace_pair);
-        if !tool_env.is_empty() {
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(tool_env);
-        }
+        extend_container_env(create_opts, image_env, tool_env);
 
         append_extra_mounts(
             &mut create_opts.mounts,
@@ -2600,8 +2622,91 @@ fn resolved_remote_env(
     config.remote_env.to_vec()
 }
 
+/// Populate the container env from the image's own `ENV` if nothing has yet.
+///
+/// `create_opts.env` is left empty when the config declares no `containerEnv`,
+/// and handing Docker a list that holds only cella's additions would drop the
+/// image's environment entirely.
+fn seed_container_env(
+    create_opts: &mut cella_backend::CreateContainerOptions,
+    image_env: &[String],
+) {
+    if create_opts.env.is_empty() {
+        create_opts.env = image_env.to_vec();
+    }
+}
+
+/// Append `additions` to the container env, seeding from the image first.
+///
+/// A no-op for an empty `additions`, so the image env is not materialised by a
+/// contributor that had nothing to add.
+fn extend_container_env(
+    create_opts: &mut cella_backend::CreateContainerOptions,
+    image_env: &[String],
+    additions: Vec<String>,
+) {
+    if additions.is_empty() {
+        return;
+    }
+    seed_container_env(create_opts, image_env);
+    create_opts.env.extend(additions);
+}
+
+/// Drop tool env entries whose key the user's `containerEnv` already defines.
+///
+/// Docker resolves duplicate env last-wins, so appending blindly would silently
+/// beat a value the user set deliberately. Only `containerEnv` counts: the
+/// image's own `ENV` is not a statement about this project.
+fn retain_undefined_env(tool_env: Vec<String>, existing: &[String]) -> Vec<String> {
+    let defined: std::collections::HashSet<&str> = existing
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+        .collect();
+    tool_env
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .split_once('=')
+                .is_none_or(|(key, _)| !defined.contains(key))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_env_yields_to_a_user_supplied_container_env() {
+        let existing = vec![
+            "PATH=/usr/bin".to_string(),
+            "CODEX_SQLITE_HOME=/db".to_string(),
+        ];
+        let kept = retain_undefined_env(
+            vec!["CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string()],
+            &existing,
+        );
+        assert!(
+            kept.is_empty(),
+            "a containerEnv value the user set must win; got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn tool_env_applies_when_the_user_defined_nothing() {
+        let existing = vec!["PATH=/usr/bin".to_string()];
+        let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
+        let kept = retain_undefined_env(vec![entry.clone()], &existing);
+        assert_eq!(kept, vec![entry]);
+    }
+
+    #[test]
+    fn tool_env_matches_on_the_whole_key_only() {
+        // A longer key sharing a prefix must not be mistaken for a definition.
+        let existing = vec!["CODEX_SQLITE_HOME_EXTRA=/db".to_string()];
+        let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
+        let kept = retain_undefined_env(vec![entry.clone()], &existing);
+        assert_eq!(kept, vec![entry]);
+    }
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
