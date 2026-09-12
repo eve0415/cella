@@ -10,8 +10,7 @@ fn default_latest() -> String {
 
 /// Where Codex keeps its `SQLite` databases.
 ///
-/// Codex opens every runtime database in WAL mode, and WAL requires all accessors to share one kernel's page cache for the mmapped `-shm` wal-index.
-/// A forwarded `~/.codex` crosses the host/VM boundary, so the host Codex app and a container reset each other's WAL and corrupt the databases.
+/// Sharing them with the host through a forwarded `~/.codex` corrupts them; the "Codex Databases: Container-Local" section of `docs/specs/ai-tool-integration.md` records the mechanism and the upstream reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodexDatabase {

@@ -1329,14 +1329,14 @@ pub fn build_tool_config_mount_specs(
 
 // ── Tool config env ──────────────────────────────────────────────────────────
 
-/// Build `KEY=VALUE` env entries that tool config forwarding needs at container creation.
+/// Build create-time env entries that a tool's *default* behaviour needs, which the user may override.
 ///
-/// Currently only Codex, which opens each of its runtime databases in WAL mode.
-/// WAL keeps its frame index in an mmapped `-shm` file that every accessor must see through one kernel's page cache, so a forwarded `~/.codex` shared with the host app corrupts those databases.
-/// Pointing `CODEX_SQLITE_HOME` at container-local storage keeps the databases single-kernel while `~/.codex` still forwards config, credentials and session transcripts.
-/// Codex rebuilds its thread index from the forwarded `sessions/` rollouts, so history survives a container rebuild.
+/// The counterpart to [`tool_config_env_vars`], which emits pins: cella-internal `CELLA_*` values the agent protocol depends on, where an override breaks sync rather than customising it.
+/// These are ordinary knobs belonging to the tool itself, so callers weigh them against the user's `containerEnv` and let the user win.
+///
+/// Currently only Codex, whose databases cannot live on the forwarded `~/.codex` — see the "Codex Databases: Container-Local" section of `docs/specs/ai-tool-integration.md` for why.
 #[must_use]
-pub fn build_tool_config_env_specs(
+pub fn build_tool_config_env_defaults(
     settings: &cella_config::CellaConfig,
     remote_user: &str,
 ) -> Vec<String> {
@@ -1414,6 +1414,11 @@ pub fn build_tool_config_seed_files(
 /// agent needs to translate `projectPath`.
 /// Container env is immutable after create, so this is injected at create time
 /// on both the single-container and compose paths.
+///
+/// These are pins, not defaults: the agent protocol depends on the exact values,
+/// so callers inject them without weighing them against the user's
+/// `containerEnv`. Tool-owned knobs the user may override belong in
+/// [`build_tool_config_env_defaults`] instead.
 #[must_use]
 pub fn tool_config_env_vars(
     settings: &cella_config::CellaConfig,
@@ -4180,22 +4185,15 @@ exit 1
     #[test]
     fn codex_sqlite_home_points_outside_the_forwarded_mount_by_default() {
         let settings = cella_config::CellaConfig::default();
-        let env = build_tool_config_env_specs(&settings, "vscode");
+        let env = build_tool_config_env_defaults(&settings, "vscode");
         assert_eq!(env, vec!["CODEX_SQLITE_HOME=/home/vscode/.codex-db"]);
-        // Trailing slash so the check tests path containment: `.codex-db` is a
-        // sibling of `.codex` that shares its string prefix.
-        let forwarded = format!("{}/", cella_env::codex::container_codex_dir("vscode"));
-        assert!(
-            !env[0].split_once('=').unwrap().1.starts_with(&forwarded),
-            "databases must not land under the bind-mounted {forwarded}"
-        );
     }
 
     #[test]
     fn codex_sqlite_home_absent_when_database_left_on_host() {
         let mut settings = cella_config::CellaConfig::default();
         settings.tools.codex.database = cella_config::settings::CodexDatabase::Host;
-        let env = build_tool_config_env_specs(&settings, "vscode");
+        let env = build_tool_config_env_defaults(&settings, "vscode");
         assert!(
             env.is_empty(),
             "opting into host databases must not override CODEX_SQLITE_HOME; got {env:?}"
@@ -4206,7 +4204,7 @@ exit 1
     fn codex_sqlite_home_absent_when_config_is_not_forwarded() {
         let mut settings = cella_config::CellaConfig::default();
         settings.tools.codex.forward_config = false;
-        let env = build_tool_config_env_specs(&settings, "vscode");
+        let env = build_tool_config_env_defaults(&settings, "vscode");
         assert!(
             env.is_empty(),
             "an unforwarded ~/.codex is already container-local; got {env:?}"

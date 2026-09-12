@@ -1389,7 +1389,7 @@ async fn build_override_and_start(
     // without that cost.
     let mut extra_env = build_extra_env(
         daemon_env,
-        cella_tool_install::build_tool_config_env_specs(&settings, remote_user),
+        cella_tool_install::build_tool_config_env_defaults(&settings, remote_user),
         env_fwd,
         cfg.remote_env,
         managed,

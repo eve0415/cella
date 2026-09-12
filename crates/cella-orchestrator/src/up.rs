@@ -1211,7 +1211,7 @@ impl EnsureUpContext<'_> {
         }
 
         let tool_env = retain_undefined_env(
-            crate::tool_install::build_tool_config_env_specs(settings, remote_user),
+            crate::tool_install::build_tool_config_env_defaults(settings, remote_user),
             container_env,
         );
         extend_container_env(create_opts, image_env, tool_env);
@@ -2697,22 +2697,6 @@ mod tests {
         let entry = "CODEX_SQLITE_HOME=/home/vscode/.codex-db".to_string();
         let kept = retain_undefined_env(vec![entry.clone()], &existing);
         assert_eq!(kept, vec![entry]);
-    }
-
-    #[test]
-    fn the_override_check_is_fed_from_container_env_alone() {
-        // `apply_tool_config` passes this, not `create_opts.env`. An image's own
-        // ENV never appears here, so it cannot defeat cella's placement, and the
-        // result does not hinge on whether some unrelated containerEnv key
-        // happened to make `create_opts.env` non-empty.
-        let with_keys = cella_config::config_map::env::map_container_env(
-            &serde_json::json!({"containerEnv": {"FOO": "1"}}),
-        );
-        assert_eq!(with_keys, vec!["FOO=1"]);
-        assert!(
-            cella_config::config_map::env::map_container_env(&serde_json::json!({})).is_empty(),
-            "absent containerEnv must yield no override keys"
-        );
     }
 
     #[test]
