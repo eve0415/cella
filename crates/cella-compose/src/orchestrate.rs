@@ -1383,10 +1383,15 @@ async fn build_override_and_start(
     // Asymmetry with the single-container path, which defers to `containerEnv`:
     // cella's override file is appended last, and compose merges `environment`
     // by key with the last file winning, so a `CODEX_SQLITE_HOME` set in the
-    // user's own service is overridden here. Detecting it would cost another
-    // `compose config` resolve on every `up`; `remoteEnv` (appended after
-    // `tool_env` below) and `tools.codex.database = "host"` both override it
-    // without that cost.
+    // user's own service is overridden here.
+    //
+    // Closing it needs an `environment` field on `ResolvedService`, which does
+    // not capture one today. The `compose config` resolve is not the obstacle —
+    // `resolve_workspace_bind` below already pays it in this same function.
+    // Left open deliberately: reading env from that resolve would make
+    // precedence depend on it succeeding, where today a failure degrades
+    // silently to "no mapping". `remoteEnv` (appended after `tool_env` below)
+    // and `tools.codex.database = "host"` both override without that coupling.
     let mut extra_env = build_extra_env(
         daemon_env,
         cella_tool_install::build_tool_config_env_defaults(&settings, remote_user),
