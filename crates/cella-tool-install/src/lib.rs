@@ -1009,6 +1009,15 @@ pub async fn setup_plugin_manifests(
     container_id: &str,
     remote_user: &str,
 ) {
+    // Without a host plugins directory there is no `/tmp/.cella/host-plugins`
+    // bind and no tmpfs shadowing `plugins/`, so the directory this would
+    // populate does not exist in the container. Every step below is already a
+    // no-op in that case except the chown, which would fail and warn on every
+    // `up` for anyone who has never installed a plugin.
+    if cella_env::claude_code::host_plugins_dir().is_none() {
+        return;
+    }
+
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins_mount = "/tmp/.cella/host-plugins";
