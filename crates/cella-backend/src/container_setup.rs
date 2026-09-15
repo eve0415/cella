@@ -247,7 +247,7 @@ async fn chown(
     cmd.push(format!("{remote_user}:{remote_user}"));
     cmd.push(path.to_string());
 
-    let _ = client
+    match client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -257,7 +257,16 @@ async fn chown(
                 working_dir: None,
             },
         )
-        .await;
+        .await
+    {
+        Ok(result) if result.exit_code != 0 => warn!(
+            "chown of {path} failed (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ),
+        Err(e) => warn!("chown of {path} failed: {e}"),
+        Ok(_) => {}
+    }
 }
 
 /// Recursively chown a directory inside the container.
