@@ -1554,10 +1554,27 @@ async fn chown_uploaded_files_and_parents(
         chown_path_in_container(client, container_id, remote_user, &file.path).await;
     }
 
-    let mut parents: Vec<&str> = files
-        .iter()
-        .filter_map(|f| std::path::Path::new(&f.path).parent()?.to_str())
-        .collect();
+    // Every ancestor up to the home directory, not just the direct parent: tar
+    // extraction creates the intermediate ones implicitly and root-owned, and
+    // with no `-R` anywhere nothing else would repair them. The walk stops at
+    // the home directory so it never reaches `/home` or `/`.
+    let home = cella_env::claude_code::container_home(remote_user);
+    let home_path = std::path::Path::new(&home);
+    let mut parents: Vec<&str> = Vec::new();
+    for file in files {
+        let mut current = std::path::Path::new(&file.path).parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(home_path) {
+                break;
+            }
+            let Some(dir_str) = dir.to_str() else { break };
+            parents.push(dir_str);
+            if dir == home_path {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
     parents.sort_unstable();
     parents.dedup();
     for parent in parents {
@@ -5064,23 +5081,23 @@ exit 1
             },
         ];
 
-        // 3 file chowns + 2 unique parents (/home/dev/.config/tmux, /home/dev)
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-        ]);
+        // 3 file chowns + every ancestor up to the home directory, deduped:
+        // /home/dev, /home/dev/.config, /home/dev/.config/tmux.
+        let backend = MockBackend::new(std::iter::repeat_with(|| Ok(ok_exit(0))).take(6).collect());
 
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
 
         let calls = backend.calls();
-        assert_eq!(calls.len(), 5, "3 file chowns + 2 unique parent chowns");
+        assert_eq!(calls.len(), 6, "3 file chowns + 3 unique ancestor chowns");
 
         let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[2].as_str()).collect();
         assert!(parent_chowns.contains(&"/home/dev"));
+        assert!(parent_chowns.contains(&"/home/dev/.config"));
         assert!(parent_chowns.contains(&"/home/dev/.config/tmux"));
+        assert!(
+            !parent_chowns.contains(&"/home"),
+            "the walk must stop at the home directory"
+        );
     }
 
     #[tokio::test]
