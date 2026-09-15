@@ -1013,14 +1013,16 @@ pub async fn setup_plugin_manifests(
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins_mount = "/tmp/.cella/host-plugins";
 
-    // The bind and the tmpfs that shadows `~/.claude/plugins` are added
-    // together at create time, so the bind's presence *in this container* is
-    // what says the plugins directory is cella's to write. Asking the host
-    // instead gets both cases wrong: with no bind there is no directory to
-    // chown, so every `up` warns; and on a container created before the host
-    // had any plugin, `~/.claude/plugins` resolves through the `~/.claude` bind
-    // to the host's own tree, where seeding would overwrite the host manifests
-    // with container-local paths and chown the host's files.
+    // Ask the container, not the host. Asking the host gets both cases wrong:
+    // with no bind there is no directory to chown, so every `up` warns; and on
+    // a container created before the host had any plugin, `~/.claude/plugins`
+    // resolves through the `~/.claude` bind to the host's own tree, where
+    // seeding would overwrite the host manifests with container-local paths.
+    //
+    // cella adds this bind and the tmpfs shadowing `~/.claude/plugins`
+    // together, so the bind is a good proxy for the tmpfs being there. It is a
+    // proxy and not a guarantee: on the compose path a base file declaring its
+    // own mount at that target drops cella's tmpfs and keeps the bind.
     if !container_dir_exists(client, container_id, host_plugins_mount).await {
         return;
     }
