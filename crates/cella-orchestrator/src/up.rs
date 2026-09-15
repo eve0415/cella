@@ -357,10 +357,18 @@ impl EnsureUpContext<'_> {
             Some(self.config.resolved),
         )?;
         if settings.tools.claude_code.forward_config {
-            crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
+            let _ = run_step_result(&self.progress, "Forwarding tool configuration...", async {
+                crate::tool_install::create_claude_home_symlink(
+                    self.client,
+                    container_id,
+                    remote_user,
+                )
                 .await;
-            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
-                .await;
+                crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
+                    .await;
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
         }
 
         let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
@@ -1494,22 +1502,33 @@ impl EnsureUpContext<'_> {
         Option<std::collections::HashMap<String, String>>,
         Vec<String>,
     ) {
-        if settings.tools.claude_code.forward_config {
-            crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
+        // Every call in here is a container exec or a file upload against the
+        // host's forwarded config trees, so the whole block reports as one step
+        // rather than running silently between the probe and tool install.
+        let _ = run_step_result(&self.progress, "Forwarding tool configuration...", async {
+            if settings.tools.claude_code.forward_config {
+                crate::tool_install::create_claude_home_symlink(
+                    self.client,
+                    container_id,
+                    remote_user,
+                )
                 .await;
-            crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
-                .await;
-        }
+                crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
+                    .await;
+            }
 
-        // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
-        // files instead of single-file bind mounts (anti-ghost). No-ops when
-        // nothing is forwarded or the files already exist in the container.
-        crate::tool_install::seed_tool_config_files(
-            self.client,
-            container_id,
-            settings,
-            remote_user,
-        )
+            // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
+            // files instead of single-file bind mounts (anti-ghost). No-ops when
+            // nothing is forwarded or the files already exist in the container.
+            crate::tool_install::seed_tool_config_files(
+                self.client,
+                container_id,
+                settings,
+                remote_user,
+            )
+            .await;
+            Ok::<(), std::convert::Infallible>(())
+        })
         .await;
 
         let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);

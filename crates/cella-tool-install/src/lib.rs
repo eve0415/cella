@@ -1985,6 +1985,10 @@ pub async fn install_tools(
     let has = |t: ToolName| tools.contains(&t);
     let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
 
+    // Reported separately from the install phase below: this runs before that
+    // phase exists, and when it does shell out to the package manager it is the
+    // longest un-attributable wait in `up`.
+    let packages_step = progress.step("Checking system packages...");
     let (is_alpine, node_available) = install_system_packages(
         client,
         container_id,
@@ -1994,6 +1998,7 @@ pub async fn install_tools(
         needs_npm,
     )
     .await;
+    packages_step.finish();
 
     let ctx = InstallCtx {
         client,
