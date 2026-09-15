@@ -241,8 +241,14 @@ async fn chown(
     recurse: Recurse,
 ) {
     let mut cmd = vec!["chown".to_string()];
-    if matches!(recurse, Recurse::Yes) {
-        cmd.push("-R".to_string());
+    match recurse {
+        Recurse::Yes => cmd.push("-R".to_string()),
+        // `-h` so a symlink planted at one of these paths by an unprivileged
+        // process inside the container cannot redirect a root chown onto its
+        // referent — `/etc`, or a host directory reachable through a bind
+        // mount. None of these targets is ever legitimately a symlink, and on
+        // a real file or directory `-h` behaves identically.
+        Recurse::No => cmd.push("-h".to_string()),
     }
     cmd.push(format!("{remote_user}:{remote_user}"));
     cmd.push(path.to_string());

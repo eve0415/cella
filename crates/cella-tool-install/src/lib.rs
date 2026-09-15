@@ -5085,13 +5085,13 @@ exit 1
 
         assert_eq!(
             calls[0].cmd,
-            vec!["chown", "dev:dev", "/home/dev/.claude.json"],
+            vec!["chown", "-h", "dev:dev", "/home/dev/.claude.json"],
         );
         assert_eq!(
             calls[1].cmd,
-            vec!["chown", "dev:dev", "/home/dev/.tmux.conf"],
+            vec!["chown", "-h", "dev:dev", "/home/dev/.tmux.conf"],
         );
-        assert_eq!(calls[2].cmd, vec!["chown", "dev:dev", "/home/dev"],);
+        assert_eq!(calls[2].cmd, vec!["chown", "-h", "dev:dev", "/home/dev"],);
         assert_eq!(calls[2].user.as_deref(), Some("root"));
     }
 
@@ -5127,7 +5127,7 @@ exit 1
         let calls = backend.calls();
         assert_eq!(calls.len(), 7, "3 file chowns + 4 unique ancestor chowns");
 
-        let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[2].as_str()).collect();
+        let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[3].as_str()).collect();
         assert!(parent_chowns.contains(&"/home/dev"));
         assert!(parent_chowns.contains(&"/home/dev/.local"));
         assert!(parent_chowns.contains(&"/home/dev/.local/state"));
@@ -5153,7 +5153,7 @@ exit 1
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].cmd[2], "/home/dev");
+        assert_eq!(calls[1].cmd[3], "/home/dev");
     }
 
     #[tokio::test]
@@ -5161,6 +5161,29 @@ exit 1
         let backend = MockBackend::new(vec![]);
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &[]).await;
         assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_never_follows_a_symlink() {
+        // A symlink planted at one of these paths by an unprivileged process
+        // in the container would otherwise redirect a root chown onto its
+        // referent.
+        let files = vec![FileToUpload {
+            path: "/home/dev/.claude.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        }];
+        let backend = MockBackend::new(vec![Ok(ok_exit(0)), Ok(ok_exit(0))]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        for call in backend.calls() {
+            assert!(
+                call.cmd.iter().any(|arg| arg == "-h"),
+                "chown must not dereference, got {:?}",
+                call.cmd
+            );
+        }
     }
 
     #[tokio::test]
