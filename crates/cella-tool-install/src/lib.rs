@@ -5177,6 +5177,19 @@ exit 1
 
     // ── Plugin manifest seeding ────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn plugin_manifests_skipped_without_the_host_plugins_bind() {
+        // Only the container can say whether `~/.claude/plugins` is cella's to
+        // write; without the bind the path resolves to the host's own tree.
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+
+        setup_plugin_manifests(&backend, "ctr", "dev").await;
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "probe only, then bail");
+        assert_eq!(calls[0].cmd, vec!["test", "-d", "/tmp/.cella/host-plugins"],);
+    }
+
     fn seed_map() -> cella_env::claude_code::PathMap {
         cella_env::claude_code::PathMap {
             claude: (
