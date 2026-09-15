@@ -1210,15 +1210,9 @@ impl UpContext {
     /// The seed's path rewrite reads the pinned workspace pair from the
     /// container's own environment, so it and the agent's `PathMap` are the same
     /// mapping by construction.
-    async fn setup_claude_code(
-        &self,
-        container_id: &str,
-        remote_user: &str,
-        settings: &cella_config::CellaConfig,
-    ) {
-        if !settings.tools.claude_code.forward_config {
-            return;
-        }
+    /// The caller gates this on `claude_code.forward_config`, so that the
+    /// progress step around it stays off the log when nothing is forwarded.
+    async fn setup_claude_code(&self, container_id: &str, remote_user: &str) {
         create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
         setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
     }
@@ -1302,19 +1296,20 @@ impl UpContext {
             )
             .await;
 
-        self.setup_claude_code(container_id, remote_user, settings)
-            .await;
+        if settings.tools.claude_code.forward_config {
+            self.progress
+                .run_step(
+                    "Forwarding tool configuration...",
+                    self.setup_claude_code(container_id, remote_user),
+                )
+                .await;
+        }
 
         // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
         // files instead of single-file bind mounts (anti-ghost). Shared by the
         // compose path, which reaches this method via the ComposeUpHooks hook.
-        cella_orchestrator::tool_install::seed_tool_config_files(
-            self.client.as_ref(),
-            container_id,
-            settings,
-            remote_user,
-        )
-        .await;
+        self.seed_tool_config_files(container_id, remote_user, settings)
+            .await;
 
         // Install tools listed in [tools] install = [...]
         let tools_to_install =
@@ -1359,6 +1354,26 @@ impl UpContext {
 
     pub(crate) fn lifecycle_secret_masker(&self) -> cella_backend::SecretMasker {
         cella_backend::SecretMasker::new(&self.lifecycle_secrets)
+    }
+
+    /// Delegates to [`cella_orchestrator::tool_install::seed_tool_config_files`].
+    async fn seed_tool_config_files(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::CellaConfig,
+    ) {
+        let (sender, renderer) = crate::progress::bridge(&self.progress);
+        cella_orchestrator::tool_install::seed_tool_config_files(
+            self.client.as_ref(),
+            container_id,
+            settings,
+            remote_user,
+            &sender,
+        )
+        .await;
+        drop(sender);
+        let _ = renderer.await;
     }
 
     /// Delegates to [`cella_orchestrator::tool_install::install_tools`].

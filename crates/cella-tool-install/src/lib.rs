@@ -10,7 +10,7 @@ pub use pkg::PackageManager;
 use std::collections::HashMap;
 use std::future::Future;
 
-use cella_backend::container_setup::chown_in_container;
+use cella_backend::container_setup::chown_path_in_container;
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
 use cella_backend::{
     BackendError, ContainerBackend, ExecOptions, ExecResult, FileToUpload, MountSpec,
@@ -1013,6 +1013,20 @@ pub async fn setup_plugin_manifests(
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins_mount = "/tmp/.cella/host-plugins";
 
+    // Ask the container, not the host. Asking the host gets both cases wrong:
+    // with no bind there is no directory to chown, so every `up` warns; and on
+    // a container created before the host had any plugin, `~/.claude/plugins`
+    // resolves through the `~/.claude` bind to the host's own tree, where
+    // seeding would overwrite the host manifests with container-local paths.
+    //
+    // cella adds this bind and the tmpfs shadowing `~/.claude/plugins`
+    // together, so the bind is a good proxy for the tmpfs being there. It is a
+    // proxy and not a guarantee: on the compose path a base file declaring its
+    // own mount at that target drops cella's tmpfs and keeps the bind.
+    if !container_dir_exists(client, container_id, host_plugins_mount).await {
+        return;
+    }
+
     // Symlink everything except the two manifests.
     let script = format!(
         concat!(
@@ -1042,7 +1056,13 @@ pub async fn setup_plugin_manifests(
         .await;
 
     upload_seeded_manifests(client, container_id, remote_user, &plugins_dir).await;
-    chown_in_container(client, container_id, remote_user, &plugins_dir).await;
+
+    // Non-recursive on purpose. Everything else in here is a symlink into the
+    // `/tmp/.cella/host-plugins` bind, and `chown` dereferences symlinks unless
+    // told not to — `-R` would rewrite the ownership of the host's own plugin
+    // files on any implementation that does not default to `-P`.
+    // `upload_seeded_manifests` chowns the two real files it writes.
+    chown_path_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
 /// Compute both manifests for this container and upload them.
@@ -1082,6 +1102,10 @@ async fn upload_seeded_manifests(
     }
     if let Err(e) = client.upload_files(container_id, &files).await {
         warn!("Failed to seed plugin manifests: {e}");
+        return;
+    }
+    for file in &files {
+        chown_path_in_container(client, container_id, remote_user, &file.path).await;
     }
 }
 
@@ -1482,12 +1506,25 @@ pub async fn seed_tool_config_files(
     container_id: &str,
     settings: &cella_config::CellaConfig,
     remote_user: &str,
+    progress: &ProgressSender,
 ) {
+    // The step lives here rather than at the call sites so that it follows the
+    // file list this function owns, and so every caller reports it identically.
     let files = build_tool_config_seed_files(settings, remote_user);
     if files.is_empty() {
         return;
     }
 
+    seed_files_into_container(client, container_id, remote_user, files, progress).await;
+}
+
+async fn seed_files_into_container(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    files: Vec<FileToUpload>,
+    progress: &ProgressSender,
+) {
     let mut to_upload = Vec::with_capacity(files.len());
     for file in files {
         if container_file_exists(client, container_id, &file.path).await {
@@ -1501,6 +1538,9 @@ pub async fn seed_tool_config_files(
         return;
     }
 
+    // Below the filter, not above it: whether there is container work to do is
+    // decided here, not by the host-side file list.
+    let step = progress.step("Seeding tool configuration...");
     match client.upload_files(container_id, &to_upload).await {
         Ok(()) => {
             chown_uploaded_files_and_parents(client, container_id, remote_user, &to_upload).await;
@@ -1511,6 +1551,7 @@ pub async fn seed_tool_config_files(
         }
         Err(e) => warn!("Failed to seed tool config files: {e}"),
     }
+    step.finish();
 }
 
 /// Chown each uploaded file and its parent directories back to `remote_user`.
@@ -1519,6 +1560,19 @@ pub async fn seed_tool_config_files(
 /// `create_tar_archive` includes directory entries with root ownership that
 /// clobber the UID-remapped home directory. This chowns both files and their
 /// unique parent directories.
+///
+/// Every chown here is non-recursive, and that is load-bearing rather than an
+/// optimization. `create_tar_archive` skips top-level components, so the only
+/// directory entry it can write for `~/.claude.json` is the home directory
+/// itself — there is no nested content to repair. Recursing from `/home/<user>`
+/// would instead walk every forwarded tool config tree bind-mounted beneath it
+/// (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.config/nvim`), costing minutes per
+/// `up` on a remote filesystem.
+///
+/// Cost is the lesser problem. Wherever UID remap is skipped — a `root` or
+/// numeric `remoteUser`, or any non-Linux host, see `uid_image` — the container
+/// user's UID is not the host user's, so recursing rewrites the ownership of
+/// the host's own config files through those bind mounts.
 async fn chown_uploaded_files_and_parents(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -1526,18 +1580,62 @@ async fn chown_uploaded_files_and_parents(
     files: &[FileToUpload],
 ) {
     for file in files {
-        chown_in_container(client, container_id, remote_user, &file.path).await;
+        chown_path_in_container(client, container_id, remote_user, &file.path).await;
     }
 
-    let mut parents: Vec<&str> = files
-        .iter()
-        .filter_map(|f| std::path::Path::new(&f.path).parent()?.to_str())
-        .collect();
+    // Every ancestor up to the home directory, not just the direct parent: tar
+    // extraction creates the intermediate ones implicitly and root-owned, and
+    // with no `-R` anywhere nothing else would repair them. The walk stops at
+    // the home directory so it never reaches `/home` or `/`.
+    //
+    // This assumes no seed path sits beneath a forwarded mount. Both of today's
+    // do not (`~/.claude.json` and `~/.tmux.conf` are directly in `$HOME`); a
+    // seed file under, say, `~/.config/nvim` would have this chown the host's
+    // own directory.
+    let home = cella_env::claude_code::container_home(remote_user);
+    let home_path = std::path::Path::new(&home);
+    let mut parents: Vec<&str> = Vec::new();
+    for file in files {
+        let mut current = std::path::Path::new(&file.path).parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(home_path) {
+                break;
+            }
+            let Some(dir_str) = dir.to_str() else { break };
+            parents.push(dir_str);
+            if dir == home_path {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
     parents.sort_unstable();
     parents.dedup();
     for parent in parents {
-        chown_in_container(client, container_id, remote_user, parent).await;
+        chown_path_in_container(client, container_id, remote_user, parent).await;
     }
+}
+
+/// Whether `path` exists as a directory inside the container.
+async fn container_dir_exists(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    path: &str,
+) -> bool {
+    matches!(
+        client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["test".to_string(), "-d".to_string(), path.to_string()],
+                    user: None,
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await,
+        Ok(r) if r.exit_code == 0
+    )
 }
 
 /// Whether `path` exists as a regular file inside the container.
@@ -1977,6 +2075,10 @@ pub async fn install_tools(
     let has = |t: ToolName| tools.contains(&t);
     let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
 
+    // Reported separately from the install phase below: this runs before that
+    // phase exists, and when it does shell out to the package manager it is the
+    // longest un-attributable wait in `up`.
+    let packages_step = progress.step("Checking system packages...");
     let (is_alpine, node_available) = install_system_packages(
         client,
         container_id,
@@ -1986,6 +2088,7 @@ pub async fn install_tools(
         needs_npm,
     )
     .await;
+    packages_step.finish();
 
     let ctx = InstallCtx {
         client,
@@ -4982,13 +5085,13 @@ exit 1
 
         assert_eq!(
             calls[0].cmd,
-            vec!["chown", "-R", "dev:dev", "/home/dev/.claude.json"],
+            vec!["chown", "-h", "dev:dev", "/home/dev/.claude.json"],
         );
         assert_eq!(
             calls[1].cmd,
-            vec!["chown", "-R", "dev:dev", "/home/dev/.tmux.conf"],
+            vec!["chown", "-h", "dev:dev", "/home/dev/.tmux.conf"],
         );
-        assert_eq!(calls[2].cmd, vec!["chown", "-R", "dev:dev", "/home/dev"],);
+        assert_eq!(calls[2].cmd, vec!["chown", "-h", "dev:dev", "/home/dev"],);
         assert_eq!(calls[2].user.as_deref(), Some("root"));
     }
 
@@ -4996,12 +5099,12 @@ exit 1
     async fn chown_after_upload_deduplicates_shared_parent() {
         let files = vec![
             FileToUpload {
-                path: "/home/dev/.config/tmux/tmux.conf".to_string(),
+                path: "/home/dev/.local/state/demo/a.conf".to_string(),
                 content: vec![],
                 mode: 0o600,
             },
             FileToUpload {
-                path: "/home/dev/.config/tmux/plugins.conf".to_string(),
+                path: "/home/dev/.local/state/demo/b.conf".to_string(),
                 content: vec![],
                 mode: 0o600,
             },
@@ -5012,23 +5115,27 @@ exit 1
             },
         ];
 
-        // 3 file chowns + 2 unique parents (/home/dev/.config/tmux, /home/dev)
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-            Ok(ok_exit(0)),
-        ]);
+        // 3 file chowns + every ancestor up to the home directory, deduped:
+        // /home/dev, /home/dev/.local, /home/dev/.local/state,
+        // /home/dev/.local/state/demo. The fixture deliberately avoids any
+        // forwarded-mount target, since the walk would chown the host's
+        // directory there.
+        let backend = MockBackend::new(std::iter::repeat_with(|| Ok(ok_exit(0))).take(7).collect());
 
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
 
         let calls = backend.calls();
-        assert_eq!(calls.len(), 5, "3 file chowns + 2 unique parent chowns");
+        assert_eq!(calls.len(), 7, "3 file chowns + 4 unique ancestor chowns");
 
         let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[3].as_str()).collect();
         assert!(parent_chowns.contains(&"/home/dev"));
-        assert!(parent_chowns.contains(&"/home/dev/.config/tmux"));
+        assert!(parent_chowns.contains(&"/home/dev/.local"));
+        assert!(parent_chowns.contains(&"/home/dev/.local/state"));
+        assert!(parent_chowns.contains(&"/home/dev/.local/state/demo"));
+        assert!(
+            !parent_chowns.contains(&"/home"),
+            "the walk must stop at the home directory"
+        );
     }
 
     #[tokio::test]
@@ -5056,7 +5163,66 @@ exit 1
         assert!(backend.calls().is_empty());
     }
 
+    #[tokio::test]
+    async fn chown_after_upload_never_follows_a_symlink() {
+        // A symlink planted at one of these paths by an unprivileged process
+        // in the container would otherwise redirect a root chown onto its
+        // referent.
+        let files = vec![FileToUpload {
+            path: "/home/dev/.claude.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        }];
+        let backend = MockBackend::new(vec![Ok(ok_exit(0)), Ok(ok_exit(0))]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        for call in backend.calls() {
+            assert!(
+                call.cmd.iter().any(|arg| arg == "-h"),
+                "chown must not dereference, got {:?}",
+                call.cmd
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_never_recurses() {
+        // `/home/<user>` has the forwarded tool config trees bind-mounted under
+        // it. Recursing there walks all of them and changes no ownership the
+        // per-file chowns have not already fixed.
+        let files = vec![FileToUpload {
+            path: "/home/dev/.claude.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        }];
+        let backend = MockBackend::new(vec![Ok(ok_exit(0)), Ok(ok_exit(0))]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        for call in backend.calls() {
+            assert!(
+                !call.cmd.iter().any(|arg| arg == "-R"),
+                "chown must not recurse, got {:?}",
+                call.cmd
+            );
+        }
+    }
+
     // ── Plugin manifest seeding ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn plugin_manifests_skipped_without_the_host_plugins_bind() {
+        // Only the container can say whether `~/.claude/plugins` is cella's to
+        // write; without the bind the path resolves to the host's own tree.
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+
+        setup_plugin_manifests(&backend, "ctr", "dev").await;
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "probe only, then bail");
+        assert_eq!(calls[0].cmd, vec!["test", "-d", "/tmp/.cella/host-plugins"],);
+    }
 
     fn seed_map() -> cella_env::claude_code::PathMap {
         cella_env::claude_code::PathMap {

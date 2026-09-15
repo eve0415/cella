@@ -224,29 +224,79 @@ pub async fn mkdir_in_container(
         .await
 }
 
+/// Whether a chown descends into a directory's contents.
+#[derive(Clone, Copy)]
+enum Recurse {
+    /// `chown -R`: the path and everything beneath it.
+    Yes,
+    /// The named path alone.
+    No,
+}
+
+async fn chown(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    path: &str,
+    recurse: Recurse,
+) {
+    let mut cmd = vec!["chown".to_string()];
+    match recurse {
+        Recurse::Yes => cmd.push("-R".to_string()),
+        // `-h` so a symlink planted at one of these paths by an unprivileged
+        // process inside the container cannot redirect a root chown onto its
+        // referent — `/etc`, or a host directory reachable through a bind
+        // mount. None of these targets is ever legitimately a symlink, and on
+        // a real file or directory `-h` behaves identically.
+        Recurse::No => cmd.push("-h".to_string()),
+    }
+    cmd.push(format!("{remote_user}:{remote_user}"));
+    cmd.push(path.to_string());
+
+    match client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd,
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(result) if result.exit_code != 0 => warn!(
+            "chown of {path} failed (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ),
+        Err(e) => warn!("chown of {path} failed: {e}"),
+        Ok(_) => {}
+    }
+}
+
 /// Recursively chown a directory inside the container.
+///
+/// Only for trees cella itself populates. A path with host bind mounts beneath
+/// it needs [`chown_path_in_container`] instead — `chown -R` has no
+/// `--one-file-system`, so it descends through every mount point it meets.
 pub async fn chown_in_container(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     dir: &str,
 ) {
-    let _ = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    format!("{remote_user}:{remote_user}"),
-                    dir.to_string(),
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
+    chown(client, container_id, remote_user, dir, Recurse::Yes).await;
+}
+
+/// Chown a single path inside the container, leaving its contents untouched.
+pub async fn chown_path_in_container(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    path: &str,
+) {
+    chown(client, container_id, remote_user, path, Recurse::No).await;
 }
 
 /// Create a directory, upload files, and fix ownership.
