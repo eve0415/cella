@@ -1534,8 +1534,13 @@ pub async fn seed_tool_config_files(
 /// directory entry it can write for `~/.claude.json` is the home directory
 /// itself — there is no nested content to repair. Recursing from `/home/<user>`
 /// would instead walk every forwarded tool config tree bind-mounted beneath it
-/// (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.config/nvim`), which on a remote
-/// filesystem costs minutes per `up` for no ownership change at all.
+/// (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.config/nvim`), costing minutes per
+/// `up` on a remote filesystem.
+///
+/// Cost is the lesser problem. Wherever UID remap is skipped — a `root` or
+/// numeric `remoteUser`, or any non-Linux host, see `uid_image` — the container
+/// user's UID is not the host user's, so recursing rewrites the ownership of
+/// the host's own config files through those bind mounts.
 async fn chown_uploaded_files_and_parents(
     client: &dyn ContainerBackend,
     container_id: &str,
