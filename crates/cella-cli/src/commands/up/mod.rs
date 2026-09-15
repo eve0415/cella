@@ -1210,15 +1210,9 @@ impl UpContext {
     /// The seed's path rewrite reads the pinned workspace pair from the
     /// container's own environment, so it and the agent's `PathMap` are the same
     /// mapping by construction.
-    async fn setup_claude_code(
-        &self,
-        container_id: &str,
-        remote_user: &str,
-        settings: &cella_config::CellaConfig,
-    ) {
-        if !settings.tools.claude_code.forward_config {
-            return;
-        }
+    /// The caller gates this on `claude_code.forward_config`, so that the
+    /// progress step around it stays off the log when nothing is forwarded.
+    async fn setup_claude_code(&self, container_id: &str, remote_user: &str) {
         create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
         setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
     }
@@ -1306,7 +1300,7 @@ impl UpContext {
             self.progress
                 .run_step(
                     "Forwarding tool configuration...",
-                    self.setup_claude_code(container_id, remote_user, settings),
+                    self.setup_claude_code(container_id, remote_user),
                 )
                 .await;
         }
