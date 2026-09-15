@@ -1009,18 +1009,21 @@ pub async fn setup_plugin_manifests(
     container_id: &str,
     remote_user: &str,
 ) {
-    // Without a host plugins directory there is no `/tmp/.cella/host-plugins`
-    // bind and no tmpfs shadowing `plugins/`, so the directory this would
-    // populate does not exist in the container. Every step below is already a
-    // no-op in that case except the chown, which would fail and warn on every
-    // `up` for anyone who has never installed a plugin.
-    if cella_env::claude_code::host_plugins_dir().is_none() {
-        return;
-    }
-
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins_mount = "/tmp/.cella/host-plugins";
+
+    // The bind and the tmpfs that shadows `~/.claude/plugins` are added
+    // together at create time, so the bind's presence *in this container* is
+    // what says the plugins directory is cella's to write. Asking the host
+    // instead gets both cases wrong: with no bind there is no directory to
+    // chown, so every `up` warns; and on a container created before the host
+    // had any plugin, `~/.claude/plugins` resolves through the `~/.claude` bind
+    // to the host's own tree, where seeding would overwrite the host manifests
+    // with container-local paths and chown the host's files.
+    if !container_dir_exists(client, container_id, host_plugins_mount).await {
+        return;
+    }
 
     // Symlink everything except the two manifests.
     let script = format!(
@@ -1560,6 +1563,28 @@ async fn chown_uploaded_files_and_parents(
     for parent in parents {
         chown_path_in_container(client, container_id, remote_user, parent).await;
     }
+}
+
+/// Whether `path` exists as a directory inside the container.
+async fn container_dir_exists(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    path: &str,
+) -> bool {
+    matches!(
+        client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["test".to_string(), "-d".to_string(), path.to_string()],
+                    user: None,
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await,
+        Ok(r) if r.exit_code == 0
+    )
 }
 
 /// Whether `path` exists as a regular file inside the container.
