@@ -242,7 +242,7 @@ async fn write_env_cache(
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec!["mkdir".to_string(), "-p".to_string(), dir_path],
+                cmd: vec!["mkdir".to_string(), "-p".to_string(), dir_path.clone()],
                 user: Some(user.to_string()),
                 env: None,
                 working_dir: None,
@@ -251,16 +251,23 @@ async fn write_env_cache(
         .await;
 
     let cache_file = FileToUpload {
-        path,
+        path: path.clone(),
         content: json.into_bytes(),
         mode: 0o644,
     };
 
     if let Err(e) = client.upload_files(container_id, &[cache_file]).await {
         debug!("Failed to cache probed env: {e}");
-    } else {
-        debug!("Cached {} probed env vars", env.len());
+        return;
     }
+    debug!("Cached {} probed env vars", env.len());
+
+    // Tar extraction runs as root and rewrites the directory entry it creates,
+    // so the `mkdir` above does not settle ownership. Nothing else repairs it.
+    cella_backend::container_setup::chown_path_in_container(client, container_id, user, &dir_path)
+        .await;
+    cella_backend::container_setup::chown_path_in_container(client, container_id, user, &path)
+        .await;
 }
 
 /// Ensure `SSH_AUTH_SOCK` is present in the target environment when a
