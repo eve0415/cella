@@ -1494,12 +1494,26 @@ pub async fn seed_tool_config_files(
     container_id: &str,
     settings: &cella_config::CellaConfig,
     remote_user: &str,
+    progress: &ProgressSender,
 ) {
+    // The step lives here rather than at the call sites so that it follows the
+    // file list this function owns, and so every caller reports it identically.
     let files = build_tool_config_seed_files(settings, remote_user);
     if files.is_empty() {
         return;
     }
 
+    let step = progress.step("Seeding tool configuration...");
+    seed_files_into_container(client, container_id, remote_user, files).await;
+    step.finish();
+}
+
+async fn seed_files_into_container(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    files: Vec<FileToUpload>,
+) {
     let mut to_upload = Vec::with_capacity(files.len());
     for file in files {
         if container_file_exists(client, container_id, &file.path).await {
