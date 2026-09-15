@@ -10,7 +10,7 @@ pub use pkg::PackageManager;
 use std::collections::HashMap;
 use std::future::Future;
 
-use cella_backend::container_setup::{chown_in_container, chown_path_in_container};
+use cella_backend::container_setup::chown_path_in_container;
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
 use cella_backend::{
     BackendError, ContainerBackend, ExecOptions, ExecResult, FileToUpload, MountSpec,
@@ -1054,7 +1054,13 @@ pub async fn setup_plugin_manifests(
         .await;
 
     upload_seeded_manifests(client, container_id, remote_user, &plugins_dir).await;
-    chown_in_container(client, container_id, remote_user, &plugins_dir).await;
+
+    // Non-recursive on purpose. Everything else in here is a symlink into the
+    // `/tmp/.cella/host-plugins` bind, and `chown` dereferences symlinks unless
+    // told not to — `-R` would rewrite the ownership of the host's own plugin
+    // files on any implementation that does not default to `-P`.
+    // `upload_seeded_manifests` chowns the two real files it writes.
+    chown_path_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
 /// Compute both manifests for this container and upload them.
@@ -1094,6 +1100,10 @@ async fn upload_seeded_manifests(
     }
     if let Err(e) = client.upload_files(container_id, &files).await {
         warn!("Failed to seed plugin manifests: {e}");
+        return;
+    }
+    for file in &files {
+        chown_path_in_container(client, container_id, remote_user, &file.path).await;
     }
 }
 
