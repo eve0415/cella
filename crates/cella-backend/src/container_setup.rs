@@ -224,29 +224,64 @@ pub async fn mkdir_in_container(
         .await
 }
 
-/// Recursively chown a directory inside the container.
-pub async fn chown_in_container(
+/// Whether a chown descends into a directory's contents.
+#[derive(Clone, Copy)]
+enum Recurse {
+    /// `chown -R`: the path and everything beneath it.
+    Yes,
+    /// The named path alone.
+    No,
+}
+
+async fn chown(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    dir: &str,
+    path: &str,
+    recurse: Recurse,
 ) {
+    let mut cmd = vec!["chown".to_string()];
+    if matches!(recurse, Recurse::Yes) {
+        cmd.push("-R".to_string());
+    }
+    cmd.push(format!("{remote_user}:{remote_user}"));
+    cmd.push(path.to_string());
+
     let _ = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    format!("{remote_user}:{remote_user}"),
-                    dir.to_string(),
-                ],
+                cmd,
                 user: Some("root".to_string()),
                 env: None,
                 working_dir: None,
             },
         )
         .await;
+}
+
+/// Recursively chown a directory inside the container.
+///
+/// Only for trees cella itself populates. A path with host bind mounts beneath
+/// it needs [`chown_path_in_container`] instead — `chown -R` has no
+/// `--one-file-system`, so it descends through every mount point it meets.
+pub async fn chown_in_container(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    dir: &str,
+) {
+    chown(client, container_id, remote_user, dir, Recurse::Yes).await;
+}
+
+/// Chown a single path inside the container, leaving its contents untouched.
+pub async fn chown_path_in_container(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    path: &str,
+) {
+    chown(client, container_id, remote_user, path, Recurse::No).await;
 }
 
 /// Create a directory, upload files, and fix ownership.

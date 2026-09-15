@@ -10,7 +10,7 @@ pub use pkg::PackageManager;
 use std::collections::HashMap;
 use std::future::Future;
 
-use cella_backend::container_setup::chown_in_container;
+use cella_backend::container_setup::{chown_in_container, chown_path_in_container};
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
 use cella_backend::{
     BackendError, ContainerBackend, ExecOptions, ExecResult, FileToUpload, MountSpec,
@@ -1519,6 +1519,14 @@ pub async fn seed_tool_config_files(
 /// `create_tar_archive` includes directory entries with root ownership that
 /// clobber the UID-remapped home directory. This chowns both files and their
 /// unique parent directories.
+///
+/// Every chown here is non-recursive, and that is load-bearing rather than an
+/// optimization. `create_tar_archive` skips top-level components, so the only
+/// directory entry it can write for `~/.claude.json` is the home directory
+/// itself — there is no nested content to repair. Recursing from `/home/<user>`
+/// would instead walk every forwarded tool config tree bind-mounted beneath it
+/// (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.config/nvim`), which on a remote
+/// filesystem costs minutes per `up` for no ownership change at all.
 async fn chown_uploaded_files_and_parents(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -1526,7 +1534,7 @@ async fn chown_uploaded_files_and_parents(
     files: &[FileToUpload],
 ) {
     for file in files {
-        chown_in_container(client, container_id, remote_user, &file.path).await;
+        chown_path_in_container(client, container_id, remote_user, &file.path).await;
     }
 
     let mut parents: Vec<&str> = files
@@ -1536,7 +1544,7 @@ async fn chown_uploaded_files_and_parents(
     parents.sort_unstable();
     parents.dedup();
     for parent in parents {
-        chown_in_container(client, container_id, remote_user, parent).await;
+        chown_path_in_container(client, container_id, remote_user, parent).await;
     }
 }
 
@@ -4982,13 +4990,13 @@ exit 1
 
         assert_eq!(
             calls[0].cmd,
-            vec!["chown", "-R", "dev:dev", "/home/dev/.claude.json"],
+            vec!["chown", "dev:dev", "/home/dev/.claude.json"],
         );
         assert_eq!(
             calls[1].cmd,
-            vec!["chown", "-R", "dev:dev", "/home/dev/.tmux.conf"],
+            vec!["chown", "dev:dev", "/home/dev/.tmux.conf"],
         );
-        assert_eq!(calls[2].cmd, vec!["chown", "-R", "dev:dev", "/home/dev"],);
+        assert_eq!(calls[2].cmd, vec!["chown", "dev:dev", "/home/dev"],);
         assert_eq!(calls[2].user.as_deref(), Some("root"));
     }
 
@@ -5026,7 +5034,7 @@ exit 1
         let calls = backend.calls();
         assert_eq!(calls.len(), 5, "3 file chowns + 2 unique parent chowns");
 
-        let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[3].as_str()).collect();
+        let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[2].as_str()).collect();
         assert!(parent_chowns.contains(&"/home/dev"));
         assert!(parent_chowns.contains(&"/home/dev/.config/tmux"));
     }
@@ -5046,7 +5054,7 @@ exit 1
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].cmd[3], "/home/dev");
+        assert_eq!(calls[1].cmd[2], "/home/dev");
     }
 
     #[tokio::test]
@@ -5054,6 +5062,29 @@ exit 1
         let backend = MockBackend::new(vec![]);
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &[]).await;
         assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_never_recurses() {
+        // `/home/<user>` has the forwarded tool config trees bind-mounted under
+        // it. Recursing there walks all of them and changes no ownership the
+        // per-file chowns have not already fixed.
+        let files = vec![FileToUpload {
+            path: "/home/dev/.claude.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        }];
+        let backend = MockBackend::new(vec![Ok(ok_exit(0)), Ok(ok_exit(0))]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        for call in backend.calls() {
+            assert!(
+                !call.cmd.iter().any(|arg| arg == "-R"),
+                "chown must not recurse, got {:?}",
+                call.cmd
+            );
+        }
     }
 
     // ── Plugin manifest seeding ────────────────────────────────────────────
