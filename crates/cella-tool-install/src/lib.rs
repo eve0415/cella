@@ -1585,6 +1585,11 @@ async fn chown_uploaded_files_and_parents(
     // extraction creates the intermediate ones implicitly and root-owned, and
     // with no `-R` anywhere nothing else would repair them. The walk stops at
     // the home directory so it never reaches `/home` or `/`.
+    //
+    // This assumes no seed path sits beneath a forwarded mount. Both of today's
+    // do not (`~/.claude.json` and `~/.tmux.conf` are directly in `$HOME`); a
+    // seed file under, say, `~/.config/nvim` would have this chown the host's
+    // own directory.
     let home = cella_env::claude_code::container_home(remote_user);
     let home_path = std::path::Path::new(&home);
     let mut parents: Vec<&str> = Vec::new();
@@ -5092,12 +5097,12 @@ exit 1
     async fn chown_after_upload_deduplicates_shared_parent() {
         let files = vec![
             FileToUpload {
-                path: "/home/dev/.config/tmux/tmux.conf".to_string(),
+                path: "/home/dev/.local/state/demo/a.conf".to_string(),
                 content: vec![],
                 mode: 0o600,
             },
             FileToUpload {
-                path: "/home/dev/.config/tmux/plugins.conf".to_string(),
+                path: "/home/dev/.local/state/demo/b.conf".to_string(),
                 content: vec![],
                 mode: 0o600,
             },
@@ -5109,18 +5114,22 @@ exit 1
         ];
 
         // 3 file chowns + every ancestor up to the home directory, deduped:
-        // /home/dev, /home/dev/.config, /home/dev/.config/tmux.
-        let backend = MockBackend::new(std::iter::repeat_with(|| Ok(ok_exit(0))).take(6).collect());
+        // /home/dev, /home/dev/.local, /home/dev/.local/state,
+        // /home/dev/.local/state/demo. The fixture deliberately avoids any
+        // forwarded-mount target, since the walk would chown the host's
+        // directory there.
+        let backend = MockBackend::new(std::iter::repeat_with(|| Ok(ok_exit(0))).take(7).collect());
 
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
 
         let calls = backend.calls();
-        assert_eq!(calls.len(), 6, "3 file chowns + 3 unique ancestor chowns");
+        assert_eq!(calls.len(), 7, "3 file chowns + 4 unique ancestor chowns");
 
         let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[2].as_str()).collect();
         assert!(parent_chowns.contains(&"/home/dev"));
-        assert!(parent_chowns.contains(&"/home/dev/.config"));
-        assert!(parent_chowns.contains(&"/home/dev/.config/tmux"));
+        assert!(parent_chowns.contains(&"/home/dev/.local"));
+        assert!(parent_chowns.contains(&"/home/dev/.local/state"));
+        assert!(parent_chowns.contains(&"/home/dev/.local/state/demo"));
         assert!(
             !parent_chowns.contains(&"/home"),
             "the walk must stop at the home directory"
