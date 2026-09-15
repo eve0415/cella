@@ -1513,9 +1513,7 @@ pub async fn seed_tool_config_files(
         return;
     }
 
-    let step = progress.step("Seeding tool configuration...");
-    seed_files_into_container(client, container_id, remote_user, files).await;
-    step.finish();
+    seed_files_into_container(client, container_id, remote_user, files, progress).await;
 }
 
 async fn seed_files_into_container(
@@ -1523,6 +1521,7 @@ async fn seed_files_into_container(
     container_id: &str,
     remote_user: &str,
     files: Vec<FileToUpload>,
+    progress: &ProgressSender,
 ) {
     let mut to_upload = Vec::with_capacity(files.len());
     for file in files {
@@ -1537,6 +1536,9 @@ async fn seed_files_into_container(
         return;
     }
 
+    // Below the filter, not above it: whether there is container work to do is
+    // decided here, not by the host-side file list.
+    let step = progress.step("Seeding tool configuration...");
     match client.upload_files(container_id, &to_upload).await {
         Ok(()) => {
             chown_uploaded_files_and_parents(client, container_id, remote_user, &to_upload).await;
@@ -1547,6 +1549,7 @@ async fn seed_files_into_container(
         }
         Err(e) => warn!("Failed to seed tool config files: {e}"),
     }
+    step.finish();
 }
 
 /// Chown each uploaded file and its parent directories back to `remote_user`.
