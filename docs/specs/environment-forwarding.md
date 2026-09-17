@@ -301,7 +301,7 @@ When [credential protection](credential-protection.md) is active, phantom tokens
 
 ### Env Var Forwarding
 
-11 AI provider API keys are detected from the host environment and forwarded as container environment variables. Keys are read live from the host process on every `cella exec` / `cella shell` invocation -- they are never stored in container labels or baked at creation time.
+12 AI provider API keys are detected from the host environment and forwarded as container environment variables. Keys are read live from the host process on every `cella exec` / `cella shell` invocation -- they are never stored in container labels or baked at creation time.
 
 | Provider | Env Var |
 |---|---|
@@ -316,6 +316,7 @@ When [credential protection](credential-protection.md) is active, phantom tokens
 | Together | `TOGETHER_API_KEY` |
 | Perplexity | `PERPLEXITY_API_KEY` |
 | Cohere | `COHERE_API_KEY` |
+| TypeSafe | `TYPESAFE_API_KEY` |
 
 A key is forwarded when all of:
 
@@ -348,7 +349,7 @@ When [credential protection](credential-protection.md) is enabled (`credentials.
 
 GitHub uses `GH_TOKEN` as the phantom injection target but resolves the real credential via `gh auth token -h <hostname>`.
 
-12 credential providers are protectable in total: the 11 AI providers above plus GitHub.
+13 credential providers are protectable in total: the 12 AI providers above plus GitHub.
 
 See [Credential Protection](credential-protection.md) for the full phantom token lifecycle, wire protocol, and security properties.
 

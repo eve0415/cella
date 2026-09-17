@@ -314,7 +314,7 @@ AI coding tools require API keys to function. cella handles credential injection
 
 API keys are read live from the host environment on every `cella exec` or `cella shell` invocation and passed as environment variables to the container process (see [Environment Forwarding](environment-forwarding.md) for the general environment injection mechanism). Keys are never stored in container labels, image layers, or persistent environment configuration.
 
-11 AI provider keys are supported:
+12 AI provider keys are supported:
 
 | Provider | Environment Variable |
 |---|---|
@@ -329,6 +329,7 @@ API keys are read live from the host environment on every `cella exec` or `cella
 | Together | `TOGETHER_API_KEY` |
 | Perplexity | `PERPLEXITY_API_KEY` |
 | Cohere | `COHERE_API_KEY` |
+| TypeSafe | `TYPESAFE_API_KEY` |
 
 A key is injected only when all of the following hold:
 

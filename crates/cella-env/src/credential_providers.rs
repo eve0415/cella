@@ -20,7 +20,7 @@ pub struct CredentialProvider {
     pub prefix: &'static str,
 }
 
-/// All built-in credential providers (GitHub + 11 AI providers).
+/// All built-in credential providers (GitHub + 12 AI providers).
 pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
     CredentialProvider {
         id: "github",
@@ -106,6 +106,13 @@ pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
         header: "Authorization",
         prefix: "Bearer ",
     },
+    CredentialProvider {
+        id: "typesafe",
+        env_var: "TYPESAFE_API_KEY",
+        domains: &["api.typesafe.ai"],
+        header: "Authorization",
+        prefix: "Bearer ",
+    },
 ];
 
 /// A merged credential provider entry (either built-in or custom).
@@ -180,7 +187,7 @@ mod tests {
 
     #[test]
     fn built_in_count() {
-        assert_eq!(CREDENTIAL_PROVIDERS.len(), 12);
+        assert_eq!(CREDENTIAL_PROVIDERS.len(), 13);
     }
 
     #[test]
@@ -267,6 +274,50 @@ mod tests {
         let anthropic = merged.iter().find(|p| p.id == "anthropic").unwrap();
         assert_eq!(anthropic.domains, vec!["custom-anthropic.corp"]);
         assert_eq!(anthropic.env_var, "MY_ANTHROPIC_KEY");
+    }
+
+    /// Every AI provider must have a credential-protection counterpart.
+    ///
+    /// The two tables feed different paths: `AI_PROVIDERS` drives plaintext
+    /// forwarding when protection is off, `CREDENTIAL_PROVIDERS` drives
+    /// phantom-token minting when it is on. A provider present in only the
+    /// former is silently absent from the container under protection, because
+    /// `append_ai_keys` returns early on the phantom path.
+    #[test]
+    fn ai_providers_have_credential_counterparts() {
+        for p in crate::ai_keys::AI_PROVIDERS {
+            let c = CREDENTIAL_PROVIDERS
+                .iter()
+                .find(|c| c.id == p.id)
+                .unwrap_or_else(|| {
+                    panic!("AI provider {} has no CREDENTIAL_PROVIDERS entry", p.id)
+                });
+            assert_eq!(c.env_var, p.env_var, "env var mismatch for {}", p.id);
+        }
+        for c in CREDENTIAL_PROVIDERS {
+            // github is credential-only: resolved via `gh auth token`, never
+            // forwarded as a raw env var.
+            if c.id == "github" {
+                continue;
+            }
+            assert!(
+                crate::ai_keys::AI_PROVIDERS.iter().any(|p| p.id == c.id),
+                "credential provider {} has no AI_PROVIDERS entry",
+                c.id
+            );
+        }
+    }
+
+    #[test]
+    fn typesafe_provider_config() {
+        let p = CREDENTIAL_PROVIDERS
+            .iter()
+            .find(|p| p.id == "typesafe")
+            .unwrap();
+        assert_eq!(p.env_var, "TYPESAFE_API_KEY");
+        assert_eq!(p.domains, &["api.typesafe.ai"]);
+        assert_eq!(p.header, "Authorization");
+        assert_eq!(p.prefix, "Bearer ");
     }
 
     #[test]

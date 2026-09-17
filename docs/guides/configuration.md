@@ -100,7 +100,7 @@ Controls which AI provider API keys are forwarded from the host environment into
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Global toggle — when `false`, no AI keys are forwarded |
-| *`<provider>`* | bool | `true` | Per-provider override — known providers: `anthropic`, `openai`, `gemini`, `groq`, `mistral`, `deepseek`, `xai`, `fireworks`, `together`, `perplexity`, `cohere` |
+| *`<provider>`* | bool | `true` | Per-provider override — known providers: `anthropic`, `openai`, `gemini`, `groq`, `mistral`, `deepseek`, `xai`, `fireworks`, `together`, `perplexity`, `cohere`, `typesafe` |
 
 ```toml
 [credentials.ai]

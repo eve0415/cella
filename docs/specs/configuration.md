@@ -230,7 +230,7 @@ Controls which AI provider API keys are forwarded from the host environment into
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | `bool` | `true` | Global toggle -- when `false`, no AI keys are forwarded regardless of per-provider settings |
-| *`<provider_id>`* | `bool` | `true` | Per-provider override. Known providers: `anthropic`, `openai`, `gemini`, `groq`, `mistral`, `deepseek`, `xai`, `fireworks`, `together`, `perplexity`, `cohere` |
+| *`<provider_id>`* | `bool` | `true` | Per-provider override. Known providers: `anthropic`, `openai`, `gemini`, `groq`, `mistral`, `deepseek`, `xai`, `fireworks`, `together`, `perplexity`, `cohere`, `typesafe` |
 
 Unknown provider names default to enabled. The `providers` map uses `#[serde(flatten)]` so any string key is accepted without struct changes.
 

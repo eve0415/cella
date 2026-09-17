@@ -25,7 +25,7 @@ Your code doesn't need any changes. SDKs read the env var, include it in the req
 
 ## Built-in providers
 
-These 12 providers work out of the box. Each one activates automatically when the corresponding environment variable is set on your host:
+These 13 providers work out of the box. Each one activates automatically when the corresponding environment variable is set on your host:
 
 | Provider | Env var | API domain |
 |----------|---------|------------|
@@ -41,6 +41,7 @@ These 12 providers work out of the box. Each one activates automatically when th
 | Together | `TOGETHER_API_KEY` | `api.together.xyz` |
 | Perplexity | `PERPLEXITY_API_KEY` | `api.perplexity.ai` |
 | Cohere | `COHERE_API_KEY` | `api.cohere.com` |
+| TypeSafe | `TYPESAFE_API_KEY` | `api.typesafe.ai` |
 
 *GitHub credentials are resolved via `gh auth token`, not by reading `GH_TOKEN` directly. You need `gh auth login` on your host.
 
