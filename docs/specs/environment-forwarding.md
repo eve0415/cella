@@ -301,7 +301,7 @@ When [credential protection](credential-protection.md) is active, phantom tokens
 
 ### Env Var Forwarding
 
-11 AI provider API keys are detected from the host environment and forwarded as container environment variables. Keys are read live from the host process on every `cella exec` / `cella shell` invocation -- they are never stored in container labels or baked at creation time.
+12 AI provider API keys are detected from the host environment and forwarded as container environment variables. Keys are read live from the host process on every `cella exec` / `cella shell` invocation -- they are never stored in container labels or baked at creation time.
 
 | Provider | Env Var |
 |---|---|
@@ -316,6 +316,7 @@ When [credential protection](credential-protection.md) is active, phantom tokens
 | Together | `TOGETHER_API_KEY` |
 | Perplexity | `PERPLEXITY_API_KEY` |
 | Cohere | `COHERE_API_KEY` |
+| TypeSafe | `TYPESAFE_API_KEY` |
 
 A key is forwarded when all of:
 
