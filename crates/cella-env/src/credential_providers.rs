@@ -106,6 +106,13 @@ pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
         header: "Authorization",
         prefix: "Bearer ",
     },
+    CredentialProvider {
+        id: "typesafe",
+        env_var: "TYPESAFE_API_KEY",
+        domains: &["api.typesafe.ai"],
+        header: "Authorization",
+        prefix: "Bearer ",
+    },
 ];
 
 /// A merged credential provider entry (either built-in or custom).
@@ -180,7 +187,7 @@ mod tests {
 
     #[test]
     fn built_in_count() {
-        assert_eq!(CREDENTIAL_PROVIDERS.len(), 12);
+        assert_eq!(CREDENTIAL_PROVIDERS.len(), 13);
     }
 
     #[test]
@@ -267,6 +274,18 @@ mod tests {
         let anthropic = merged.iter().find(|p| p.id == "anthropic").unwrap();
         assert_eq!(anthropic.domains, vec!["custom-anthropic.corp"]);
         assert_eq!(anthropic.env_var, "MY_ANTHROPIC_KEY");
+    }
+
+    #[test]
+    fn typesafe_provider_config() {
+        let p = CREDENTIAL_PROVIDERS
+            .iter()
+            .find(|p| p.id == "typesafe")
+            .unwrap();
+        assert_eq!(p.env_var, "TYPESAFE_API_KEY");
+        assert_eq!(p.domains, &["api.typesafe.ai"]);
+        assert_eq!(p.header, "Authorization");
+        assert_eq!(p.prefix, "Bearer ");
     }
 
     #[test]
