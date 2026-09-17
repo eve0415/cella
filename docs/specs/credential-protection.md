@@ -144,7 +144,7 @@ flowchart LR
 
 ## Built-in Providers
 
-12 providers ship built-in. Custom providers MAY override any built-in by matching the `name`/`id`.
+13 providers ship built-in. Custom providers MAY override any built-in by matching the `name`/`id`.
 
 | ID | Env Var | Domains | Header | Prefix |
 |---|---|---|---|---|
@@ -160,6 +160,7 @@ flowchart LR
 | `together` | `TOGETHER_API_KEY` | `api.together.xyz` | `Authorization` | `Bearer ` |
 | `perplexity` | `PERPLEXITY_API_KEY` | `api.perplexity.ai` | `Authorization` | `Bearer ` |
 | `cohere` | `COHERE_API_KEY` | `api.cohere.com` | `Authorization` | `Bearer ` |
+| `typesafe` | `TYPESAFE_API_KEY` | `api.typesafe.ai` | `Authorization` | `Bearer ` |
 
 †The GitHub provider resolves credentials via `gh auth token -h <hostname>` subprocess invocation, not by reading `GH_TOKEN` directly. `GH_TOKEN` is used only as the phantom token injection target (the env var name set inside the container).
 
