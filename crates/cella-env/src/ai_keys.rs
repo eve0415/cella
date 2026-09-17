@@ -62,6 +62,10 @@ pub const AI_PROVIDERS: &[AiProvider] = &[
         id: "cohere",
         env_var: "COHERE_API_KEY",
     },
+    AiProvider {
+        id: "typesafe",
+        env_var: "TYPESAFE_API_KEY",
+    },
 ];
 
 /// Detect AI API keys present in the host environment.
@@ -121,7 +125,7 @@ mod tests {
 
     #[test]
     fn providers_count() {
-        assert_eq!(AI_PROVIDERS.len(), 11);
+        assert_eq!(AI_PROVIDERS.len(), 12);
     }
 
     #[test]
@@ -138,6 +142,15 @@ mod tests {
         for p in AI_PROVIDERS {
             assert!(seen.insert(p.id), "duplicate id: {}", p.id);
         }
+    }
+
+    #[test]
+    fn typesafe_provider_registered() {
+        let provider = AI_PROVIDERS
+            .iter()
+            .find(|p| p.id == "typesafe")
+            .expect("typesafe provider must be registered");
+        assert_eq!(provider.env_var, "TYPESAFE_API_KEY");
     }
 
     #[test]
