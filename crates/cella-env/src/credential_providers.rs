@@ -276,6 +276,38 @@ mod tests {
         assert_eq!(anthropic.env_var, "MY_ANTHROPIC_KEY");
     }
 
+    /// Every AI provider must have a credential-protection counterpart.
+    ///
+    /// The two tables feed different paths: `AI_PROVIDERS` drives plaintext
+    /// forwarding when protection is off, `CREDENTIAL_PROVIDERS` drives
+    /// phantom-token minting when it is on. A provider present in only the
+    /// former is silently absent from the container under protection, because
+    /// `append_ai_keys` returns early on the phantom path.
+    #[test]
+    fn ai_providers_have_credential_counterparts() {
+        for p in crate::ai_keys::AI_PROVIDERS {
+            let c = CREDENTIAL_PROVIDERS
+                .iter()
+                .find(|c| c.id == p.id)
+                .unwrap_or_else(|| {
+                    panic!("AI provider {} has no CREDENTIAL_PROVIDERS entry", p.id)
+                });
+            assert_eq!(c.env_var, p.env_var, "env var mismatch for {}", p.id);
+        }
+        for c in CREDENTIAL_PROVIDERS {
+            // github is credential-only: resolved via `gh auth token`, never
+            // forwarded as a raw env var.
+            if c.id == "github" {
+                continue;
+            }
+            assert!(
+                crate::ai_keys::AI_PROVIDERS.iter().any(|p| p.id == c.id),
+                "credential provider {} has no AI_PROVIDERS entry",
+                c.id
+            );
+        }
+    }
+
     #[test]
     fn typesafe_provider_config() {
         let p = CREDENTIAL_PROVIDERS

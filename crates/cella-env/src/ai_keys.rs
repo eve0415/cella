@@ -145,15 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_provider_registered() {
-        let provider = AI_PROVIDERS
-            .iter()
-            .find(|p| p.id == "typesafe")
-            .expect("typesafe provider must be registered");
-        assert_eq!(provider.env_var, "TYPESAFE_API_KEY");
-    }
-
-    #[test]
     #[allow(unsafe_code)]
     fn detect_skips_disabled_provider() {
         let _guard = ENV_LOCK
