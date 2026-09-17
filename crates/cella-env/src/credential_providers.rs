@@ -20,7 +20,7 @@ pub struct CredentialProvider {
     pub prefix: &'static str,
 }
 
-/// All built-in credential providers (GitHub + 11 AI providers).
+/// All built-in credential providers (GitHub + 12 AI providers).
 pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
     CredentialProvider {
         id: "github",

@@ -349,7 +349,7 @@ When [credential protection](credential-protection.md) is enabled (`credentials.
 
 GitHub uses `GH_TOKEN` as the phantom injection target but resolves the real credential via `gh auth token -h <hostname>`.
 
-12 credential providers are protectable in total: the 11 AI providers above plus GitHub.
+13 credential providers are protectable in total: the 12 AI providers above plus GitHub.
 
 See [Credential Protection](credential-protection.md) for the full phantom token lifecycle, wire protocol, and security properties.
 

@@ -25,7 +25,7 @@ Your code doesn't need any changes. SDKs read the env var, include it in the req
 
 ## Built-in providers
 
-These 12 providers work out of the box. Each one activates automatically when the corresponding environment variable is set on your host:
+These 13 providers work out of the box. Each one activates automatically when the corresponding environment variable is set on your host:
 
 | Provider | Env var | API domain |
 |----------|---------|------------|
