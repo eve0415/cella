@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
@@ -416,11 +416,37 @@ async fn bind_control_tcp(
         .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u16>().ok()))
         .unwrap_or(0);
 
-    crate::shared::bind_tcp_reclaim(preferred_port)
+    let listener = crate::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("failed to bind control TCP: {e}"),
-        })
+        })?;
+
+    warn_if_control_port_moved(preferred_port, &listener);
+    Ok(listener)
+}
+
+/// Report a control port that could not be reclaimed.
+///
+/// Agents read the address once from `/cella/.daemon_addr` and reconnect to it
+/// indefinitely, so a moved port silently strands every running container until
+/// something rewrites that file. The daemon has no container runtime client of
+/// its own, so it names the recovery command instead of repairing it here.
+fn warn_if_control_port_moved(preferred_port: u16, listener: &tokio::net::TcpListener) {
+    if preferred_port == 0 {
+        return;
+    }
+    let Ok(actual) = listener.local_addr().map(|addr| addr.port()) else {
+        return;
+    };
+    if actual == preferred_port {
+        return;
+    }
+    error!(
+        "Control port moved from {preferred_port} to {actual}: containers started earlier still \
+         point at {preferred_port} and cannot reconnect. Run `cella up` in each affected \
+         workspace to refresh them."
+    );
 }
 
 /// Check if the daemon is already running.

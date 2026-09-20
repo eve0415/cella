@@ -168,8 +168,7 @@ pub async fn bind_tcp_reclaim(
                 Err(e) if attempt == RECLAIM_ATTEMPTS => {
                     warn!(
                         "Cannot reclaim TCP port {preferred_port} after {attempt} attempts ({e}), \
-                         binding new port; agents pinned to the old port will not reconnect \
-                         until `cella up` refreshes them"
+                         binding an OS-assigned port instead"
                     );
                 }
                 Err(_) => tokio::time::sleep(RECLAIM_RETRY_INTERVAL).await,
