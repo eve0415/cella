@@ -1,5 +1,7 @@
 //! Per-container health checks.
 
+use std::collections::HashMap;
+
 use cella_backend::{ContainerBackend, ContainerTarget, ExecOptions};
 use cella_protocol::{ContainerProbeResult, ManagementRequest, ManagementResponse};
 
@@ -63,10 +65,13 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
             )]
         }
         Ok(containers) => {
+            let mut probes =
+                probe_containers(containers.iter().map(|c| c.id.clone()).collect()).await;
             let mut reports = Vec::new();
             for container in &containers {
                 let name = format!("Container: {}", container.name);
-                let checks = check_single_container(client, &container.id).await;
+                let mut checks = check_single_container(client, &container.id).await;
+                checks.extend(probes.remove(&container.id));
                 reports.push(CategoryReport::new(name, checks));
             }
             reports
@@ -111,7 +116,8 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
-            let checks = check_single_container(client, &container.id).await;
+            let mut checks = check_single_container(client, &container.id).await;
+            checks.extend(check_host_can_reach_container(&container.id).await);
             vec![CategoryReport::new(name, checks)]
         }
         Err(_) => {
@@ -155,7 +161,6 @@ async fn check_single_container(
 
         // Port forwarding
         check_ports(&mut checks, container_id).await;
-        check_host_can_reach_container(&mut checks, container_id).await;
     }
 
     checks
@@ -338,10 +343,8 @@ async fn check_credentials(
 /// the port count above stays reassuring while every connection is dropped
 /// upstream. The daemon answers this because it is the process that performs
 /// the connection user traffic depends on.
-async fn check_host_can_reach_container(checks: &mut Vec<CheckResult>, container_id: &str) {
-    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
-        return;
-    };
+async fn check_host_can_reach_container(container_id: &str) -> Option<CheckResult> {
+    let data_dir = cella_env::paths::cella_data_dir()?;
     let mgmt_socket = data_dir.join("daemon.sock");
 
     let response = cella_daemon_client::send_management_request(
@@ -353,7 +356,7 @@ async fn check_host_can_reach_container(checks: &mut Vec<CheckResult>, container
     .await;
 
     let Ok(ManagementResponse::ContainerProbe { result, .. }) = response else {
-        return;
+        return None;
     };
 
     let check = match result {
@@ -381,7 +384,32 @@ async fn check_host_can_reach_container(checks: &mut Vec<CheckResult>, container
             fix_hint: None,
         },
     };
-    checks.push(check);
+    Some(check)
+}
+
+/// Probe every container at once.
+///
+/// The container category has a fixed time budget for all of its checks, and a
+/// probe that goes unanswered costs the full timeout. Running them together
+/// keeps the cost of several unreachable containers at roughly one probe rather
+/// than one per container, which is what stops the whole category from being
+/// discarded exactly when it has something to report.
+async fn probe_containers(container_ids: Vec<String>) -> HashMap<String, CheckResult> {
+    let mut probes = tokio::task::JoinSet::new();
+    for id in container_ids {
+        probes.spawn(async move {
+            let check = check_host_can_reach_container(&id).await;
+            (id, check)
+        });
+    }
+
+    let mut results = HashMap::new();
+    while let Some(joined) = probes.join_next().await {
+        if let Ok((id, Some(check))) = joined {
+            results.insert(id, check);
+        }
+    }
+    results
 }
 
 async fn check_ports(checks: &mut Vec<CheckResult>, container_id: &str) {
