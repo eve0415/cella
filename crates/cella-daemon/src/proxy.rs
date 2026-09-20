@@ -67,9 +67,9 @@ pub struct ProxyCoordinatorContext {
 /// A host that cannot reach the container fails identically for every
 /// connection and every bridge refresh, so only the first failure in a run of
 /// them carries the diagnosis; a successful dial re-arms it.
-fn report_dial_failure(dial_failing: &AtomicBool, ip: &str, port: u16, e: &io::Error) {
+fn report_dial_failure(dial_failing: &AtomicBool, target: &str, port: u16, e: &io::Error) {
     if dial_failing.swap(true, Ordering::Relaxed) {
-        debug!("Proxy connect to {ip}:{port} failed again: {e}");
+        debug!("Proxy connect to {target}:{port} failed again: {e}");
         return;
     }
     if matches!(
@@ -79,13 +79,13 @@ fn report_dial_failure(dial_failing: &AtomicBool, ip: &str, port: u16, e: &io::E
             | io::ErrorKind::PermissionDenied
     ) {
         warn!(
-            "Proxy connect to {ip}:{port} failed: {e}. This host cannot open a connection to the \
-             container, so every forwarded port for it will fail the same way. Check that the \
-             container runtime still routes to {ip}, and that no firewall or network policy \
+            "Proxy connect to {target}:{port} failed: {e}. This host cannot open a connection \
+             to the container, so every forwarded port for it will fail the same way. Check that \
+             the container runtime still routes to it, and that no firewall or network policy \
              blocks the cella daemon specifically."
         );
     } else {
-        warn!("Proxy connect to {ip}:{port} failed: {e}");
+        warn!("Proxy connect to {target}:{port} failed: {e}");
     }
 }
 
@@ -146,6 +146,7 @@ async fn start_tunnel_proxy(
         "Tunnel proxy listening on 127.0.0.1:{host_port} -> agent:{container_name}:{host_label}:{target_port}"
     );
 
+    let tunnel_failing = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -160,6 +161,7 @@ async fn start_tunnel_proxy(
             let handles = container_handles.clone();
             let name = container_name.clone();
             let host = target_host.clone();
+            let tunnel_failing = Arc::clone(&tunnel_failing);
             debug!("Tunnel proxy connection from {peer} on port {host_port}");
 
             tokio::spawn(async move {
@@ -173,8 +175,10 @@ async fn start_tunnel_proxy(
                 )
                 .await
                 {
-                    debug!("Tunnel proxy connection failed: {e}");
+                    report_dial_failure(&tunnel_failing, &name, target_port, &e);
                     let _ = inbound.shutdown().await;
+                } else {
+                    tunnel_failing.store(false, Ordering::Relaxed);
                 }
             });
         }
