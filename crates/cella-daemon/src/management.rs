@@ -212,20 +212,13 @@ async fn handle_probe_container(
     ctx: &ManagementContext,
 ) -> ManagementResponse {
     let runtime_uses_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
-    let pm = ctx.port_manager.lock().await;
-    let ip = pm.container_ip(&container_id).map(str::to_string);
-    let forwards = pm.all_forwarded_ports();
-    drop(pm);
-
     // A cross-service forward carries a `target_host` and is tunnelled whatever
     // the runtime, so a container whose every forward is cross-service does not
     // depend on the direct path and must not be judged by it.
-    let mut own_forwards = forwards
-        .into_iter()
-        .filter(|p| p.container_id == container_id)
-        .peekable();
-    let has_direct_forward =
-        own_forwards.peek().is_none() || own_forwards.any(|p| p.target_host.is_none());
+    let pm = ctx.port_manager.lock().await;
+    let ip = pm.container_ip(&container_id).map(str::to_string);
+    let has_direct_forward = pm.has_direct_forward(&container_id);
+    drop(pm);
 
     let result = if !runtime_uses_direct_ip || !has_direct_forward {
         cella_protocol::ContainerProbeResult::NotApplicable {
