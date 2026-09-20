@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cella_protocol::DaemonMessage;
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
@@ -61,6 +62,33 @@ pub struct ProxyCoordinatorContext {
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
 }
 
+/// Describe a failed upstream dial, collapsing repeats for the same proxy.
+///
+/// A host that cannot reach the container fails identically for every
+/// connection and every bridge refresh, so only the first failure in a run of
+/// them carries the diagnosis; a successful dial re-arms it.
+fn report_dial_failure(dial_failing: &AtomicBool, ip: &str, port: u16, e: &io::Error) {
+    if dial_failing.swap(true, Ordering::Relaxed) {
+        debug!("Proxy connect to {ip}:{port} failed again: {e}");
+        return;
+    }
+    if matches!(
+        e.kind(),
+        io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::PermissionDenied
+    ) {
+        warn!(
+            "Proxy connect to {ip}:{port} failed: {e}. This host cannot open a connection to the \
+             container, so every forwarded port for it will fail the same way. Check that the \
+             container runtime still routes to {ip}, and that no firewall or network policy \
+             blocks the cella daemon specifically."
+        );
+    } else {
+        warn!("Proxy connect to {ip}:{port} failed: {e}");
+    }
+}
+
 /// Start a direct-IP TCP proxy from `host_port` to the given `IP:port`.
 async fn start_direct_proxy(
     host_port: u16,
@@ -70,6 +98,7 @@ async fn start_direct_proxy(
     let listener = TcpListener::bind(("127.0.0.1", host_port)).await?;
     debug!("Direct proxy listening on 127.0.0.1:{host_port} -> {ip}:{port}");
 
+    let dial_failing = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -81,15 +110,17 @@ async fn start_direct_proxy(
             };
 
             let ip = ip.clone();
+            let dial_failing = Arc::clone(&dial_failing);
             debug!("Proxy connection from {peer} on port {host_port}");
 
             tokio::spawn(async move {
                 match TcpStream::connect((ip.as_str(), port)).await {
                     Ok(mut outbound) => {
+                        dial_failing.store(false, Ordering::Relaxed);
                         let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
                     Err(e) => {
-                        warn!("Proxy connect to {ip}:{port} failed: {e}");
+                        report_dial_failure(&dial_failing, &ip, port, &e);
                         let _ = inbound.shutdown().await;
                     }
                 }
@@ -411,6 +442,30 @@ mod tests {
             .await
             .unwrap();
         handle.abort();
+    }
+
+    // -- report_dial_failure --
+
+    #[test]
+    fn report_dial_failure_arms_on_first_failure() {
+        let dial_failing = AtomicBool::new(false);
+        let err = io::Error::from(io::ErrorKind::HostUnreachable);
+
+        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
+        assert!(dial_failing.load(Ordering::Relaxed));
+
+        // Repeats stay armed, so the diagnosis is not re-emitted per connection.
+        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
+        assert!(dial_failing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn report_dial_failure_arms_for_other_error_kinds_too() {
+        let dial_failing = AtomicBool::new(false);
+        let err = io::Error::from(io::ErrorKind::ConnectionRefused);
+
+        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
+        assert!(dial_failing.load(Ordering::Relaxed));
     }
 
     // -- run_proxy_coordinator --
