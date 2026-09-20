@@ -868,6 +868,40 @@ async fn remove_hostname_route(
     });
 }
 
+/// Warn before opening a login page whose callback cannot be delivered.
+///
+/// `wait_for_proxy_ready` connects to the daemon's own listener, which accepts
+/// before it dials the container, so it reports ready even when the forward is
+/// dead. Sending the visitor to the provider anyway spends a single-use
+/// authorization code on a page that can never load, and the browser shows only
+/// a transport error, so the reason belongs in the log at that moment.
+async fn warn_if_callback_undeliverable(
+    container_id: &str,
+    port_manager: &Arc<Mutex<PortManager>>,
+    uses_direct_ip: bool,
+) {
+    if !uses_direct_ip {
+        return;
+    }
+    let ip = port_manager
+        .lock()
+        .await
+        .container_ip(container_id)
+        .map(str::to_string);
+    let Some(ip) = ip else {
+        return;
+    };
+    if let cella_protocol::ContainerProbeResult::Unreachable { error } =
+        crate::reachability::probe_ip(&ip).await
+    {
+        warn!(
+            "Opening a login page whose callback cannot be delivered: {error}. The browser will \
+             redirect to a port this host forwards but cannot reach, so the authorization code \
+             will be spent on a page that never loads."
+        );
+    }
+}
+
 /// Handle a browser open request from an agent.
 async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
     let rewritten = if let Some(cid) = ctx.container_id {
@@ -893,8 +927,10 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
         let pm = Arc::clone(ctx.port_manager);
         let browser = Arc::clone(ctx.browser_handler);
         let container_id = cid.to_string();
+        let uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
         tokio::spawn(async move {
             wait_for_callback_forwarded(callback_port, &container_id, &pm, 50).await;
+            warn_if_callback_undeliverable(&container_id, &pm, uses_direct_ip).await;
             if let Some(port) = extract_port(&rewritten)
                 && port != callback_port
             {
