@@ -15,6 +15,13 @@ use super::{CHECK_TIMEOUT, CategoryReport, CheckContext, CheckResult, Severity};
 const CONTAINER_BUDGET: std::time::Duration =
     CHECK_TIMEOUT.saturating_sub(std::time::Duration::from_millis(500));
 
+/// How long to wait for the daemon to answer a reachability probe.
+///
+/// The daemon bounds the probe itself, but the request to it is not bounded,
+/// and a daemon that has stopped answering is one of the things doctor is run
+/// to find out about.
+const PROBE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Run container diagnostics.
 ///
 /// Returns one `CategoryReport` per container, or a single report
@@ -78,34 +85,53 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
 
             // The probes and the per-container checks are independent, so the
             // probes run while the checks do rather than in front of them.
-            let (mut probes, mut reports) = tokio::join!(probe_containers(ids), async {
-                let mut reports = Vec::new();
+            let (mut probes, collected) = tokio::join!(probe_containers(ids), async {
+                let mut collected: Vec<Vec<CheckResult>> = Vec::new();
                 for container in &containers {
                     if std::time::Instant::now() >= deadline {
-                        reports.push(CategoryReport::new(
-                            format!("Container: {}", container.name),
-                            vec![CheckResult {
-                                name: "skipped".into(),
-                                severity: Severity::Info,
-                                detail: "ran out of time before this container was checked".into(),
-                                fix_hint: Some(
-                                    "Check one workspace at a time with `cella doctor`".into(),
-                                ),
-                            }],
-                        ));
+                        collected.push(vec![CheckResult {
+                            name: "skipped".into(),
+                            severity: Severity::Info,
+                            detail: "ran out of time before this container was checked".into(),
+                            fix_hint: Some(
+                                "Check one workspace at a time with `cella doctor`".into(),
+                            ),
+                        }]);
                         continue;
                     }
-                    let name = format!("Container: {}", container.name);
-                    let checks = check_single_container(client, &container.id).await;
-                    reports.push(CategoryReport::new(name, checks));
+                    // Bounded per container: an unresponsive host otherwise
+                    // never returns here, and the deadline above is only
+                    // consulted between containers.
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let checks = tokio::time::timeout(
+                        remaining,
+                        check_single_container(client, &container.id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        vec![CheckResult {
+                            name: "checks".into(),
+                            severity: Severity::Warning,
+                            detail: "this container stopped responding partway through".into(),
+                            fix_hint: None,
+                        }]
+                    });
+                    collected.push(checks);
                 }
-                reports
+                collected
             });
 
-            for (container, report) in containers.iter().zip(reports.iter_mut()) {
-                report.checks.extend(probes.remove(&container.id));
-            }
-            reports
+            // The category's status is derived from its checks, so the probe
+            // has to be merged before the report is built or an unreachable
+            // container is summarised as passing.
+            containers
+                .iter()
+                .zip(collected)
+                .map(|(container, mut checks)| {
+                    checks.extend(probes.remove(&container.id));
+                    CategoryReport::new(format!("Container: {}", container.name), checks)
+                })
+                .collect()
         }
         Err(e) => {
             vec![CategoryReport::new(
@@ -147,10 +173,21 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
-            let (mut checks, probe) = tokio::join!(
-                check_single_container(client, &container.id),
+            let (checks, probe) = tokio::join!(
+                tokio::time::timeout(
+                    CONTAINER_BUDGET,
+                    check_single_container(client, &container.id)
+                ),
                 check_host_can_reach_container(&container.id)
             );
+            let mut checks = checks.unwrap_or_else(|_| {
+                vec![CheckResult {
+                    name: "checks".into(),
+                    severity: Severity::Warning,
+                    detail: "this container stopped responding partway through".into(),
+                    fix_hint: None,
+                }]
+            });
             checks.extend(probe);
             vec![CategoryReport::new(name, checks)]
         }
@@ -378,7 +415,18 @@ async fn check_credentials(
 async fn check_host_can_reach_container(container_id: &str) -> Option<CheckResult> {
     let mgmt_socket = cella_env::paths::daemon_socket_path()?;
     let client = cella_daemon_client::DaemonClient::new(mgmt_socket);
-    let result = client.probe_container(container_id).await.ok()?;
+
+    let Ok(answer) =
+        tokio::time::timeout(PROBE_REQUEST_TIMEOUT, client.probe_container(container_id)).await
+    else {
+        return Some(CheckResult {
+            name: "container reachable from host".into(),
+            severity: Severity::Warning,
+            detail: "the daemon did not answer a reachability probe in time".into(),
+            fix_hint: Some("Check the daemon with `cella daemon status`".into()),
+        });
+    };
+    let result = answer.ok()?;
 
     let (severity, detail, fix_hint) = match result {
         ContainerProbeResult::Reachable { detail } => (Severity::Pass, detail, None),
