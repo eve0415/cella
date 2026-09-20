@@ -5,7 +5,15 @@ use std::collections::HashMap;
 use cella_backend::{ContainerBackend, ContainerTarget, ExecOptions};
 use cella_protocol::{ContainerProbeResult, ManagementRequest, ManagementResponse};
 
-use super::{CategoryReport, CheckContext, CheckResult, Severity};
+use super::{CHECK_TIMEOUT, CategoryReport, CheckContext, CheckResult, Severity};
+
+/// Budget for the whole container category.
+///
+/// Held under [`CHECK_TIMEOUT`] so a slow host yields the containers that were
+/// checked plus a note, rather than the category timing out and discarding
+/// everything it had.
+const CONTAINER_BUDGET: std::time::Duration =
+    CHECK_TIMEOUT.saturating_sub(std::time::Duration::from_millis(500));
 
 /// Run container diagnostics.
 ///
@@ -65,14 +73,37 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
             )]
         }
         Ok(containers) => {
-            let mut probes =
-                probe_containers(containers.iter().map(|c| c.id.clone()).collect()).await;
-            let mut reports = Vec::new();
-            for container in &containers {
-                let name = format!("Container: {}", container.name);
-                let mut checks = check_single_container(client, &container.id).await;
-                checks.extend(probes.remove(&container.id));
-                reports.push(CategoryReport::new(name, checks));
+            let ids = containers.iter().map(|c| c.id.clone()).collect();
+            let deadline = std::time::Instant::now() + CONTAINER_BUDGET;
+
+            // The probes and the per-container checks are independent, so the
+            // probes run while the checks do rather than in front of them.
+            let (mut probes, mut reports) = tokio::join!(probe_containers(ids), async {
+                let mut reports = Vec::new();
+                for container in &containers {
+                    if std::time::Instant::now() >= deadline {
+                        reports.push(CategoryReport::new(
+                            format!("Container: {}", container.name),
+                            vec![CheckResult {
+                                name: "skipped".into(),
+                                severity: Severity::Info,
+                                detail: "ran out of time before this container was checked".into(),
+                                fix_hint: Some(
+                                    "Check one workspace at a time with `cella doctor`".into(),
+                                ),
+                            }],
+                        ));
+                        continue;
+                    }
+                    let name = format!("Container: {}", container.name);
+                    let checks = check_single_container(client, &container.id).await;
+                    reports.push(CategoryReport::new(name, checks));
+                }
+                reports
+            });
+
+            for (container, report) in containers.iter().zip(reports.iter_mut()) {
+                report.checks.extend(probes.remove(&container.id));
             }
             reports
         }
@@ -116,8 +147,11 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
-            let mut checks = check_single_container(client, &container.id).await;
-            checks.extend(check_host_can_reach_container(&container.id).await);
+            let (mut checks, probe) = tokio::join!(
+                check_single_container(client, &container.id),
+                check_host_can_reach_container(&container.id)
+            );
+            checks.extend(probe);
             vec![CategoryReport::new(name, checks)]
         }
         Err(_) => {
