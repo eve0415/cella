@@ -141,6 +141,14 @@ pub fn read_daemon_connection_info(
     container_name: &str,
 ) -> Option<cella_env::proxy::DaemonConnectionInfo> {
     let data_dir = cella_env::paths::cella_data_dir()?;
+    // The control file deliberately outlives the daemon so the port can be
+    // reclaimed, which means its contents are only trustworthy while a daemon
+    // is actually listening. Without this, a failed start would hand the
+    // container a port the OS may since have given to something else, along
+    // with the daemon's auth token.
+    if !data_dir.join("daemon.sock").exists() {
+        return None;
+    }
     let control_path = data_dir.join("daemon.control");
     let content = std::fs::read_to_string(&control_path).ok()?;
     let mut lines = content.lines();
