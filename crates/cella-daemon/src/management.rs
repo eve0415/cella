@@ -211,25 +211,34 @@ async fn handle_probe_container(
     container_id: String,
     ctx: &ManagementContext,
 ) -> ManagementResponse {
-    let uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
-    let result = if uses_direct_ip {
-        let ip = ctx
-            .port_manager
-            .lock()
-            .await
-            .container_ip(&container_id)
-            .map(str::to_string);
-        match ip {
-            Some(ip) => crate::reachability::probe_ip(&ip).await,
-            None => cella_protocol::ContainerProbeResult::Unknown {
-                reason: format!("no container is registered as {container_id}"),
-            },
-        }
-    } else {
+    let runtime_uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+    let pm = ctx.port_manager.lock().await;
+    let ip = pm.container_ip(&container_id).map(str::to_string);
+    let forwards = pm.all_forwarded_ports();
+    drop(pm);
+
+    // A cross-service forward carries a `target_host` and is tunnelled whatever
+    // the runtime, so a container whose every forward is cross-service does not
+    // depend on the direct path and must not be judged by it.
+    let mut own_forwards = forwards
+        .into_iter()
+        .filter(|p| p.container_id == container_id)
+        .peekable();
+    let has_direct_forward =
+        own_forwards.peek().is_none() || own_forwards.any(|p| p.target_host.is_none());
+
+    let result = if !runtime_uses_direct_ip || !has_direct_forward {
         cella_protocol::ContainerProbeResult::NotApplicable {
             reason: "forwards for this container run through the agent tunnel, so there is no \
                      direct connection to test"
                 .to_string(),
+        }
+    } else {
+        match ip {
+            Some(ip) => crate::reachability::probe_ip(&ip).await,
+            None => cella_protocol::ContainerProbeResult::Unknown {
+                reason: format!("the daemon has no recorded address for {container_id}"),
+            },
         }
     };
 

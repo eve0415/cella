@@ -53,13 +53,33 @@ pub async fn probe_ip(ip: &str) -> ContainerProbeResult {
         Ok(Ok(_stream)) => ContainerProbeResult::Reachable {
             detail: format!("{ip} accepted port {PROBE_PORT}, which is unusual but reachable"),
         },
-        Ok(Err(e)) => ContainerProbeResult::Unreachable {
+        Ok(Err(e)) if is_unreachable(e.kind()) => ContainerProbeResult::Unreachable {
             error: format!("connecting to {ip} failed: {e}"),
         },
-        Err(_) => ContainerProbeResult::Unreachable {
-            error: format!("{ip} did not respond within {}s", PROBE_TIMEOUT.as_secs()),
+        // Silence is not proof. A filter that drops this port while permitting
+        // the ones the workspace actually uses looks identical from here, so an
+        // unanswered probe is reported as inconclusive rather than as a fault.
+        Err(_) => ContainerProbeResult::Unknown {
+            reason: format!(
+                "{ip} did not answer on port {PROBE_PORT} within {}s, which a filtered port \
+                 also looks like",
+                PROBE_TIMEOUT.as_secs()
+            ),
+        },
+        Ok(Err(e)) => ContainerProbeResult::Unknown {
+            reason: format!("probing {ip} was inconclusive: {e}"),
         },
     }
+}
+
+/// Whether an error kind means the network path itself is unusable.
+const fn is_unreachable(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::PermissionDenied
+    )
 }
 
 #[cfg(test)]
@@ -84,12 +104,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unroutable_address_is_unreachable() {
-        // TEST-NET-1: reserved for documentation and not routed anywhere.
+    async fn unroutable_address_is_never_reachable() {
+        // TEST-NET-1: reserved for documentation and not routed anywhere. It
+        // either errors outright or goes unanswered; both must avoid claiming
+        // the container is reachable.
         let result = probe_ip("192.0.2.1").await;
         assert!(
-            matches!(result, ContainerProbeResult::Unreachable { .. }),
+            matches!(
+                result,
+                ContainerProbeResult::Unreachable { .. } | ContainerProbeResult::Unknown { .. }
+            ),
             "an unroutable address must not read as reachable, got {result:?}"
         );
+    }
+
+    #[test]
+    fn only_path_level_errors_count_as_unreachable() {
+        assert!(is_unreachable(io::ErrorKind::HostUnreachable));
+        assert!(is_unreachable(io::ErrorKind::NetworkUnreachable));
+        assert!(is_unreachable(io::ErrorKind::PermissionDenied));
+        // A refusal proves the stack answered, and a reset says nothing about
+        // whether the path works.
+        assert!(!is_unreachable(io::ErrorKind::ConnectionRefused));
+        assert!(!is_unreachable(io::ErrorKind::ConnectionReset));
     }
 }
