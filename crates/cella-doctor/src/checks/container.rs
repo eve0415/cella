@@ -1,7 +1,7 @@
 //! Per-container health checks.
 
 use cella_backend::{ContainerBackend, ContainerTarget, ExecOptions};
-use cella_protocol::{ManagementRequest, ManagementResponse};
+use cella_protocol::{ContainerProbeResult, ManagementRequest, ManagementResponse};
 
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
@@ -155,6 +155,7 @@ async fn check_single_container(
 
         // Port forwarding
         check_ports(&mut checks, container_id).await;
+        check_host_can_reach_container(&mut checks, container_id).await;
     }
 
     checks
@@ -329,6 +330,58 @@ async fn check_credentials(
             fix_hint: Some("Run `cella credential sync gh`".into()),
         });
     }
+}
+
+/// Check that the daemon can still open a connection to the container.
+///
+/// A forward binds its host port whether or not the container is reachable, so
+/// the port count above stays reassuring while every connection is dropped
+/// upstream. The daemon answers this because it is the process that performs
+/// the connection user traffic depends on.
+async fn check_host_can_reach_container(checks: &mut Vec<CheckResult>, container_id: &str) {
+    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
+        return;
+    };
+    let mgmt_socket = data_dir.join("daemon.sock");
+
+    let response = cella_daemon_client::send_management_request(
+        &mgmt_socket,
+        &ManagementRequest::ProbeContainer {
+            container_id: container_id.to_string(),
+        },
+    )
+    .await;
+
+    let Ok(ManagementResponse::ContainerProbe { result, .. }) = response else {
+        return;
+    };
+
+    let check = match result {
+        ContainerProbeResult::Reachable { detail } => CheckResult {
+            name: "container reachable from host".into(),
+            severity: Severity::Pass,
+            detail,
+            fix_hint: None,
+        },
+        ContainerProbeResult::Unreachable { error } => CheckResult {
+            name: "container reachable from host".into(),
+            severity: Severity::Error,
+            detail: format!("{error}; forwarded ports will accept connections and then drop them"),
+            fix_hint: Some(
+                "Check that the container runtime still routes to the container, and that no \
+                 firewall or network policy blocks the cella daemon."
+                    .into(),
+            ),
+        },
+        ContainerProbeResult::NotApplicable { reason }
+        | ContainerProbeResult::Unknown { reason } => CheckResult {
+            name: "container reachable from host".into(),
+            severity: Severity::Info,
+            detail: reason,
+            fix_hint: None,
+        },
+    };
+    checks.push(check);
 }
 
 async fn check_ports(checks: &mut Vec<CheckResult>, container_id: &str) {
