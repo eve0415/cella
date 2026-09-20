@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cella_protocol::DaemonMessage;
+use cella_protocol::{DaemonMessage, ForwardHealth};
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -47,6 +47,7 @@ pub enum ProxyStartTarget {
 /// Handle to a running TCP proxy task.
 pub struct ProxyHandle {
     handle: tokio::task::JoinHandle<()>,
+    dial_state: Arc<DialFailureState>,
 }
 
 impl ProxyHandle {
@@ -71,13 +72,24 @@ enum DialPath {
     Tunnel,
 }
 
-/// Per-proxy state for collapsing repeated upstream dial failures.
+/// Last observed delivery state of every running forward, keyed by host port.
+pub type ForwardHealthTable = Arc<Mutex<HashMap<u16, Arc<DialFailureState>>>>;
+
+/// Create an empty forward-health table.
+#[must_use]
+pub fn new_health_table() -> ForwardHealthTable {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Per-proxy record of what connections through a forward actually did.
 #[derive(Default)]
-struct DialFailureState {
+pub struct DialFailureState {
     /// A failure of any kind has been logged since the last success.
     reported: AtomicBool,
     /// A broken path has been explained since the last success.
     diagnosed: AtomicBool,
+    /// At least one connection has been attempted through this forward.
+    observed: AtomicBool,
 }
 
 /// What a failure is worth saying, given what has already been said.
@@ -91,8 +103,21 @@ enum DialReport {
 }
 
 impl DialFailureState {
+    /// What connections through this forward last did.
+    pub fn health(&self) -> ForwardHealth {
+        if !self.observed.load(Ordering::Relaxed) {
+            return ForwardHealth::Unknown;
+        }
+        if self.reported.load(Ordering::Relaxed) || self.diagnosed.load(Ordering::Relaxed) {
+            ForwardHealth::Failing
+        } else {
+            ForwardHealth::Delivering
+        }
+    }
+
     /// Re-arm after a connection succeeds, so a relapse is explained again.
     fn clear(&self) {
+        self.observed.store(true, Ordering::Relaxed);
         self.reported.store(false, Ordering::Relaxed);
         self.diagnosed.store(false, Ordering::Relaxed);
     }
@@ -103,6 +128,7 @@ impl DialFailureState {
     /// while a service is still starting cannot swallow the explanation of a
     /// path that later stops working.
     fn next_report(&self, path: DialPath, kind: io::ErrorKind) -> DialReport {
+        self.observed.store(true, Ordering::Relaxed);
         if breaks_path(path, kind) {
             if self.diagnosed.swap(true, Ordering::Relaxed) {
                 return DialReport::Repeat;
@@ -178,6 +204,7 @@ async fn start_direct_proxy(
     debug!("Direct proxy listening on 127.0.0.1:{host_port} -> {ip}:{port}");
 
     let dial_state = Arc::new(DialFailureState::default());
+    let published = Arc::clone(&dial_state);
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -207,7 +234,10 @@ async fn start_direct_proxy(
         }
     });
 
-    Ok(ProxyHandle { handle })
+    Ok(ProxyHandle {
+        handle,
+        dial_state: published,
+    })
 }
 
 /// Start an agent-tunnel TCP proxy from `host_port` through the agent.
@@ -226,6 +256,7 @@ async fn start_tunnel_proxy(
     );
 
     let tunnel_state = Arc::new(DialFailureState::default());
+    let published = Arc::clone(&tunnel_state);
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -263,7 +294,10 @@ async fn start_tunnel_proxy(
         }
     });
 
-    Ok(ProxyHandle { handle })
+    Ok(ProxyHandle {
+        handle,
+        dial_state: published,
+    })
 }
 
 async fn handle_tunnel_proxy_connection(
@@ -335,6 +369,7 @@ async fn handle_tunnel_proxy_connection(
 pub async fn run_proxy_coordinator(
     mut rx: tokio::sync::mpsc::Receiver<ProxyCommand>,
     ctx: Option<ProxyCoordinatorContext>,
+    health: ForwardHealthTable,
 ) {
     let mut proxies: HashMap<u16, ProxyHandle> = HashMap::new();
 
@@ -375,6 +410,10 @@ pub async fn run_proxy_coordinator(
                 match result {
                     Ok(handle) => {
                         debug!("Started proxy on localhost:{host_port}");
+                        health
+                            .lock()
+                            .await
+                            .insert(host_port, Arc::clone(&handle.dial_state));
                         proxies.insert(host_port, handle);
                         if let Some(tx) = result_tx {
                             let _ = tx.send(Ok(()));
@@ -389,6 +428,7 @@ pub async fn run_proxy_coordinator(
                 }
             }
             ProxyCommand::Stop { host_port } => {
+                health.lock().await.remove(&host_port);
                 if let Some(handle) = proxies.remove(&host_port) {
                     handle.abort();
                     debug!("Stopped proxy on port {host_port}");
@@ -530,6 +570,23 @@ mod tests {
     // -- report_dial_failure --
 
     #[test]
+    fn health_starts_unknown_and_follows_the_last_outcome() {
+        let state = DialFailureState::default();
+        assert_eq!(
+            state.health(),
+            ForwardHealth::Unknown,
+            "a forward nothing has used yet has nothing to report"
+        );
+
+        let err = io::Error::from(io::ErrorKind::HostUnreachable);
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
+        assert_eq!(state.health(), ForwardHealth::Failing);
+
+        state.clear();
+        assert_eq!(state.health(), ForwardHealth::Delivering);
+    }
+
+    #[test]
     fn a_broken_path_is_diagnosed_once() {
         let state = DialFailureState::default();
         let err = io::Error::from(io::ErrorKind::HostUnreachable);
@@ -615,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_stop_unknown_port_is_harmless() {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let coordinator = tokio::spawn(run_proxy_coordinator(rx, None));
+        let coordinator = tokio::spawn(run_proxy_coordinator(rx, None, new_health_table()));
 
         tx.send(ProxyCommand::Stop { host_port: 9999 })
             .await
@@ -627,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_start_and_stop_lifecycle() {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let coordinator = tokio::spawn(run_proxy_coordinator(rx, None));
+        let coordinator = tokio::spawn(run_proxy_coordinator(rx, None, new_health_table()));
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tx.send(ProxyCommand::Start {

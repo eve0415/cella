@@ -548,6 +548,26 @@ pub struct ForwardedPortDetail {
     /// Hostname-based URL (e.g., `http://3000.main.myapp.localhost`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// What connections through this forward last did.
+    #[serde(default)]
+    pub health: ForwardHealth,
+}
+
+/// What the daemon last observed when carrying traffic for a forward.
+///
+/// A forward binds its host port whether or not the container can be reached,
+/// so binding says nothing about delivery. This records what real connections
+/// through the forward actually did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardHealth {
+    /// Nothing has used the forward yet, so there is nothing to report.
+    #[default]
+    Unknown,
+    /// The last connection through it reached the container.
+    Delivering,
+    /// The last connection through it could not be delivered.
+    Failing,
 }
 
 /// Runtime state for the hostname HTTP proxy listener.
@@ -1440,6 +1460,7 @@ mod tests {
                 process: Some("node".to_string()),
                 url: "localhost:3000".to_string(),
                 hostname: None,
+                health: ForwardHealth::Failing,
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();

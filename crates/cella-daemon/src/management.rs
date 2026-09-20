@@ -30,6 +30,7 @@ pub(crate) struct ManagementContext {
     pub browser_handler: Arc<BrowserHandler>,
     pub clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
     pub proxy_cmd_tx: mpsc::Sender<ProxyCommand>,
+    pub forward_health: crate::proxy::ForwardHealthTable,
     pub start_time: std::time::Instant,
     pub is_orbstack: bool,
     pub daemon_started_at: u64,
@@ -264,9 +265,7 @@ async fn handle_management_request(
             )
             .await
         }
-        ManagementRequest::QueryPorts => {
-            handle_query_ports(&ctx.port_manager, ctx.hostname_proxy.as_ref()).await
-        }
+        ManagementRequest::QueryPorts => handle_query_ports(ctx).await,
         ManagementRequest::QueryStatus => handle_query_status(ctx, container_handles).await,
         ManagementRequest::ProbeContainer { container_id } => {
             handle_probe_container(container_id, ctx).await
@@ -734,30 +733,38 @@ async fn handle_deregister(
 }
 
 /// Handle port query.
-async fn handle_query_ports(
-    port_manager: &Arc<Mutex<PortManager>>,
-    hostname_proxy: Option<&cella_protocol::HostnameProxyStatus>,
-) -> ManagementResponse {
-    let hostname_proxy_port =
-        hostname_proxy.and_then(|status| if status.enabled { status.port } else { None });
-    let ports = {
-        let pm = port_manager.lock().await;
-        pm.all_forwarded_ports()
-            .into_iter()
-            .map(|p| {
-                let hostname = p.hostname_url(hostname_proxy_port);
-                ForwardedPortDetail {
-                    container_name: p.container_name.clone(),
-                    container_port: p.container_port,
-                    host_port: p.host_port,
-                    protocol: p.protocol,
-                    process: p.process.clone(),
-                    url: p.url(),
-                    hostname,
-                }
-            })
-            .collect()
-    };
+async fn handle_query_ports(ctx: &ManagementContext) -> ManagementResponse {
+    let hostname_proxy_port = ctx
+        .hostname_proxy
+        .as_ref()
+        .and_then(|status| if status.enabled { status.port } else { None });
+
+    let forwards = ctx.port_manager.lock().await.all_forwarded_ports();
+
+    // What each forward last did, rather than merely that its host port is
+    // bound: binding succeeds whether or not the container can be reached.
+    let health = ctx.forward_health.lock().await;
+    let ports = forwards
+        .into_iter()
+        .map(|p| {
+            let hostname = p.hostname_url(hostname_proxy_port);
+            ForwardedPortDetail {
+                container_name: p.container_name.clone(),
+                container_port: p.container_port,
+                host_port: p.host_port,
+                protocol: p.protocol,
+                process: p.process.clone(),
+                url: p.url(),
+                hostname,
+                health: health
+                    .get(&p.host_port)
+                    .map_or(cella_protocol::ForwardHealth::Unknown, |state| {
+                        state.health()
+                    }),
+            }
+        })
+        .collect();
+    drop(health);
 
     ManagementResponse::Ports { ports }
 }
@@ -827,6 +834,7 @@ mod tests {
             browser_handler: Arc::new(BrowserHandler::new()),
             clipboard_handler: Arc::new(crate::clipboard::ClipboardHandler::null()),
             proxy_cmd_tx: mpsc::channel(16).0,
+            forward_health: crate::proxy::new_health_table(),
             start_time: std::time::Instant::now(),
             is_orbstack: false,
             daemon_started_at: 0,
@@ -1002,9 +1010,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_ports_includes_hostname_proxy_fallback_port() {
-        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let (mut ctx, _srx) = test_management_context(0);
         {
-            let mut guard = pm.lock().await;
+            let mut guard = ctx.port_manager.lock().await;
             guard.register_container(crate::port_manager::ContainerRegistrationInfo {
                 container_id: "c1".to_string(),
                 container_name: "test-container".to_string(),
@@ -1016,14 +1024,14 @@ mod tests {
             });
             guard.handle_port_open("c1", 3000, cella_protocol::PortProtocol::Tcp, None);
         }
-        let status = cella_protocol::HostnameProxyStatus {
+        ctx.hostname_proxy = Some(cella_protocol::HostnameProxyStatus {
             enabled: true,
             address: Some("127.0.0.1:49180".to_string()),
             port: Some(49180),
             using_fallback_port: true,
-        };
+        });
 
-        let resp = handle_query_ports(&pm, Some(&status)).await;
+        let resp = handle_query_ports(&ctx).await;
 
         let ManagementResponse::Ports { ports } = resp else {
             panic!("expected ports response");
@@ -1031,6 +1039,11 @@ mod tests {
         assert_eq!(
             ports[0].hostname.as_deref(),
             Some("http://3000.feature-auth.myapp.localhost:49180")
+        );
+        assert_eq!(
+            ports[0].health,
+            cella_protocol::ForwardHealth::Unknown,
+            "a forward nothing has used yet has nothing to report"
         );
     }
 

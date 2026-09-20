@@ -238,13 +238,15 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     // Spawn proxy coordinator with tunnel context
     let (proxy_cmd_tx, proxy_cmd_rx) = tokio::sync::mpsc::channel(64);
+    let forward_health = crate::proxy::new_health_table();
     {
         let proxy_ctx = ProxyCoordinatorContext {
             tunnel_broker: tunnel_broker.clone(),
             container_handles: container_handles.clone(),
         };
+        let health = forward_health.clone();
         tokio::spawn(async move {
-            run_proxy_coordinator(proxy_cmd_rx, Some(proxy_ctx)).await;
+            run_proxy_coordinator(proxy_cmd_rx, Some(proxy_ctx), health).await;
         });
     }
 
@@ -264,6 +266,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         browser_handler,
         clipboard_handler,
         proxy_cmd_tx,
+        forward_health,
         start_time,
         is_orbstack,
         daemon_started_at,
@@ -306,6 +309,7 @@ fn build_management_context(
     browser_handler: Arc<BrowserHandler>,
     clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
     proxy_cmd_tx: tokio::sync::mpsc::Sender<crate::proxy::ProxyCommand>,
+    forward_health: crate::proxy::ForwardHealthTable,
     start_time: std::time::Instant,
     is_orbstack: bool,
     daemon_started_at: u64,
@@ -327,6 +331,7 @@ fn build_management_context(
         browser_handler,
         clipboard_handler,
         proxy_cmd_tx,
+        forward_health,
         start_time,
         is_orbstack,
         daemon_started_at,
