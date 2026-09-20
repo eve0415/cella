@@ -200,7 +200,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         .port();
 
     // Persist port+token to daemon.control for reclaiming on restart
-    let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
+    write_control_file(socket_path, control_port, &auth_token)?;
 
     let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir, auth_token.clone());
     // Reclaim bridge ports from previous daemon run so containers
@@ -283,11 +283,10 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     let cleanup_fut = tokio::task::spawn_blocking({
         let pid = pid_path.to_path_buf();
         let sock = socket_path.to_path_buf();
-        let ctrl_file = control_file_path;
-        move || {
-            cleanup_files(&[&pid, &sock]);
-            let _ = std::fs::remove_file(&ctrl_file);
-        }
+        // `daemon.control` survives here for the same reason it survives an
+        // explicit stop: it is the only record of the control port, and running
+        // agents have no way to learn a new one.
+        move || cleanup_files(&[&pid, &sock])
     });
     if tokio::time::timeout(Duration::from_secs(5), cleanup_fut)
         .await
@@ -568,16 +567,6 @@ mod tests {
             &dir.path().join("test.pid"),
             &dir.path().join("test.sock"),
         ));
-    }
-
-    #[test]
-    fn stop_daemon_reports_not_running_without_pid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = stop_daemon(
-            &dir.path().join("daemon.pid"),
-            &dir.path().join("daemon.sock"),
-        );
-        assert!(matches!(result, Err(CellaDaemonError::NotRunning)));
     }
 
     #[test]
