@@ -202,6 +202,43 @@ async fn handle_management_connection(
     Ok(())
 }
 
+/// Answer a reachability probe for one container.
+///
+/// Only meaningful where the daemon reaches containers by IP. Where forwards
+/// run through the agent tunnel there is no direct path to test, and the
+/// agent's own connection state is the signal that matters instead.
+async fn handle_probe_container(
+    container_id: String,
+    ctx: &ManagementContext,
+) -> ManagementResponse {
+    let uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+    let result = if uses_direct_ip {
+        let ip = ctx
+            .port_manager
+            .lock()
+            .await
+            .container_ip(&container_id)
+            .map(str::to_string);
+        match ip {
+            Some(ip) => crate::reachability::probe_ip(&ip).await,
+            None => cella_protocol::ContainerProbeResult::Unknown {
+                reason: format!("no container is registered as {container_id}"),
+            },
+        }
+    } else {
+        cella_protocol::ContainerProbeResult::NotApplicable {
+            reason: "forwards for this container run through the agent tunnel, so there is no \
+                     direct connection to test"
+                .to_string(),
+        }
+    };
+
+    ManagementResponse::ContainerProbe {
+        container_id,
+        result,
+    }
+}
+
 /// Route a management request to the appropriate handler.
 async fn handle_management_request(
     req: ManagementRequest,
@@ -229,6 +266,9 @@ async fn handle_management_request(
             handle_query_ports(&ctx.port_manager, ctx.hostname_proxy.as_ref()).await
         }
         ManagementRequest::QueryStatus => handle_query_status(ctx, container_handles).await,
+        ManagementRequest::ProbeContainer { container_id } => {
+            handle_probe_container(container_id, ctx).await
+        }
         ManagementRequest::UpdateContainerIp {
             container_id,
             container_ip,
@@ -915,6 +955,31 @@ mod tests {
             .unwrap();
 
         assert!(matches!(resp, ManagementResponse::Ports { ports } if ports.is_empty()));
+
+        // Probing a container that was never registered must not claim a verdict.
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::ProbeContainer {
+                container_id: "no-such-container".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match resp {
+            ManagementResponse::ContainerProbe {
+                container_id,
+                result,
+            } => {
+                assert_eq!(container_id, "no-such-container");
+                assert!(matches!(
+                    result,
+                    cella_protocol::ContainerProbeResult::Unknown { .. }
+                        | cella_protocol::ContainerProbeResult::NotApplicable { .. }
+                ));
+            }
+            other => panic!("Expected ContainerProbe response, got {other:?}"),
+        }
 
         // Deregister
         let resp = send_management_request(

@@ -366,6 +366,12 @@ pub enum ManagementRequest {
     QueryPorts,
     /// Query daemon status.
     QueryStatus,
+    /// Ask the daemon whether it can still reach a container over the network.
+    ///
+    /// Answered by the daemon because only the daemon owns the forwarding
+    /// path: it performs the `connect` that user traffic depends on, and it
+    /// holds the agent socket that the tunnel path uses.
+    ProbeContainer { container_id: String },
     /// Health check.
     Ping,
     /// Update a container's IP address after it has started.
@@ -411,6 +417,21 @@ pub enum ManagementRequest {
     Shutdown,
 }
 
+/// Outcome of a host to container reachability probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ContainerProbeResult {
+    /// The container's network stack answered.
+    Reachable { detail: String },
+    /// The container's network stack could not be reached.
+    Unreachable { error: String },
+    /// This daemon does not reach the container by IP, so there is nothing to
+    /// probe; the agent connection is the meaningful signal instead.
+    NotApplicable { reason: String },
+    /// The probe could not be performed.
+    Unknown { reason: String },
+}
+
 /// Responses from the daemon management socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -444,6 +465,11 @@ pub enum ManagementResponse {
         /// Hostname proxy bind state for diagnostics and URL rendering.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname_proxy: Option<HostnameProxyStatus>,
+    },
+    /// Result of a host to container reachability probe.
+    ContainerProbe {
+        container_id: String,
+        result: ContainerProbeResult,
     },
     /// Daemon is shutting down.
     ShuttingDown { pid: u32 },

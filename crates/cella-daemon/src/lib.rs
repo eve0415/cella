@@ -22,6 +22,7 @@ pub mod orbstack;
 pub mod phantom_registry;
 pub mod port_manager;
 pub mod proxy;
+pub mod reachability;
 pub mod shared;
 pub mod ssh_proxy;
 pub mod stream_bridge;
