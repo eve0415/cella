@@ -3059,13 +3059,18 @@ const FORWARD_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(
 async fn wait_for_proxy_ready(port: u16) {
     for _ in 0..40 {
         if let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-            if forward_dropped_connection(stream).await {
-                warn!(
-                    "Port {port} accepts connections and then drops them, so this host cannot \
-                     reach the container behind that forward. A page opened against it will not \
-                     load, and a single-use login code sent through it will be spent for nothing."
-                );
-            }
+            // The verdict takes a moment to arrive and only produces a log
+            // line, so it must not hold up what the visitor is waiting for.
+            tokio::spawn(async move {
+                if forward_dropped_connection(stream).await {
+                    warn!(
+                        "Port {port} accepts connections and then drops them, so this host \
+                         cannot reach the container behind that forward. A page opened against \
+                         it will not load, and a single-use login code sent through it will be \
+                         spent for nothing."
+                    );
+                }
+            });
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
