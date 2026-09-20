@@ -42,38 +42,43 @@ pub async fn probe_ip(ip: &str) -> ContainerProbeResult {
         };
     }
 
-    let attempt = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect((ip, PROBE_PORT))).await;
-    match attempt {
-        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            debug!("Reachability probe: {ip} refused port {PROBE_PORT}");
-            ContainerProbeResult::Reachable {
-                detail: format!("{ip} answered on port {PROBE_PORT}"),
-            }
-        }
-        Ok(Ok(_stream)) => ContainerProbeResult::Reachable {
-            detail: format!("{ip} accepted port {PROBE_PORT}, which is unusual but reachable"),
-        },
-        Ok(Err(e)) if is_unreachable(e.kind()) => ContainerProbeResult::Unreachable {
-            error: format!("connecting to {ip} failed: {e}"),
-        },
-        // Silence is not proof. A filter that drops this port while permitting
-        // the ones the workspace actually uses looks identical from here, so an
-        // unanswered probe is reported as inconclusive rather than as a fault.
-        Err(_) => ContainerProbeResult::Unknown {
+    // Silence is not proof. A filter that drops this port while permitting the
+    // ones the workspace actually uses looks identical from here, so an
+    // unanswered probe is inconclusive rather than a fault.
+    let Ok(attempt) =
+        tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect((ip, PROBE_PORT))).await
+    else {
+        return ContainerProbeResult::Unknown {
             reason: format!(
                 "{ip} did not answer on port {PROBE_PORT} within {}s, which a filtered port \
                  also looks like",
                 PROBE_TIMEOUT.as_secs()
             ),
+        };
+    };
+
+    match attempt {
+        Ok(_stream) => ContainerProbeResult::Reachable {
+            detail: format!("{ip} accepted port {PROBE_PORT}, which is unusual but reachable"),
         },
-        Ok(Err(e)) => ContainerProbeResult::Unknown {
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            debug!("Reachability probe: {ip} refused port {PROBE_PORT}");
+            ContainerProbeResult::Reachable {
+                detail: format!("{ip} answered on port {PROBE_PORT}"),
+            }
+        }
+        Err(e) if is_unreachable(e.kind()) => ContainerProbeResult::Unreachable {
+            error: format!("connecting to {ip} failed: {e}"),
+        },
+        Err(e) => ContainerProbeResult::Unknown {
             reason: format!("probing {ip} was inconclusive: {e}"),
         },
     }
 }
 
-/// Whether an error kind means the network path itself is unusable.
-const fn is_unreachable(kind: io::ErrorKind) -> bool {
+/// Whether an error kind means the network path itself is unusable, rather
+/// than the service behind it being absent.
+pub(crate) const fn is_unreachable(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::HostUnreachable

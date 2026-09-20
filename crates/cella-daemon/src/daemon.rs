@@ -427,10 +427,12 @@ async fn bind_control_tcp(
 
 /// Report a control port that could not be reclaimed.
 ///
-/// Agents read the address once from `/cella/.daemon_addr` and reconnect to it
-/// indefinitely, so a moved port silently strands every running container until
-/// something rewrites that file. The daemon has no container runtime client of
-/// its own, so it names the recovery command instead of repairing it here.
+/// Agents re-read `/cella/.daemon_addr` on every reconnect attempt, so they
+/// would follow a moved port the moment something rewrote that file — but the
+/// daemon has no container runtime client of its own to write it. Reconnecting
+/// would not be enough on its own either: a restarted daemon has no record of
+/// any container, and rejects an agent whose container is not registered. Both
+/// halves are what `cella up` restores, so that is the recovery named here.
 fn warn_if_control_port_moved(preferred_port: u16, listener: &tokio::net::TcpListener) {
     if preferred_port == 0 {
         return;

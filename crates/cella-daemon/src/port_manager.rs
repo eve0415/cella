@@ -387,9 +387,11 @@ impl PortManager {
         let mut forwarded = container
             .detected_ports
             .iter()
-            .filter(|detected| detected.host_port.is_some())
-            .peekable();
-        forwarded.peek().is_none() || forwarded.any(|detected| detected.target_host.is_none())
+            .filter(|detected| detected.host_port.is_some());
+        let Some(first) = forwarded.next() else {
+            return true;
+        };
+        first.target_host.is_none() || forwarded.any(|detected| detected.target_host.is_none())
     }
 
     pub fn all_forwarded_ports(&self) -> Vec<ForwardedPortInfo> {

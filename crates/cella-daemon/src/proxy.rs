@@ -80,25 +80,55 @@ struct DialFailureState {
     diagnosed: AtomicBool,
 }
 
+/// What a failure is worth saying, given what has already been said.
+enum DialReport {
+    /// Explain a broken path, once per run of failures.
+    Diagnose,
+    /// Report an ordinary failure, once per run of failures.
+    Failure,
+    /// Say nothing new.
+    Repeat,
+}
+
 impl DialFailureState {
     /// Re-arm after a connection succeeds, so a relapse is explained again.
     fn clear(&self) {
         self.reported.store(false, Ordering::Relaxed);
         self.diagnosed.store(false, Ordering::Relaxed);
     }
+
+    /// Claim the right to report this failure, latching what it reports.
+    ///
+    /// A broken path latches separately from ordinary failures, so a refusal
+    /// while a service is still starting cannot swallow the explanation of a
+    /// path that later stops working.
+    fn next_report(&self, path: DialPath, kind: io::ErrorKind) -> DialReport {
+        if breaks_path(path, kind) {
+            if self.diagnosed.swap(true, Ordering::Relaxed) {
+                return DialReport::Repeat;
+            }
+            self.reported.store(true, Ordering::Relaxed);
+            return DialReport::Diagnose;
+        }
+        if self.reported.swap(true, Ordering::Relaxed) {
+            return DialReport::Repeat;
+        }
+        DialReport::Failure
+    }
 }
 
 /// Whether an error kind means the path itself is broken, rather than the
 /// service behind it being absent.
+///
+/// A direct dial adds `TimedOut` to what the reachability probe treats as
+/// unreachable, because the probe bounds its own connect while this one does
+/// not: a connection dropped silently by host policy surfaces here only as the
+/// operating system's own timeout.
 const fn breaks_path(path: DialPath, kind: io::ErrorKind) -> bool {
     match path {
-        DialPath::Direct => matches!(
-            kind,
-            io::ErrorKind::HostUnreachable
-                | io::ErrorKind::NetworkUnreachable
-                | io::ErrorKind::PermissionDenied
-                | io::ErrorKind::TimedOut
-        ),
+        DialPath::Direct => {
+            crate::reachability::is_unreachable(kind) || matches!(kind, io::ErrorKind::TimedOut)
+        }
         DialPath::Tunnel => matches!(
             kind,
             io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut
@@ -119,29 +149,23 @@ fn report_dial_failure(
     port: u16,
     e: &io::Error,
 ) {
-    if breaks_path(path, e.kind()) {
-        if !state.diagnosed.swap(true, Ordering::Relaxed) {
-            state.reported.store(true, Ordering::Relaxed);
-            match path {
-                DialPath::Direct => warn!(
-                    "Proxy connect to {target}:{port} failed: {e}. This host cannot open a \
-                     connection to the container, so every forwarded port for it will fail the \
-                     same way. Check that the container runtime still routes to it, and that no \
-                     firewall or network policy blocks the cella daemon specifically."
-                ),
-                DialPath::Tunnel => warn!(
-                    "Forward to {target}:{port} failed: {e}. The agent tunnel could not carry \
-                     the connection, so forwards for that container will fail the same way until \
-                     its agent reconnects."
-                ),
-            }
-            return;
-        }
-    } else if !state.reported.swap(true, Ordering::Relaxed) {
-        warn!("Proxy connect to {target}:{port} failed: {e}");
-        return;
+    match state.next_report(path, e.kind()) {
+        DialReport::Diagnose => match path {
+            DialPath::Direct => warn!(
+                "Proxy connect to {target}:{port} failed: {e}. This host cannot open a \
+                 connection to the container, so every forwarded port for it will fail the \
+                 same way. Check that the container runtime still routes to it, and that no \
+                 firewall or network policy blocks the cella daemon specifically."
+            ),
+            DialPath::Tunnel => warn!(
+                "Forward to {target}:{port} failed: {e}. The agent tunnel could not carry \
+                 the connection, so forwards for that container will fail the same way until \
+                 its agent reconnects."
+            ),
+        },
+        DialReport::Failure => warn!("Proxy connect to {target}:{port} failed: {e}"),
+        DialReport::Repeat => debug!("Proxy connect to {target}:{port} failed again: {e}"),
     }
-    debug!("Proxy connect to {target}:{port} failed again: {e}");
 }
 
 /// Start a direct-IP TCP proxy from `host_port` to the given `IP:port`.
