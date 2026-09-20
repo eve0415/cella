@@ -27,6 +27,9 @@ const PROBE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Returns one `CategoryReport` per container, or a single report
 /// explaining why container checks were skipped.
 pub async fn check_containers(ctx: &CheckContext, daemon_running: bool) -> Vec<CategoryReport> {
+    // Started before discovery, because the category timeout this stays under
+    // is already running by the time listing the containers begins.
+    let deadline = std::time::Instant::now() + CONTAINER_BUDGET;
     // Only require a running daemon for backends with managed agents.
     // Unmanaged backends (e.g. Apple Container) can still run basic
     // container checks (running state, version skew) without the daemon.
@@ -60,13 +63,16 @@ pub async fn check_containers(ctx: &CheckContext, daemon_running: bool) -> Vec<C
     };
 
     if ctx.all {
-        check_all_containers(client.as_ref()).await
+        check_all_containers(client.as_ref(), deadline).await
     } else {
-        check_workspace_container(ctx, client.as_ref()).await
+        check_workspace_container(ctx, client.as_ref(), deadline).await
     }
 }
 
-async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryReport> {
+async fn check_all_containers(
+    client: &dyn ContainerBackend,
+    deadline: std::time::Instant,
+) -> Vec<CategoryReport> {
     match client.list_cella_containers(true).await {
         Ok(containers) if containers.is_empty() => {
             vec![CategoryReport::new(
@@ -81,45 +87,52 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
         }
         Ok(containers) => {
             let ids = containers.iter().map(|c| c.id.clone()).collect();
-            let deadline = std::time::Instant::now() + CONTAINER_BUDGET;
 
             // The probes and the per-container checks are independent, so the
             // probes run while the checks do rather than in front of them.
-            let (mut probes, collected) = tokio::join!(probe_containers(ids), async {
-                let mut collected: Vec<Vec<CheckResult>> = Vec::new();
-                for container in &containers {
-                    if std::time::Instant::now() >= deadline {
-                        collected.push(vec![CheckResult {
-                            name: "skipped".into(),
-                            severity: Severity::Info,
-                            detail: "ran out of time before this container was checked".into(),
-                            fix_hint: Some(
-                                "Check one workspace at a time with `cella doctor`".into(),
-                            ),
-                        }]);
-                        continue;
+            // Both arms are bounded by what is left of the budget, so neither
+            // can hold the category past the point where its results are lost.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let (probes, collected) = tokio::join!(
+                tokio::time::timeout(remaining, probe_containers(ids)),
+                async {
+                    let mut collected: Vec<Vec<CheckResult>> = Vec::new();
+                    for container in &containers {
+                        if std::time::Instant::now() >= deadline {
+                            collected.push(vec![CheckResult {
+                                name: "skipped".into(),
+                                severity: Severity::Info,
+                                detail: "ran out of time before this container was checked".into(),
+                                fix_hint: Some(
+                                    "Check one workspace at a time with `cella doctor`".into(),
+                                ),
+                            }]);
+                            continue;
+                        }
+                        // Bounded per container: an unresponsive host otherwise
+                        // never returns here, and the deadline above is only
+                        // consulted between containers.
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        let checks = tokio::time::timeout(
+                            remaining,
+                            check_single_container(client, &container.id),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            vec![CheckResult {
+                                name: "checks".into(),
+                                severity: Severity::Warning,
+                                detail: "this container stopped responding partway through".into(),
+                                fix_hint: None,
+                            }]
+                        });
+                        collected.push(checks);
                     }
-                    // Bounded per container: an unresponsive host otherwise
-                    // never returns here, and the deadline above is only
-                    // consulted between containers.
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let checks = tokio::time::timeout(
-                        remaining,
-                        check_single_container(client, &container.id),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        vec![CheckResult {
-                            name: "checks".into(),
-                            severity: Severity::Warning,
-                            detail: "this container stopped responding partway through".into(),
-                            fix_hint: None,
-                        }]
-                    });
-                    collected.push(checks);
+                    collected
                 }
-                collected
-            });
+            );
+            let mut probes = probes.unwrap_or_default();
 
             // The category's status is derived from its checks, so the probe
             // has to be merged before the report is built or an unreachable
@@ -150,6 +163,7 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
 async fn check_workspace_container(
     ctx: &CheckContext,
     client: &dyn ContainerBackend,
+    deadline: std::time::Instant,
 ) -> Vec<CategoryReport> {
     let Some(ref workspace) = ctx.workspace_folder else {
         return vec![CategoryReport::new(
@@ -173,13 +187,12 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let (checks, probe) = tokio::join!(
-                tokio::time::timeout(
-                    CONTAINER_BUDGET,
-                    check_single_container(client, &container.id)
-                ),
-                check_host_can_reach_container(&container.id)
+                tokio::time::timeout(remaining, check_single_container(client, &container.id)),
+                tokio::time::timeout(remaining, check_host_can_reach_container(&container.id))
             );
+            let probe = probe.ok().flatten();
             let mut checks = checks.unwrap_or_else(|_| {
                 vec![CheckResult {
                     name: "checks".into(),

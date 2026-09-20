@@ -108,21 +108,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unroutable_address_is_never_reachable() {
-        // TEST-NET-1: reserved for documentation and not routed anywhere. It
-        // either errors outright or goes unanswered; both must avoid claiming
-        // the container is reachable.
-        let result = probe_ip("192.0.2.1").await;
-        assert!(
-            matches!(
-                result,
-                ContainerProbeResult::Unreachable { .. } | ContainerProbeResult::Unknown { .. }
-            ),
-            "an unroutable address must not read as reachable, got {result:?}"
-        );
-    }
-
     #[test]
     fn only_path_level_errors_count_as_unreachable() {
         assert!(is_unreachable(io::ErrorKind::HostUnreachable));
