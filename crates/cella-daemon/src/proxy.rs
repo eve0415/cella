@@ -62,31 +62,86 @@ pub struct ProxyCoordinatorContext {
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
 }
 
+/// How a forward reaches the container.
+#[derive(Clone, Copy)]
+enum DialPath {
+    /// Straight to the container's own address.
+    Direct,
+    /// Over the reverse tunnel the agent holds open.
+    Tunnel,
+}
+
+/// Per-proxy state for collapsing repeated upstream dial failures.
+#[derive(Default)]
+struct DialFailureState {
+    /// A failure of any kind has been logged since the last success.
+    reported: AtomicBool,
+    /// A broken path has been explained since the last success.
+    diagnosed: AtomicBool,
+}
+
+impl DialFailureState {
+    /// Re-arm after a connection succeeds, so a relapse is explained again.
+    fn clear(&self) {
+        self.reported.store(false, Ordering::Relaxed);
+        self.diagnosed.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Whether an error kind means the path itself is broken, rather than the
+/// service behind it being absent.
+const fn breaks_path(path: DialPath, kind: io::ErrorKind) -> bool {
+    match path {
+        DialPath::Direct => matches!(
+            kind,
+            io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::TimedOut
+        ),
+        DialPath::Tunnel => matches!(
+            kind,
+            io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut
+        ),
+    }
+}
+
 /// Describe a failed upstream dial, collapsing repeats for the same proxy.
 ///
-/// A host that cannot reach the container fails identically for every
-/// connection and every bridge refresh, so only the first failure in a run of
-/// them carries the diagnosis; a successful dial re-arms it.
-fn report_dial_failure(dial_failing: &AtomicBool, target: &str, port: u16, e: &io::Error) {
-    if dial_failing.swap(true, Ordering::Relaxed) {
-        debug!("Proxy connect to {target}:{port} failed again: {e}");
+/// A broken path is latched separately from ordinary failures. A refused
+/// connection while a dev server is still starting is the common case, and
+/// latching on it would otherwise swallow the explanation of a path that later
+/// stops working altogether.
+fn report_dial_failure(
+    state: &DialFailureState,
+    path: DialPath,
+    target: &str,
+    port: u16,
+    e: &io::Error,
+) {
+    if breaks_path(path, e.kind()) {
+        if !state.diagnosed.swap(true, Ordering::Relaxed) {
+            state.reported.store(true, Ordering::Relaxed);
+            match path {
+                DialPath::Direct => warn!(
+                    "Proxy connect to {target}:{port} failed: {e}. This host cannot open a \
+                     connection to the container, so every forwarded port for it will fail the \
+                     same way. Check that the container runtime still routes to it, and that no \
+                     firewall or network policy blocks the cella daemon specifically."
+                ),
+                DialPath::Tunnel => warn!(
+                    "Forward to {target}:{port} failed: {e}. The agent tunnel could not carry \
+                     the connection, so forwards for that container will fail the same way until \
+                     its agent reconnects."
+                ),
+            }
+            return;
+        }
+    } else if !state.reported.swap(true, Ordering::Relaxed) {
+        warn!("Proxy connect to {target}:{port} failed: {e}");
         return;
     }
-    if matches!(
-        e.kind(),
-        io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::PermissionDenied
-    ) {
-        warn!(
-            "Proxy connect to {target}:{port} failed: {e}. This host cannot open a connection \
-             to the container, so every forwarded port for it will fail the same way. Check that \
-             the container runtime still routes to it, and that no firewall or network policy \
-             blocks the cella daemon specifically."
-        );
-    } else {
-        warn!("Proxy connect to {target}:{port} failed: {e}");
-    }
+    debug!("Proxy connect to {target}:{port} failed again: {e}");
 }
 
 /// Start a direct-IP TCP proxy from `host_port` to the given `IP:port`.
@@ -98,7 +153,7 @@ async fn start_direct_proxy(
     let listener = TcpListener::bind(("127.0.0.1", host_port)).await?;
     debug!("Direct proxy listening on 127.0.0.1:{host_port} -> {ip}:{port}");
 
-    let dial_failing = Arc::new(AtomicBool::new(false));
+    let dial_state = Arc::new(DialFailureState::default());
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -110,17 +165,17 @@ async fn start_direct_proxy(
             };
 
             let ip = ip.clone();
-            let dial_failing = Arc::clone(&dial_failing);
+            let dial_state = Arc::clone(&dial_state);
             debug!("Proxy connection from {peer} on port {host_port}");
 
             tokio::spawn(async move {
                 match TcpStream::connect((ip.as_str(), port)).await {
                     Ok(mut outbound) => {
-                        dial_failing.store(false, Ordering::Relaxed);
+                        dial_state.clear();
                         let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
                     Err(e) => {
-                        report_dial_failure(&dial_failing, &ip, port, &e);
+                        report_dial_failure(&dial_state, DialPath::Direct, &ip, port, &e);
                         let _ = inbound.shutdown().await;
                     }
                 }
@@ -146,7 +201,7 @@ async fn start_tunnel_proxy(
         "Tunnel proxy listening on 127.0.0.1:{host_port} -> agent:{container_name}:{host_label}:{target_port}"
     );
 
-    let tunnel_failing = Arc::new(AtomicBool::new(false));
+    let tunnel_state = Arc::new(DialFailureState::default());
     let handle = tokio::spawn(async move {
         loop {
             let (mut inbound, peer) = match listener.accept().await {
@@ -161,7 +216,7 @@ async fn start_tunnel_proxy(
             let handles = container_handles.clone();
             let name = container_name.clone();
             let host = target_host.clone();
-            let tunnel_failing = Arc::clone(&tunnel_failing);
+            let tunnel_state = Arc::clone(&tunnel_state);
             debug!("Tunnel proxy connection from {peer} on port {host_port}");
 
             tokio::spawn(async move {
@@ -175,10 +230,10 @@ async fn start_tunnel_proxy(
                 )
                 .await
                 {
-                    report_dial_failure(&tunnel_failing, &name, target_port, &e);
+                    report_dial_failure(&tunnel_state, DialPath::Tunnel, &name, target_port, &e);
                     let _ = inbound.shutdown().await;
                 } else {
-                    tunnel_failing.store(false, Ordering::Relaxed);
+                    tunnel_state.clear();
                 }
             });
         }
@@ -451,25 +506,84 @@ mod tests {
     // -- report_dial_failure --
 
     #[test]
-    fn report_dial_failure_arms_on_first_failure() {
-        let dial_failing = AtomicBool::new(false);
+    fn a_broken_path_is_diagnosed_once() {
+        let state = DialFailureState::default();
         let err = io::Error::from(io::ErrorKind::HostUnreachable);
 
-        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
-        assert!(dial_failing.load(Ordering::Relaxed));
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
+        assert!(state.diagnosed.load(Ordering::Relaxed));
 
-        // Repeats stay armed, so the diagnosis is not re-emitted per connection.
-        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
-        assert!(dial_failing.load(Ordering::Relaxed));
+        // Repeats stay latched, so the explanation is not re-emitted per connection.
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
+        assert!(state.diagnosed.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn report_dial_failure_arms_for_other_error_kinds_too() {
-        let dial_failing = AtomicBool::new(false);
-        let err = io::Error::from(io::ErrorKind::ConnectionRefused);
+    fn a_refused_connection_does_not_swallow_a_later_diagnosis() {
+        let state = DialFailureState::default();
 
-        report_dial_failure(&dial_failing, "192.168.97.3", 37479, &err);
-        assert!(dial_failing.load(Ordering::Relaxed));
+        // The everyday case: the workspace's server has not bound yet.
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &refused);
+        assert!(state.reported.load(Ordering::Relaxed));
+        assert!(
+            !state.diagnosed.load(Ordering::Relaxed),
+            "a refusal says nothing about the path and must not latch the diagnosis"
+        );
+
+        // The path then breaks: the explanation must still be emitted.
+        let unreachable = io::Error::from(io::ErrorKind::HostUnreachable);
+        report_dial_failure(
+            &state,
+            DialPath::Direct,
+            "192.168.97.3",
+            37479,
+            &unreachable,
+        );
+        assert!(state.diagnosed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_success_re_arms_both_latches() {
+        let state = DialFailureState::default();
+        let err = io::Error::from(io::ErrorKind::HostUnreachable);
+
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
+        state.clear();
+
+        assert!(!state.reported.load(Ordering::Relaxed));
+        assert!(!state.diagnosed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn each_path_diagnoses_its_own_failure_kinds() {
+        // A timeout breaks either path.
+        assert!(breaks_path(DialPath::Direct, io::ErrorKind::TimedOut));
+        assert!(breaks_path(DialPath::Tunnel, io::ErrorKind::TimedOut));
+
+        // A missing agent breaks the tunnel, and says nothing about a direct dial.
+        assert!(breaks_path(DialPath::Tunnel, io::ErrorKind::NotConnected));
+        assert!(!breaks_path(DialPath::Direct, io::ErrorKind::NotConnected));
+
+        // An unroutable host breaks a direct dial; the tunnel never dials it.
+        assert!(breaks_path(
+            DialPath::Direct,
+            io::ErrorKind::HostUnreachable
+        ));
+        assert!(!breaks_path(
+            DialPath::Tunnel,
+            io::ErrorKind::HostUnreachable
+        ));
+
+        // A refusal means the path worked and nothing was listening.
+        assert!(!breaks_path(
+            DialPath::Direct,
+            io::ErrorKind::ConnectionRefused
+        ));
+        assert!(!breaks_path(
+            DialPath::Tunnel,
+            io::ErrorKind::ConnectionRefused
+        ));
     }
 
     // -- run_proxy_coordinator --
