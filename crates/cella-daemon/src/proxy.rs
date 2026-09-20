@@ -64,9 +64,10 @@ pub struct ProxyCoordinatorContext {
 }
 
 /// How a forward reaches the container.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum DialPath {
     /// Straight to the container's own address.
+    #[default]
     Direct,
     /// Over the reverse tunnel the agent holds open.
     Tunnel,
@@ -82,8 +83,9 @@ pub fn new_health_table() -> ForwardHealthTable {
 }
 
 /// Per-proxy record of what connections through a forward actually did.
-#[derive(Default)]
 pub struct DialFailureState {
+    /// How this forward reaches the container.
+    path: DialPath,
     /// A failure of any kind has been logged since the last success.
     reported: AtomicBool,
     /// A broken path has been explained since the last success.
@@ -103,15 +105,29 @@ enum DialReport {
 }
 
 impl DialFailureState {
-    /// What connections through this forward last did.
-    pub fn health(&self) -> ForwardHealth {
-        if !self.observed.load(Ordering::Relaxed) {
-            return ForwardHealth::Unknown;
+    /// Track a forward that reaches the container by `path`.
+    const fn new(path: DialPath) -> Self {
+        Self {
+            path,
+            reported: AtomicBool::new(false),
+            diagnosed: AtomicBool::new(false),
+            observed: AtomicBool::new(false),
         }
+    }
+
+    /// What connections through this forward last did.
+    ///
+    /// Only a direct dial can report delivery. On the tunnel the agent opens
+    /// the connection to the service itself and says nothing when that fails,
+    /// so the daemon sees a clean end-of-stream either way and can honestly
+    /// report a tunnel failure but never a tunnel success.
+    pub fn health(&self) -> ForwardHealth {
         if self.reported.load(Ordering::Relaxed) || self.diagnosed.load(Ordering::Relaxed) {
-            ForwardHealth::Failing
-        } else {
-            ForwardHealth::Delivering
+            return ForwardHealth::Failing;
+        }
+        match self.path {
+            DialPath::Direct if self.observed.load(Ordering::Relaxed) => ForwardHealth::Delivering,
+            _ => ForwardHealth::Unknown,
         }
     }
 
@@ -203,7 +219,7 @@ async fn start_direct_proxy(
     let listener = TcpListener::bind(("127.0.0.1", host_port)).await?;
     debug!("Direct proxy listening on 127.0.0.1:{host_port} -> {ip}:{port}");
 
-    let dial_state = Arc::new(DialFailureState::default());
+    let dial_state = Arc::new(DialFailureState::new(DialPath::Direct));
     let published = Arc::clone(&dial_state);
     let handle = tokio::spawn(async move {
         loop {
@@ -255,7 +271,7 @@ async fn start_tunnel_proxy(
         "Tunnel proxy listening on 127.0.0.1:{host_port} -> agent:{container_name}:{host_label}:{target_port}"
     );
 
-    let tunnel_state = Arc::new(DialFailureState::default());
+    let tunnel_state = Arc::new(DialFailureState::new(DialPath::Tunnel));
     let published = Arc::clone(&tunnel_state);
     let handle = tokio::spawn(async move {
         loop {
@@ -282,13 +298,12 @@ async fn start_tunnel_proxy(
                     host,
                     &broker,
                     &handles,
+                    &tunnel_state,
                 )
                 .await
                 {
                     report_dial_failure(&tunnel_state, DialPath::Tunnel, &name, target_port, &e);
                     let _ = inbound.shutdown().await;
-                } else {
-                    tunnel_state.clear();
                 }
             });
         }
@@ -307,6 +322,7 @@ async fn handle_tunnel_proxy_connection(
     target_host: Option<String>,
     broker: &TunnelBroker,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    state: &DialFailureState,
 ) -> Result<(), io::Error> {
     let (connection_id, rx) = broker.request_tunnel().await;
 
@@ -342,7 +358,13 @@ async fn handle_tunnel_proxy_connection(
     let tunnel_stream = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
 
     let mut tunnel = match tunnel_stream {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => {
+            // The tunnel carried this connection, which is all the daemon can
+            // see; clearing here rather than after relaying means a forward
+            // that recovers stops reading as failing straight away.
+            state.clear();
+            stream
+        }
         Ok(Err(_)) => {
             broker.cancel(connection_id).await;
             return Err(io::Error::new(
@@ -571,7 +593,7 @@ mod tests {
 
     #[test]
     fn health_starts_unknown_and_follows_the_last_outcome() {
-        let state = DialFailureState::default();
+        let state = DialFailureState::new(DialPath::Direct);
         assert_eq!(
             state.health(),
             ForwardHealth::Unknown,
@@ -587,8 +609,27 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_never_claims_delivery_it_cannot_observe() {
+        let state = DialFailureState::new(DialPath::Tunnel);
+        assert_eq!(state.health(), ForwardHealth::Unknown);
+
+        // Establishing the tunnel proves only that the tunnel carried the
+        // connection; the agent dials the service itself and says nothing.
+        state.clear();
+        assert_eq!(state.health(), ForwardHealth::Unknown);
+
+        let err = io::Error::from(io::ErrorKind::NotConnected);
+        report_dial_failure(&state, DialPath::Tunnel, "c1", 5432, &err);
+        assert_eq!(
+            state.health(),
+            ForwardHealth::Failing,
+            "a tunnel failure is observable even though a tunnel success is not"
+        );
+    }
+
+    #[test]
     fn a_broken_path_is_diagnosed_once() {
-        let state = DialFailureState::default();
+        let state = DialFailureState::new(DialPath::Direct);
         let err = io::Error::from(io::ErrorKind::HostUnreachable);
 
         report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
@@ -601,7 +642,7 @@ mod tests {
 
     #[test]
     fn a_refused_connection_does_not_swallow_a_later_diagnosis() {
-        let state = DialFailureState::default();
+        let state = DialFailureState::new(DialPath::Direct);
 
         // The everyday case: the workspace's server has not bound yet.
         let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
@@ -626,7 +667,7 @@ mod tests {
 
     #[test]
     fn a_success_re_arms_both_latches() {
-        let state = DialFailureState::default();
+        let state = DialFailureState::new(DialPath::Direct);
         let err = io::Error::from(io::ErrorKind::HostUnreachable);
 
         report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 37479, &err);
