@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use cella_protocol::{DaemonMessage, ForwardHealth};
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
@@ -82,6 +82,31 @@ pub fn new_health_table() -> ForwardHealthTable {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// What the last connection through a forward did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum LastOutcome {
+    /// Nothing has used the forward yet.
+    Untried = 0,
+    /// The connection reached the container.
+    Delivered = 1,
+    /// The path carried the attempt, but nothing was listening behind it.
+    NotListening = 2,
+    /// The path itself could not carry the attempt.
+    PathBroken = 3,
+}
+
+impl LastOutcome {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Delivered,
+            2 => Self::NotListening,
+            3 => Self::PathBroken,
+            _ => Self::Untried,
+        }
+    }
+}
+
 /// Per-proxy record of what connections through a forward actually did.
 pub struct DialFailureState {
     /// How this forward reaches the container.
@@ -90,8 +115,8 @@ pub struct DialFailureState {
     reported: AtomicBool,
     /// A broken path has been explained since the last success.
     diagnosed: AtomicBool,
-    /// At least one connection has been attempted through this forward.
-    observed: AtomicBool,
+    /// The most recent outcome, as a [`LastOutcome`] discriminant.
+    last_outcome: AtomicU8,
 }
 
 /// What a failure is worth saying, given what has already been said.
@@ -111,8 +136,22 @@ impl DialFailureState {
             path,
             reported: AtomicBool::new(false),
             diagnosed: AtomicBool::new(false),
-            observed: AtomicBool::new(false),
+            last_outcome: AtomicU8::new(LastOutcome::Untried as u8),
         }
+    }
+
+    /// The most recent outcome for this forward.
+    fn last_outcome(&self) -> LastOutcome {
+        LastOutcome::from_u8(self.last_outcome.load(Ordering::Relaxed))
+    }
+
+    /// Whether a direct dial for this forward is failing at the path itself.
+    ///
+    /// This is the only evidence that says anything about reaching the
+    /// container's address. A service that is simply not running, and a tunnel
+    /// that could not be established, are both failures of something else.
+    pub fn direct_path_is_broken(&self) -> bool {
+        matches!(self.path, DialPath::Direct) && self.last_outcome() == LastOutcome::PathBroken
     }
 
     /// What connections through this forward last did.
@@ -122,18 +161,21 @@ impl DialFailureState {
     /// so the daemon sees a clean end-of-stream either way and can honestly
     /// report a tunnel failure but never a tunnel success.
     pub fn health(&self) -> ForwardHealth {
-        if self.reported.load(Ordering::Relaxed) || self.diagnosed.load(Ordering::Relaxed) {
-            return ForwardHealth::Failing;
-        }
-        match self.path {
-            DialPath::Direct if self.observed.load(Ordering::Relaxed) => ForwardHealth::Delivering,
+        match self.last_outcome() {
+            // A service that is not running is not a broken forward, so it is
+            // reported as neither delivering nor failing.
+            LastOutcome::PathBroken => ForwardHealth::Failing,
+            LastOutcome::Delivered if matches!(self.path, DialPath::Direct) => {
+                ForwardHealth::Delivering
+            }
             _ => ForwardHealth::Unknown,
         }
     }
 
     /// Re-arm after a connection succeeds, so a relapse is explained again.
     fn clear(&self) {
-        self.observed.store(true, Ordering::Relaxed);
+        self.last_outcome
+            .store(LastOutcome::Delivered as u8, Ordering::Relaxed);
         self.reported.store(false, Ordering::Relaxed);
         self.diagnosed.store(false, Ordering::Relaxed);
     }
@@ -144,8 +186,16 @@ impl DialFailureState {
     /// while a service is still starting cannot swallow the explanation of a
     /// path that later stops working.
     fn next_report(&self, path: DialPath, kind: io::ErrorKind) -> DialReport {
-        self.observed.store(true, Ordering::Relaxed);
-        if breaks_path(path, kind) {
+        let broken = breaks_path(path, kind);
+        self.last_outcome.store(
+            if broken {
+                LastOutcome::PathBroken as u8
+            } else {
+                LastOutcome::NotListening as u8
+            },
+            Ordering::Relaxed,
+        );
+        if broken {
             if self.diagnosed.swap(true, Ordering::Relaxed) {
                 return DialReport::Repeat;
             }
@@ -606,6 +656,38 @@ mod tests {
 
         state.clear();
         assert_eq!(state.health(), ForwardHealth::Delivering);
+    }
+
+    #[test]
+    fn a_service_that_is_not_running_is_not_a_failing_forward() {
+        let state = DialFailureState::new(DialPath::Direct);
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 3000, &refused);
+
+        assert_eq!(
+            state.health(),
+            ForwardHealth::Unknown,
+            "the path carried the attempt; nothing was listening behind it"
+        );
+        assert!(!state.direct_path_is_broken());
+
+        let unreachable = io::Error::from(io::ErrorKind::HostUnreachable);
+        report_dial_failure(&state, DialPath::Direct, "192.168.97.3", 3000, &unreachable);
+        assert_eq!(state.health(), ForwardHealth::Failing);
+        assert!(state.direct_path_is_broken());
+    }
+
+    #[test]
+    fn a_tunnel_failure_says_nothing_about_the_direct_path() {
+        let state = DialFailureState::new(DialPath::Tunnel);
+        let err = io::Error::from(io::ErrorKind::NotConnected);
+        report_dial_failure(&state, DialPath::Tunnel, "c1", 5432, &err);
+
+        assert_eq!(state.health(), ForwardHealth::Failing);
+        assert!(
+            !state.direct_path_is_broken(),
+            "a tunnel that could not be established is a failure of something else"
+        );
     }
 
     #[test]

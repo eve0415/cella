@@ -203,13 +203,14 @@ async fn handle_management_connection(
     Ok(())
 }
 
-/// Require a real forward failure before calling a container unreachable.
+/// Require a real direct-path failure before calling a container unreachable.
 ///
 /// The probe dials a port the workspace does not use, so a filter that rejects
 /// that port while permitting the ones it does use produces the same answer as
-/// a genuinely broken path. Traffic through the forwards themselves is the
-/// evidence that separates the two, and until some of it has failed the probe
-/// alone is only a suspicion.
+/// a genuinely broken path. Traffic through the forwards themselves separates
+/// the two, but only a direct dial that failed at the path says anything about
+/// reaching the container's address: a service that is not running, and a
+/// tunnel that could not be established, are failures of something else.
 async fn corroborate(
     probed: cella_protocol::ContainerProbeResult,
     host_ports: &[u16],
@@ -220,20 +221,20 @@ async fn corroborate(
     };
 
     let health = forward_health.lock().await;
-    let any_failing = host_ports.iter().any(|port| {
+    let any_path_broken = host_ports.iter().any(|port| {
         health
             .get(port)
-            .is_some_and(|state| state.health() == cella_protocol::ForwardHealth::Failing)
+            .is_some_and(|state| state.direct_path_is_broken())
     });
     drop(health);
 
-    if any_failing {
+    if any_path_broken {
         cella_protocol::ContainerProbeResult::Unreachable { error }
     } else {
         cella_protocol::ContainerProbeResult::Unknown {
             reason: format!(
-                "{error}, but no forward for this container has failed to deliver, so the \
-                 probe port may simply be filtered"
+                "{error}, but no direct forward for this container has failed at the network \
+                 path, so the probe port may simply be filtered"
             ),
         }
     }
