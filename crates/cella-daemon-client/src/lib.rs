@@ -5,8 +5,8 @@ pub mod ssh_proxy;
 use std::path::{Path, PathBuf};
 
 use cella_protocol::{
-    ContainerRegistrationData, ContainerSummary, ForwardedPortDetail, ManagementRequest,
-    ManagementResponse,
+    ContainerProbeResult, ContainerRegistrationData, ContainerSummary, ForwardedPortDetail,
+    ManagementRequest, ManagementResponse,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -91,6 +91,24 @@ impl DaemonClient {
         match self.request(&ManagementRequest::QueryPorts).await? {
             ManagementResponse::Ports { ports } => Ok(ports),
             response => Err(DaemonClientError::unexpected("ports", &response)),
+        }
+    }
+
+    /// Ask whether the daemon can still reach a container over the network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or unexpected response.
+    pub async fn probe_container(
+        &self,
+        container_id: &str,
+    ) -> Result<ContainerProbeResult, DaemonClientError> {
+        let request = ManagementRequest::ProbeContainer {
+            container_id: container_id.to_string(),
+        };
+        match self.request(&request).await? {
+            ManagementResponse::ContainerProbe { result, .. } => Ok(result),
+            response => Err(DaemonClientError::unexpected("container probe", &response)),
         }
     }
 

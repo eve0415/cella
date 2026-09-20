@@ -225,8 +225,7 @@ async fn check_version_skew(
 
 /// Query the daemon for a container's live agent version.
 async fn query_live_agent_version(container_id: &str) -> Option<String> {
-    let data_dir = cella_env::paths::cella_data_dir()?;
-    let mgmt_socket = data_dir.join("daemon.sock");
+    let mgmt_socket = cella_env::paths::daemon_socket_path()?;
     if !mgmt_socket.exists() {
         return None;
     }
@@ -247,10 +246,9 @@ async fn query_live_agent_version(container_id: &str) -> Option<String> {
 }
 
 async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_id: &str) {
-    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
+    let Some(mgmt_socket) = cella_env::paths::daemon_socket_path() else {
         return;
     };
-    let mgmt_socket = data_dir.join("daemon.sock");
 
     match cella_daemon_client::send_management_request(
         &mgmt_socket,
@@ -344,47 +342,31 @@ async fn check_credentials(
 /// upstream. The daemon answers this because it is the process that performs
 /// the connection user traffic depends on.
 async fn check_host_can_reach_container(container_id: &str) -> Option<CheckResult> {
-    let data_dir = cella_env::paths::cella_data_dir()?;
-    let mgmt_socket = data_dir.join("daemon.sock");
+    let mgmt_socket = cella_env::paths::daemon_socket_path()?;
+    let client = cella_daemon_client::DaemonClient::new(mgmt_socket);
+    let result = client.probe_container(container_id).await.ok()?;
 
-    let response = cella_daemon_client::send_management_request(
-        &mgmt_socket,
-        &ManagementRequest::ProbeContainer {
-            container_id: container_id.to_string(),
-        },
-    )
-    .await;
-
-    let Ok(ManagementResponse::ContainerProbe { result, .. }) = response else {
-        return None;
-    };
-
-    let check = match result {
-        ContainerProbeResult::Reachable { detail } => CheckResult {
-            name: "container reachable from host".into(),
-            severity: Severity::Pass,
-            detail,
-            fix_hint: None,
-        },
-        ContainerProbeResult::Unreachable { error } => CheckResult {
-            name: "container reachable from host".into(),
-            severity: Severity::Error,
-            detail: format!("{error}; forwarded ports will accept connections and then drop them"),
-            fix_hint: Some(
+    let (severity, detail, fix_hint) = match result {
+        ContainerProbeResult::Reachable { detail } => (Severity::Pass, detail, None),
+        ContainerProbeResult::Unreachable { error } => (
+            Severity::Error,
+            format!("{error}; forwarded ports will accept connections and then drop them"),
+            Some(
                 "Check that the container runtime still routes to the container, and that no \
                  firewall or network policy blocks the cella daemon."
-                    .into(),
+                    .to_string(),
             ),
-        },
+        ),
         ContainerProbeResult::NotApplicable { reason }
-        | ContainerProbeResult::Unknown { reason } => CheckResult {
-            name: "container reachable from host".into(),
-            severity: Severity::Info,
-            detail: reason,
-            fix_hint: None,
-        },
+        | ContainerProbeResult::Unknown { reason } => (Severity::Info, reason, None),
     };
-    Some(check)
+
+    Some(CheckResult {
+        name: "container reachable from host".into(),
+        severity,
+        detail,
+        fix_hint,
+    })
 }
 
 /// Probe every container at once.
@@ -413,10 +395,9 @@ async fn probe_containers(container_ids: Vec<String>) -> HashMap<String, CheckRe
 }
 
 async fn check_ports(checks: &mut Vec<CheckResult>, container_id: &str) {
-    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
+    let Some(mgmt_socket) = cella_env::paths::daemon_socket_path() else {
         return;
     };
-    let mgmt_socket = data_dir.join("daemon.sock");
 
     match cella_daemon_client::send_management_request(
         &mgmt_socket,
