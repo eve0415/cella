@@ -203,6 +203,42 @@ async fn handle_management_connection(
     Ok(())
 }
 
+/// Require a real forward failure before calling a container unreachable.
+///
+/// The probe dials a port the workspace does not use, so a filter that rejects
+/// that port while permitting the ones it does use produces the same answer as
+/// a genuinely broken path. Traffic through the forwards themselves is the
+/// evidence that separates the two, and until some of it has failed the probe
+/// alone is only a suspicion.
+async fn corroborate(
+    probed: cella_protocol::ContainerProbeResult,
+    host_ports: &[u16],
+    forward_health: &crate::proxy::ForwardHealthTable,
+) -> cella_protocol::ContainerProbeResult {
+    let cella_protocol::ContainerProbeResult::Unreachable { error } = probed else {
+        return probed;
+    };
+
+    let health = forward_health.lock().await;
+    let any_failing = host_ports.iter().any(|port| {
+        health
+            .get(port)
+            .is_some_and(|state| state.health() == cella_protocol::ForwardHealth::Failing)
+    });
+    drop(health);
+
+    if any_failing {
+        cella_protocol::ContainerProbeResult::Unreachable { error }
+    } else {
+        cella_protocol::ContainerProbeResult::Unknown {
+            reason: format!(
+                "{error}, but no forward for this container has failed to deliver, so the \
+                 probe port may simply be filtered"
+            ),
+        }
+    }
+}
+
 /// Answer a reachability probe for one container.
 ///
 /// Only meaningful where the daemon reaches containers by IP. Where forwards
@@ -219,6 +255,7 @@ async fn handle_probe_container(
     let pm = ctx.port_manager.lock().await;
     let ip = pm.container_ip(&container_id).map(str::to_string);
     let has_direct_forward = pm.has_direct_forward(&container_id);
+    let host_ports = pm.forward_host_ports(&container_id);
     drop(pm);
 
     let result = if !runtime_uses_direct_ip || !has_direct_forward {
@@ -229,7 +266,10 @@ async fn handle_probe_container(
         }
     } else {
         match ip {
-            Some(ip) => crate::reachability::probe_ip(&ip).await,
+            Some(ip) => {
+                let probed = crate::reachability::probe_ip(&ip).await;
+                corroborate(probed, &host_ports, &ctx.forward_health).await
+            }
             None => cella_protocol::ContainerProbeResult::Unknown {
                 reason: format!("the daemon has no recorded address for {container_id}"),
             },
@@ -1006,6 +1046,35 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_probe_needs_a_real_failure_behind_it() {
+        let health = crate::proxy::new_health_table();
+        let probed = cella_protocol::ContainerProbeResult::Unreachable {
+            error: "no route".to_string(),
+        };
+
+        // Nothing has failed to deliver, so the probe alone is not a verdict.
+        let result = corroborate(probed.clone(), &[3000], &health).await;
+        assert!(
+            matches!(result, cella_protocol::ContainerProbeResult::Unknown { .. }),
+            "a filtered probe port must not condemn a working workspace, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_probe_is_passed_through_unchanged() {
+        let health = crate::proxy::new_health_table();
+        let probed = cella_protocol::ContainerProbeResult::Reachable {
+            detail: "answered".to_string(),
+        };
+
+        let result = corroborate(probed, &[3000], &health).await;
+        assert!(matches!(
+            result,
+            cella_protocol::ContainerProbeResult::Reachable { .. }
+        ));
     }
 
     #[tokio::test]

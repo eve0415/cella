@@ -373,7 +373,18 @@ impl PortManager {
         self.allocation.release_container(container_id);
     }
 
-    /// Get all forwarded ports across all containers.
+    /// Host ports currently forwarded for `container_id`.
+    pub fn forward_host_ports(&self, container_id: &str) -> Vec<u16> {
+        self.containers
+            .get(container_id)
+            .map_or_else(Vec::new, |c| {
+                c.detected_ports
+                    .iter()
+                    .filter_map(|detected| detected.host_port)
+                    .collect()
+            })
+    }
+
     /// Whether any of `container_id`'s forwards are reached on the container
     /// itself rather than through a cross-service tunnel.
     ///
@@ -394,6 +405,7 @@ impl PortManager {
         first.target_host.is_none() || forwarded.any(|detected| detected.target_host.is_none())
     }
 
+    /// Get all forwarded ports across all containers.
     pub fn all_forwarded_ports(&self) -> Vec<ForwardedPortInfo> {
         let mut result = Vec::new();
         for (container_id, container) in &self.containers {
