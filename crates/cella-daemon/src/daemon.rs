@@ -14,7 +14,9 @@ use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::{ProxyCoordinatorContext, run_proxy_coordinator};
-use crate::shared::{cleanup_files, current_time_secs, read_pid_file, set_socket_permissions};
+use crate::shared::{
+    cleanup_files, current_time_secs, is_process_alive, read_pid_file, set_socket_permissions,
+};
 use crate::tunnel::TunnelBroker;
 
 /// Write the PID file and ensure the parent directory exists.
@@ -147,7 +149,7 @@ fn persist_hostname_proxy_port(socket_path: &Path, port: u16, using_fallback_por
 ///
 fn enforce_single_instance(pid_path: &Path) -> Result<(), CellaDaemonError> {
     if let Some(existing_pid) = read_pid_file(pid_path) {
-        if crate::shared::is_process_alive(existing_pid) {
+        if is_process_alive(existing_pid) {
             return Err(CellaDaemonError::PidFile {
                 message: format!(
                     "Another daemon instance is running (PID {existing_pid}). \
@@ -479,6 +481,12 @@ pub fn ensure_daemon_running(
     Ok(socket_path.to_path_buf())
 }
 
+/// How long `stop_daemon` waits for the signalled process to exit.
+const STOP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the signalled process to exit.
+const STOP_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Stop the running daemon.
 ///
 /// # Errors
@@ -494,10 +502,33 @@ pub fn stop_daemon(pid_path: &Path, socket_path: &Path) -> Result<(), CellaDaemo
             .status();
     }
 
-    let control_file = socket_path.with_file_name("daemon.control");
-    cleanup_files(&[pid_path, socket_path, &control_file]);
+    wait_for_process_exit(pid);
+
+    // `daemon.control` is deliberately kept: it records the control port so the
+    // next start reclaims it. Running agents hold that port in
+    // `/cella/.daemon_addr` and have no way to learn a new one.
+    cleanup_files(&[pid_path, socket_path]);
     info!("Cella daemon stopped");
     Ok(())
+}
+
+/// Wait for a signalled daemon to exit so it releases its control port.
+///
+/// `kill` only delivers the signal; returning before the process has exited
+/// leaves the listening socket bound, which makes the next start fall back to
+/// a fresh port and strands every running agent.
+fn wait_for_process_exit(pid: u32) {
+    let deadline = std::time::Instant::now() + STOP_EXIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(STOP_EXIT_POLL_INTERVAL);
+    }
+    warn!(
+        "Daemon process {pid} still running after {}s; the next daemon may not reclaim its control port",
+        STOP_EXIT_TIMEOUT.as_secs()
+    );
 }
 
 #[cfg(test)]
@@ -511,6 +542,16 @@ mod tests {
             &dir.path().join("test.pid"),
             &dir.path().join("test.sock"),
         ));
+    }
+
+    #[test]
+    fn stop_daemon_reports_not_running_without_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = stop_daemon(
+            &dir.path().join("daemon.pid"),
+            &dir.path().join("daemon.sock"),
+        );
+        assert!(matches!(result, Err(CellaDaemonError::NotRunning)));
     }
 
     #[test]
@@ -721,6 +762,9 @@ mod tests {
         let _ = stop_daemon(&pid_path, &sock_path);
         assert!(!pid_path.exists());
         assert!(!sock_path.exists());
-        assert!(!control_path.exists());
+        assert!(
+            control_path.exists(),
+            "the control port must survive a stop or running agents are stranded"
+        );
     }
 }
