@@ -211,7 +211,7 @@ async fn handle_probe_container(
     container_id: String,
     ctx: &ManagementContext,
 ) -> ManagementResponse {
-    let runtime_uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+    let runtime_uses_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
     let pm = ctx.port_manager.lock().await;
     let ip = pm.container_ip(&container_id).map(str::to_string);
     let forwards = pm.all_forwarded_ports();
@@ -581,7 +581,7 @@ async fn preload_numeric_forward(
         return;
     };
 
-    let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+    let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
     let target = if use_direct_ip {
         if let Some(ip) = container_ip {
             crate::proxy::ProxyStartTarget::DirectIp {

@@ -772,7 +772,7 @@ async fn handle_port_open(
     if let Some(tx) = ctx.proxy_cmd_tx
         && !already_forwarded
     {
-        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
         let target = if use_direct_ip {
             if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
                 ProxyStartTarget::DirectIp {
@@ -927,7 +927,7 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
         let pm = Arc::clone(ctx.port_manager);
         let browser = Arc::clone(ctx.browser_handler);
         let container_id = cid.to_string();
-        let uses_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let uses_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
         tokio::spawn(async move {
             wait_for_callback_forwarded(callback_port, &container_id, &pm, 50).await;
             warn_if_callback_undeliverable(&container_id, &pm, uses_direct_ip).await;
