@@ -126,14 +126,6 @@ pub fn dev_agent_override() -> Option<String> {
     std::env::var("CELLA_AGENT_PATH").ok()
 }
 
-/// Detect the target architecture for the agent binary.
-///
-/// The volume path convention uses Rust's own architecture names, so this is
-/// `std::env::consts::ARCH` verbatim.
-pub const fn detect_agent_arch() -> &'static str {
-    std::env::consts::ARCH
-}
-
 /// Detect the target architecture from the Docker daemon.
 ///
 /// Uses the Docker daemon's reported architecture rather than the host
@@ -1455,12 +1447,6 @@ mod tests {
     }
 
     #[test]
-    fn detect_arch_returns_known() {
-        let arch = detect_agent_arch();
-        assert!(!arch.is_empty());
-    }
-
-    #[test]
     fn build_volume_tar_creates_valid_archive() {
         let agent_bytes = b"#!/bin/sh\necho agent";
         let browser_bytes = b"#!/bin/sh\necho browser";
@@ -1862,16 +1848,6 @@ mod tests {
         let (source, target, _) = agent_volume_mount();
         assert_eq!(source, AGENT_VOLUME_NAME);
         assert_eq!(target, "/cella");
-    }
-
-    #[test]
-    fn detect_agent_arch_returns_x86_64_or_aarch64() {
-        let arch = detect_agent_arch();
-        // In CI/test environments we expect a known architecture
-        assert!(
-            arch == "x86_64" || arch == "aarch64",
-            "unexpected arch: {arch}"
-        );
     }
 
     #[test]
