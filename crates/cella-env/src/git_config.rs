@@ -44,7 +44,7 @@ fn run_host_git(args: &[&str], from: Option<&Path>) -> std::io::Result<Output> {
 ///
 /// `--global` still decides which files are read; the working directory only decides which `includeIf gitdir:` and `onbranch:` conditions match, so a user who narrows their signing config to one repository gets the config git would give them while standing in it.
 ///
-/// Two cases fall back to running without a working directory, because losing `includeIf` matching costs one conditional value while failing the read costs every forwarded key. A folder that is not there cannot be a working directory at all — `Command::current_dir` would turn that into a spawn failure indistinguishable from git being missing. A folder git refuses to stand in, which a `.git` file naming a gitdir that no longer exists produces, fails every invocation with `fatal: not a git repository` before reading any config.
+/// Two cases fall back to running without a working directory, because the fallback still evaluates `includeIf` sections, only against cella's own working directory instead of the workspace — which can select the wrong identity or signing key from the user's own `~/.gitconfig` — while failing the read costs every forwarded key. A folder that is not there cannot be a working directory at all — `Command::current_dir` would turn that into a spawn failure indistinguishable from git being missing. A folder git refuses to stand in, which a `.git` file naming a gitdir that no longer exists produces, fails every invocation with `fatal: not a git repository` before reading any config.
 pub(crate) fn host_git_output(args: &[&str], workspace_folder: &Path) -> std::io::Result<Output> {
     if !workspace_folder.is_dir() {
         return run_host_git(args, None);
@@ -62,7 +62,7 @@ pub(crate) fn host_git_output(args: &[&str], workspace_folder: &Path) -> std::io
     }
 
     warn!(
-        "Reading host git config from {} failed ({}), falling back to the unconditional global config",
+        "Reading host git config from {} failed ({}), falling back to the global config read from cella's own working directory",
         workspace_folder.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_folder_git_refuses_falls_back_to_the_unconditional_read() {
+    fn a_workspace_folder_git_refuses_falls_back_to_the_cwd_read() {
         let tmp = TempDir::new().unwrap();
         let global = tmp.path().join("global");
         std::fs::write(&global, "[user]\n\tname = Global Name\n").unwrap();

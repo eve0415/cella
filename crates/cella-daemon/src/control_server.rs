@@ -47,11 +47,11 @@ pub(crate) struct ControlContext {
     pub doc_sync: HashMap<SyncDoc, DocSyncHub>,
 }
 
-/// The host `~/.claude/plugins` directory, creating it when `~/.claude` exists.
+/// The host `~/.claude/plugins` directory, creating it (and `~/.claude` itself) if needed.
 ///
-/// Returns `None` when the host has no `~/.claude` at all (Claude Code was never
-/// run there) or the directory cannot be created — in both cases there is
-/// nothing to sync and no hub is built.
+/// Returns `None` when the host has no resolvable home directory, or the
+/// directory cannot be created — in both cases there is nothing to sync and
+/// no hub is built.
 fn ensure_host_plugins_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = cella_env::claude_code::host_plugins_dir() {
         return Some(dir);

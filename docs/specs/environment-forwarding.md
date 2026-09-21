@@ -247,7 +247,7 @@ Literal key material is forwarded verbatim -- it carries the key with it and nee
 
 Only the public half is ever copied. Git's config documentation notes the value "can contain the path to either your private ssh key or the public key when ssh-agent is used", so a value naming the private key is swapped for its conventional `.pub` sibling; signing still works because `ssh-keygen -Y sign` takes the private half from the forwarded SSH agent. A private key with no usable public counterpart is not forwarded at all.
 
-This is gated on `gpg.format` resolving to `ssh`. Under `openpgp` the value is a GPG key id, means nothing on the filesystem, and is forwarded untouched. As with the allowed-signers file, a filename whose file cannot be read drops the key from the forwarded config rather than injecting a path the container never had.
+This is gated on `gpg.format` resolving to `ssh`. Under `openpgp` the value is a GPG key id, means nothing on the filesystem, and is not forwarded at all. As with the allowed-signers file, a filename whose file cannot be read drops the key from the forwarded config rather than injecting a path the container never had.
 
 ### Safe Directory
 

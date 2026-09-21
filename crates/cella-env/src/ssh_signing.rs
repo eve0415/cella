@@ -1,6 +1,6 @@
 //! Git SSH signing material forwarding.
 //!
-//! Two host git config keys under SSH signing name files rather than values.
+//! Two host git config keys under SSH signing each name a file rather than a value.
 //! `gpg.ssh.allowedSignersFile` must point at a file that exists inside the container, or every signature verification fails with `gpg.ssh.allowedSignersFile needs to be configured and exist`.
 //! A path-valued `user.signingKey` must likewise resolve inside the container, or `git commit -S` fails with `Load key ...: No such file or directory`.
 //! Forwarding either host value alone leaves a dangling host path, so each file is copied and the forwarded value is rewritten to the copy.

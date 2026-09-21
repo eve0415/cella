@@ -15,7 +15,7 @@ Integration tests use `#[runtime_test]` from `cella-testing` for runtime detecti
 
 Update snapshots with `cargo insta review`.
 
-**Note:** `cargo-insta` may not be installed in dev containers. Use `cargo test` to check snapshot correctness; update snapshots from the host with `cargo insta review`.
+**Note:** the dev container installs `cargo-insta` via `postCreateCommand`, so the snapshot gate runs here. Update snapshots with `cargo insta review`.
 
 ## Testing
 
