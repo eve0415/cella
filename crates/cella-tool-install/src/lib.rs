@@ -1678,10 +1678,87 @@ pub enum VerifyOutcome {
     /// Neither probe located the binary. The installer did not produce a
     /// reachable file.
     NotInstalled,
+    /// A probe exited 0 but what the shell resolved is not an absolute path.
+    /// An rc file that aliases the tool makes `command -v` answer
+    /// `alias <bin>='...'`, and a shell function answers with its own name.
+    /// Carries that answer so the failure can name what shadowed the binary.
+    /// Never used as a symlink source.
+    Unresolved(String),
     /// A backend error prevented verification from running. Treated as a
     /// hard failure because we cannot tell the user whether the install
     /// worked.
     ProbeError(String),
+}
+
+/// Sentinel that brackets a probe's answer on stdout.
+///
+/// Same device as the environment probe in `cella-orchestrator`: the command
+/// runs under a login shell, so whatever the startup files print lands on the
+/// same stdout as the answer. A fixed string is enough here because the
+/// payload is a single path rather than arbitrary environment values.
+const PROBE_MARKER: &str = "__cella_command_v__";
+
+/// The shell snippet each probe runs.
+///
+/// Nothing here is specific to one shell's syntax: `shell` is whatever the
+/// remote user's login shell is, which `detect_shell` reads from `$SHELL` or
+/// `/etc/passwd` and need not be POSIX. `printf` is used rather than
+/// `echo -n`, which prints `-n` literally under dash.
+fn command_v_probe(binary: &str) -> String {
+    format!("printf '%s' '{PROBE_MARKER}'; command -v {binary}; printf '%s' '{PROBE_MARKER}'")
+}
+
+/// What one probe answered.
+enum ProbeAnswer {
+    /// An absolute path, usable both as an answer and as a symlink source.
+    Path(String),
+    /// Nothing between the markers: this shell does not resolve the name.
+    NotFound,
+    /// Something that is not a path.
+    Unresolved(String),
+}
+
+/// Read one probe's answer.
+///
+/// The markers make the exit status uninformative — it belongs to the closing
+/// `printf` — so "not found" is an empty answer rather than a non-zero exit.
+/// A non-zero exit means the shell itself did not run the snippet, which is
+/// also nothing found.
+fn classify_probe(result: &ExecResult) -> ProbeAnswer {
+    if result.exit_code != 0 {
+        return ProbeAnswer::NotFound;
+    }
+    let answer = probe_payload(&result.stdout);
+    if answer.is_empty() {
+        return ProbeAnswer::NotFound;
+    }
+    resolved_executable_path(&result.stdout).map_or_else(
+        || ProbeAnswer::Unresolved(answer.to_string()),
+        ProbeAnswer::Path,
+    )
+}
+
+/// The probe's answer with the markers and any surrounding shell output
+/// removed. Falls back to the whole of `stdout` when the markers are absent,
+/// so a shell that mangles the wrapping is no worse off than before it.
+fn probe_payload(stdout: &str) -> &str {
+    match (stdout.find(PROBE_MARKER), stdout.rfind(PROBE_MARKER)) {
+        (Some(open), Some(close)) if close >= open + PROBE_MARKER.len() => {
+            &stdout[open + PROBE_MARKER.len()..close]
+        }
+        _ => stdout,
+    }
+    .trim()
+}
+
+/// The absolute path a probe resolved, or `None` when it answered with
+/// something that cannot be executed or symlinked.
+fn resolved_executable_path(stdout: &str) -> Option<String> {
+    let line = probe_payload(stdout)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())?;
+    line.starts_with('/').then(|| line.to_string())
 }
 
 /// Check whether `binary` is callable by a login shell, mirroring the exact
@@ -1699,7 +1776,7 @@ pub async fn verify_tool_callable(
     probed_env: Option<&ProbedEnv>,
 ) -> VerifyOutcome {
     let env = tool_exec_env(probed_env);
-    let cmd_str = format!("command -v {binary}");
+    let cmd_str = command_v_probe(binary);
 
     // 1. Login-shell probe — matches cella exec's `<shell> -lc ...` wrap.
     let lc_result = client
@@ -1714,10 +1791,11 @@ pub async fn verify_tool_callable(
         )
         .await;
     match lc_result {
-        Ok(r) if r.exit_code == 0 => {
-            return VerifyOutcome::Reachable(r.stdout.trim().to_string());
-        }
-        Ok(_) => {}
+        Ok(r) => match classify_probe(&r) {
+            ProbeAnswer::Path(path) => return VerifyOutcome::Reachable(path),
+            ProbeAnswer::Unresolved(answer) => return VerifyOutcome::Unresolved(answer),
+            ProbeAnswer::NotFound => {}
+        },
         Err(e) => return VerifyOutcome::ProbeError(e.to_string()),
     }
 
@@ -1735,8 +1813,11 @@ pub async fn verify_tool_callable(
         )
         .await;
     match lic_result {
-        Ok(r) if r.exit_code == 0 => VerifyOutcome::InstalledElsewhere(r.stdout.trim().to_string()),
-        Ok(_) => VerifyOutcome::NotInstalled,
+        Ok(r) => match classify_probe(&r) {
+            ProbeAnswer::Path(path) => VerifyOutcome::InstalledElsewhere(path),
+            ProbeAnswer::Unresolved(answer) => VerifyOutcome::Unresolved(answer),
+            ProbeAnswer::NotFound => VerifyOutcome::NotInstalled,
+        },
         Err(e) => VerifyOutcome::ProbeError(e.to_string()),
     }
 }
@@ -1985,7 +2066,7 @@ async fn verified_install_step(
             debug!("{binary}: found at {path} but not on login-shell PATH, symlinking");
             symlink_and_reverify(ctx, binary, &path, install_result.as_ref(), step).await
         }
-        VerifyOutcome::NotInstalled => {
+        outcome @ (VerifyOutcome::NotInstalled | VerifyOutcome::Unresolved(_)) => {
             if let Some(dir) = ctx.fallback_bin_dir {
                 let fallback_path = format!("{dir}/{binary}");
                 if executable_by_remote_user(ctx, &fallback_path).await {
@@ -2002,10 +2083,13 @@ async fn verified_install_step(
                     .await;
                 }
             }
-            step.fail(&render_failure_reason(
-                install_result.as_ref(),
-                "install did not produce a reachable binary",
-            ));
+            let reason = match outcome {
+                VerifyOutcome::Unresolved(answer) => {
+                    format!("`command -v {binary}` answered `{answer}`, not a path")
+                }
+                _ => "install did not produce a reachable binary".to_string(),
+            };
+            step.fail(&render_failure_reason(install_result.as_ref(), &reason));
             false
         }
         VerifyOutcome::ProbeError(e) => {
@@ -3896,7 +3980,7 @@ exit 1
             .expect("redirected binary should be symlinked");
         let verification_index = calls
             .iter()
-            .position(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
+            .position(|call| call.cmd == verification_cmd("codex"))
             .expect("Codex verification should run");
         assert!(install_index < executable_index);
         assert!(executable_index < symlink_index);
@@ -4070,7 +4154,7 @@ exit 1
         );
         let verification = calls
             .iter()
-            .find(|call| call.cmd == vec!["/bin/bash", "-lc", "command -v codex"])
+            .find(|call| call.cmd == verification_cmd("codex"))
             .expect("Codex verification should run");
         assert_eq!(verification.env, None);
     }
@@ -4124,7 +4208,7 @@ exit 1
             Ok(fail_exit(1, "could not update npm config")),
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
-            Ok(ok_exit(0)), // codex is callable
+            Ok(ok_stdout(0, &bracketed("/usr/local/bin/codex"))), // codex is callable
             Ok(ok_exit(0)), // codex sandbox probe is healthy
         ]);
         let settings = cella_config::CellaConfig::default();
@@ -4328,6 +4412,20 @@ exit 1
         }
     }
 
+    /// The `-lc` probe as `verify_tool_callable` issues it.
+    fn verification_cmd(binary: &str) -> Vec<String> {
+        vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            command_v_probe(binary),
+        ]
+    }
+
+    /// Stdout as a shell that brackets its answer produces it.
+    fn bracketed(answer: &str) -> String {
+        format!("{PROBE_MARKER}{answer}{PROBE_MARKER}")
+    }
+
     #[tokio::test]
     async fn verify_tool_callable_reachable_via_lc() {
         let backend =
@@ -4404,6 +4502,167 @@ exit 1
             VerifyOutcome::ProbeError(msg) => assert!(msg.contains("dead")),
             other => panic!("expected ProbeError, got {other:?}"),
         }
+    }
+
+    /// The probe runs under the remote user's login shell, which may be fish
+    /// or another non-POSIX shell, so the snippet stays clear of assignments,
+    /// command substitution, `$?` and operators fish spells differently.
+    #[test]
+    fn command_v_probe_brackets_the_answer_without_shell_specific_syntax() {
+        let cmd = command_v_probe("claude");
+        assert!(cmd.contains("command -v claude"), "{cmd}");
+        assert_eq!(cmd.matches(PROBE_MARKER).count(), 2, "{cmd}");
+        for forbidden in ["$(", "$?", "=$"] {
+            assert!(!cmd.contains(forbidden), "{forbidden} in {cmd}");
+        }
+    }
+
+    /// With the markers in place the exit status belongs to the closing
+    /// `printf`, so an empty answer is what "not found" looks like.
+    #[tokio::test]
+    async fn verify_tool_callable_treats_an_empty_answer_as_not_found() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, &bracketed(""))),
+            Ok(ok_stdout(0, &bracketed(""))),
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::NotInstalled);
+    }
+
+    #[test]
+    fn probe_payload_drops_output_outside_the_markers() {
+        let stdout = format!("motd line\n{}\n", bracketed("/usr/local/bin/claude"));
+        assert_eq!(probe_payload(&stdout), "/usr/local/bin/claude");
+    }
+
+    #[test]
+    fn probe_payload_falls_back_to_unbracketed_output() {
+        assert_eq!(
+            probe_payload("  /usr/local/bin/claude\n"),
+            "/usr/local/bin/claude"
+        );
+    }
+
+    #[test]
+    fn resolved_executable_path_rejects_a_relative_answer() {
+        assert_eq!(resolved_executable_path(&bracketed("claude")), None);
+        assert_eq!(resolved_executable_path(&bracketed("")), None);
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_reads_the_path_out_of_startup_output() {
+        let stdout = format!(
+            "Welcome to the container\n{}",
+            bracketed("/home/vscode/.local/bin/claude")
+        );
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, &stdout))]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Reachable("/home/vscode/.local/bin/claude".to_string())
+        );
+    }
+
+    /// An rc file that aliases the tool makes `command -v` answer with the
+    /// alias definition. That text is not a path and must not become a
+    /// symlink target.
+    #[tokio::test]
+    async fn verify_tool_callable_rejects_an_alias_from_the_interactive_probe() {
+        let alias = "alias claude='/opt/wrapper/claude --dangerously-skip-permissions'";
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_stdout(0, &bracketed(alias))),
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::Unresolved(alias.to_string()));
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_rejects_a_shell_function_from_the_login_probe() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, &bracketed("claude")))]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::Unresolved("claude".to_string()));
+    }
+
+    /// Regression: the alias text used to be handed to `ln -sfn` as the
+    /// symlink source, leaving a broken `/usr/local/bin/<tool>` behind.
+    #[tokio::test]
+    async fn verified_install_step_does_not_symlink_an_alias() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let alias = "alias claude='/opt/wrapper/claude'";
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_stdout(0, &bracketed(alias))),
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Claude Code");
+
+        let succeeded = verified_install_step(&ctx, "claude", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(!succeeded);
+        backend.assert_all_responses_consumed();
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| call.cmd.iter().any(|part| part.contains("ln -sfn"))),
+            "an alias must not reach the symlink"
+        );
+        let failure_message = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+            if let ProgressEvent::PhaseChildFailed { message, .. } = event {
+                Some(message)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            failure_message.as_deref(),
+            Some("`command -v claude` answered `alias claude=\'/opt/wrapper/claude\'`, not a path")
+        );
     }
 
     // ── symlink_to_usr_local_bin ────────────────────────────────────────────
@@ -4555,7 +4814,7 @@ exit 1
         assert!(calls[2].cmd.iter().any(|part| {
             part == "ln -sfn '/home/vscode/.local/bin/codex' /usr/local/bin/codex"
         }));
-        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
+        assert_eq!(calls[3].cmd, verification_cmd("codex"));
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
                 .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
@@ -4587,11 +4846,7 @@ exit 1
         assert_eq!(
             backend.calls(),
             vec![RecordedExec {
-                cmd: vec![
-                    "/bin/bash".to_string(),
-                    "-lc".to_string(),
-                    "command -v codex".to_string(),
-                ],
+                cmd: verification_cmd("codex"),
                 user: Some("vscode".to_string()),
                 env: None,
                 working_dir: None,
@@ -4629,7 +4884,7 @@ exit 1
         backend.assert_all_responses_consumed();
         let calls = backend.calls();
         assert!(calls[2].cmd.iter().any(|part| part.contains("ln -sfn")));
-        assert_eq!(calls[3].cmd, vec!["/bin/bash", "-lc", "command -v codex"]);
+        assert_eq!(calls[3].cmd, verification_cmd("codex"));
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
                 .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))

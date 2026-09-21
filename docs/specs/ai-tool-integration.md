@@ -165,13 +165,16 @@ After installation, every tool MUST be verified as callable through the same she
 1. **Login shell probe**: `<shell> -lc "command -v <binary>"` with the probed PATH. This matches the exact wrapping `cella exec` uses.
 2. **Interactive fallback**: `<shell> -lic "command -v <binary>"` -- catches installers that only modified `.bashrc` / `.zshrc` (which `-lc` does not source).
 
-Three outcomes are possible:
+Each probe brackets the answer with a marker, because the shell's startup files write to the same stdout, and only an absolute path is accepted as a result. The wrapping is shell-neutral -- the probe runs under the remote user's login shell, which need not be POSIX. Under `-lic`, an rc file that aliases the tool makes `command -v` answer `alias <binary>='...'` instead of a path, and a shell function answers with its own name; neither can be executed or symlinked. With the markers in place an empty answer, not the exit status, is what "not found" looks like.
+
+Four outcomes are possible:
 
 | Outcome | Action |
 |---|---|
 | `Reachable` | Tool is on the login-shell PATH. No remediation needed. |
 | `InstalledElsewhere(path)` | Binary found at an absolute path not on the login-shell PATH. A symlink is created at `/usr/local/bin/<binary>` pointing to the discovered path, then re-verified. |
 | `NotInstalled` | Neither probe found the binary. Installation failed. |
+| `Unresolved(answer)` | A probe exited 0 but answered with something that is not a path. Reported as a failed install, and never used as a symlink source. |
 
 The `/usr/local/bin` symlink remediation refuses to overwrite existing regular files (only replaces symlinks), making it safe across repeated `cella up` runs.
 
