@@ -66,7 +66,7 @@ impl SourceText {
         // Skip past the last key and colon to find the value
         let pos = skip_past_colon(bytes, pos)?;
         let value_start = skip_whitespace(bytes, pos);
-        let value_end = find_value_end(bytes, value_start)?;
+        let value_end = skip_value(bytes, value_start)?;
 
         Some(Range {
             offset: value_start,
@@ -251,10 +251,6 @@ const fn skip_balanced(bytes: &[u8], mut pos: usize, open: u8, close: u8) -> Opt
         pos += 1;
     }
     None
-}
-
-const fn find_value_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    skip_value(bytes, pos)
 }
 
 #[cfg(test)]

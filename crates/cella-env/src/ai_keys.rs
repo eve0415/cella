@@ -91,12 +91,15 @@ pub fn detect_ai_keys(
         .collect()
 }
 
+/// Returns `true` if this provider's env var is set to a non-empty value.
+fn key_present(provider: &AiProvider) -> bool {
+    std::env::var(provider.env_var).is_ok_and(|v| !v.is_empty())
+}
+
 /// Returns `true` if at least one known AI API key env var is set and
 /// non-empty on the host. Cheap check — no disk I/O.
 pub fn any_ai_key_present() -> bool {
-    AI_PROVIDERS
-        .iter()
-        .any(|p| std::env::var(p.env_var).is_ok_and(|v| !v.is_empty()))
+    AI_PROVIDERS.iter().any(key_present)
 }
 
 /// Return the names of AI API keys detected on the host (for logging).
@@ -106,7 +109,7 @@ pub fn detect_ai_key_names(provider_enabled: &dyn Fn(&str) -> bool) -> Vec<&'sta
     AI_PROVIDERS
         .iter()
         .filter(|p| provider_enabled(p.id))
-        .filter(|p| std::env::var(p.env_var).is_ok_and(|v| !v.is_empty()))
+        .filter(|p| key_present(p))
         .map(|p| p.env_var)
         .collect()
 }
