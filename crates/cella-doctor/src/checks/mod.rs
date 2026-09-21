@@ -16,7 +16,11 @@ use tokio::time::timeout;
 use cella_backend::{BackendKind, ContainerBackend};
 
 /// Default timeout per check category.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// A category that exceeds this is reported as a bare timeout and everything it
+/// had already collected is lost, so a category that can take a while should
+/// stay inside a budget of its own.
+pub(super) const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Severity level for a check result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

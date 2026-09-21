@@ -101,6 +101,12 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
     use crate::table::{Column, Table};
 
     let has_hostnames = ports.iter().any(|p| p.hostname.is_some());
+    // A forward's host port binds whether or not the container can be reached,
+    // so the listing would otherwise present a dead forward as a live one. The
+    // column appears only when there is something wrong to say.
+    let has_failures = ports
+        .iter()
+        .any(|p| p.health == cella_protocol::ForwardHealth::Failing);
 
     let mut columns = vec![
         Column::shrinkable("CONTAINER"),
@@ -112,6 +118,9 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
         columns.push(Column::shrinkable("HOSTNAME"));
     }
     columns.push(Column::fixed("URL"));
+    if has_failures {
+        columns.push(Column::fixed("STATUS"));
+    }
 
     let mut table = Table::new(columns);
 
@@ -126,10 +135,30 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
             row.push(port.hostname.as_deref().unwrap_or("-").to_string());
         }
         row.push(port.url.clone());
+        if has_failures {
+            row.push(health_label(port.health).to_string());
+        }
         table.add_row(row);
     }
 
     table.eprint();
+
+    if has_failures {
+        eprintln!();
+        eprintln!(
+            "Some forwards accept connections but cannot deliver them. \
+             Run `cella doctor` to see why."
+        );
+    }
+}
+
+/// Short word for what a forward last did.
+const fn health_label(health: cella_protocol::ForwardHealth) -> &'static str {
+    match health {
+        cella_protocol::ForwardHealth::Unknown => "-",
+        cella_protocol::ForwardHealth::Delivering => "ok",
+        cella_protocol::ForwardHealth::Failing => "failing",
+    }
 }
 
 async fn print_backend_ports(
@@ -351,6 +380,7 @@ fn print_daemon_ports_json(ports: &[cella_protocol::ForwardedPortDetail]) {
                 "process": p.process,
                 "url": p.url,
                 "hostname": p.hostname,
+                "health": p.health,
             })
         })
         .collect();
@@ -461,6 +491,7 @@ mod tests {
                 process: Some("node".to_string()),
                 url: "localhost:49152".to_string(),
                 hostname: None,
+                health: cella_protocol::ForwardHealth::Unknown,
             },
             cella_protocol::ForwardedPortDetail {
                 container_name: "api".to_string(),
@@ -470,6 +501,7 @@ mod tests {
                 process: None,
                 url: "localhost:49153".to_string(),
                 hostname: None,
+                health: cella_protocol::ForwardHealth::Unknown,
             },
         ];
 

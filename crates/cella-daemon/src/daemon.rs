@@ -14,7 +14,9 @@ use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::{ProxyCoordinatorContext, run_proxy_coordinator};
-use crate::shared::{cleanup_files, current_time_secs, read_pid_file, set_socket_permissions};
+use crate::shared::{
+    cleanup_files, current_time_secs, is_process_alive, read_pid_file, set_socket_permissions,
+};
 use crate::tunnel::TunnelBroker;
 
 /// Write the PID file and ensure the parent directory exists.
@@ -147,7 +149,7 @@ fn persist_hostname_proxy_port(socket_path: &Path, port: u16, using_fallback_por
 ///
 fn enforce_single_instance(pid_path: &Path) -> Result<(), CellaDaemonError> {
     if let Some(existing_pid) = read_pid_file(pid_path) {
-        if crate::shared::is_process_alive(existing_pid) {
+        if is_process_alive(existing_pid) {
             return Err(CellaDaemonError::PidFile {
                 message: format!(
                     "Another daemon instance is running (PID {existing_pid}). \
@@ -198,7 +200,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         .port();
 
     // Persist port+token to daemon.control for reclaiming on restart
-    let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
+    write_control_file(socket_path, control_port, &auth_token)?;
 
     let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir, auth_token.clone());
     // Reclaim bridge ports from previous daemon run so containers
@@ -236,13 +238,15 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     // Spawn proxy coordinator with tunnel context
     let (proxy_cmd_tx, proxy_cmd_rx) = tokio::sync::mpsc::channel(64);
+    let forward_health = crate::proxy::new_health_table();
     {
         let proxy_ctx = ProxyCoordinatorContext {
             tunnel_broker: tunnel_broker.clone(),
             container_handles: container_handles.clone(),
         };
+        let health = forward_health.clone();
         tokio::spawn(async move {
-            run_proxy_coordinator(proxy_cmd_rx, Some(proxy_ctx)).await;
+            run_proxy_coordinator(proxy_cmd_rx, Some(proxy_ctx), health).await;
         });
     }
 
@@ -262,6 +266,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         browser_handler,
         clipboard_handler,
         proxy_cmd_tx,
+        forward_health,
         start_time,
         is_orbstack,
         daemon_started_at,
@@ -281,11 +286,10 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     let cleanup_fut = tokio::task::spawn_blocking({
         let pid = pid_path.to_path_buf();
         let sock = socket_path.to_path_buf();
-        let ctrl_file = control_file_path;
-        move || {
-            cleanup_files(&[&pid, &sock]);
-            let _ = std::fs::remove_file(&ctrl_file);
-        }
+        // `daemon.control` survives here for the same reason it survives an
+        // explicit stop: it is the only record of the control port, and running
+        // agents have no way to learn a new one.
+        move || cleanup_files(&[&pid, &sock])
     });
     if tokio::time::timeout(Duration::from_secs(5), cleanup_fut)
         .await
@@ -305,6 +309,7 @@ fn build_management_context(
     browser_handler: Arc<BrowserHandler>,
     clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
     proxy_cmd_tx: tokio::sync::mpsc::Sender<crate::proxy::ProxyCommand>,
+    forward_health: crate::proxy::ForwardHealthTable,
     start_time: std::time::Instant,
     is_orbstack: bool,
     daemon_started_at: u64,
@@ -326,6 +331,7 @@ fn build_management_context(
         browser_handler,
         clipboard_handler,
         proxy_cmd_tx,
+        forward_health,
         start_time,
         is_orbstack,
         daemon_started_at,
@@ -414,11 +420,39 @@ async fn bind_control_tcp(
         .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u16>().ok()))
         .unwrap_or(0);
 
-    crate::shared::bind_tcp_reclaim(preferred_port)
+    let listener = crate::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("failed to bind control TCP: {e}"),
-        })
+        })?;
+
+    warn_if_control_port_moved(preferred_port, &listener);
+    Ok(listener)
+}
+
+/// Report a control port that could not be reclaimed.
+///
+/// Agents re-read `/cella/.daemon_addr` on every reconnect attempt, so they
+/// would follow a moved port the moment something rewrote that file — but the
+/// daemon has no container runtime client of its own to write it. Reconnecting
+/// would not be enough on its own either: a restarted daemon has no record of
+/// any container, and rejects an agent whose container is not registered. Both
+/// halves are what `cella up` restores, so that is the recovery named here.
+fn warn_if_control_port_moved(preferred_port: u16, listener: &tokio::net::TcpListener) {
+    if preferred_port == 0 {
+        return;
+    }
+    let Ok(actual) = listener.local_addr().map(|addr| addr.port()) else {
+        return;
+    };
+    if actual == preferred_port {
+        return;
+    }
+    warn!(
+        "Control port moved from {preferred_port} to {actual}. Any container started before this \
+         daemon still points at {preferred_port} and cannot reconnect; run `cella up` in those \
+         workspaces to refresh them. Nothing is stranded if none are running."
+    );
 }
 
 /// Check if the daemon is already running.
@@ -479,6 +513,12 @@ pub fn ensure_daemon_running(
     Ok(socket_path.to_path_buf())
 }
 
+/// How long `stop_daemon` waits for the signalled process to exit.
+const STOP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the signalled process to exit.
+const STOP_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Stop the running daemon.
 ///
 /// # Errors
@@ -494,10 +534,33 @@ pub fn stop_daemon(pid_path: &Path, socket_path: &Path) -> Result<(), CellaDaemo
             .status();
     }
 
-    let control_file = socket_path.with_file_name("daemon.control");
-    cleanup_files(&[pid_path, socket_path, &control_file]);
+    wait_for_process_exit(pid);
+
+    // `daemon.control` is deliberately kept: it records the control port so the
+    // next start reclaims it. Running agents hold that port in
+    // `/cella/.daemon_addr` and have no way to learn a new one.
+    cleanup_files(&[pid_path, socket_path]);
     info!("Cella daemon stopped");
     Ok(())
+}
+
+/// Wait for a signalled daemon to exit so it releases its control port.
+///
+/// `kill` only delivers the signal; returning before the process has exited
+/// leaves the listening socket bound, which makes the next start fall back to
+/// a fresh port and strands every running agent.
+fn wait_for_process_exit(pid: u32) {
+    let deadline = std::time::Instant::now() + STOP_EXIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(STOP_EXIT_POLL_INTERVAL);
+    }
+    warn!(
+        "Daemon process {pid} still running after {}s; the next daemon may not reclaim its control port",
+        STOP_EXIT_TIMEOUT.as_secs()
+    );
 }
 
 #[cfg(test)]
@@ -721,6 +784,9 @@ mod tests {
         let _ = stop_daemon(&pid_path, &sock_path);
         assert!(!pid_path.exists());
         assert!(!sock_path.exists());
-        assert!(!control_path.exists());
+        assert!(
+            control_path.exists(),
+            "the control port must survive a stop or running agents are stranded"
+        );
     }
 }

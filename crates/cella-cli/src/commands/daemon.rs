@@ -37,7 +37,7 @@ impl DaemonArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             DaemonCommand::Start(args) => run_start(args).await,
-            DaemonCommand::Stop => run_stop(),
+            DaemonCommand::Stop => run_stop().await,
             DaemonCommand::Status => run_status().await,
         }
     }
@@ -56,11 +56,13 @@ async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error + Se
     Ok(())
 }
 
-fn run_stop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_stop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
     let pid_path = data_dir.join("daemon.pid");
     let socket_path = data_dir.join("daemon.sock");
-    daemon::stop_daemon(&pid_path, &socket_path)?;
+    // `stop_daemon` waits for the signalled process to exit, so it is kept off
+    // the async worker threads.
+    tokio::task::spawn_blocking(move || daemon::stop_daemon(&pid_path, &socket_path)).await??;
     eprintln!("Cella daemon stopped.");
     Ok(())
 }

@@ -198,7 +198,9 @@ The `RouteTable` maps `(project, branch, port)` tuples to backend targets. Route
 | Port closed (`port_closed`) | Remove route, release host port allocation |
 | Container deregistered | Remove all routes for that container, release all allocations |
 
-Each route stores a `ProxyMode` indicating how to reach the backend. The daemon updates the mode for all routes belonging to a container when the connectivity path changes (e.g., when an agent tunnel becomes available).
+Each route stores a `ProxyMode` indicating how to reach the backend.
+Every route the daemon inserts uses `ProxyMode::Localhost` and targets the allocated host port, so hostname requests traverse the same forward described above rather than reaching the container directly.
+The mode is fixed when the route is inserted and is not recalculated when the connectivity path changes.
 
 ## Reverse Tunnels
 

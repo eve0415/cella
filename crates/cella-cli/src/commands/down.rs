@@ -312,9 +312,26 @@ fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
 pub(super) fn cleanup_daemon() {
     if running_cella_container_count() == 0
         && let Some(data_dir) = cella_data_dir()
-        && daemon::stop_daemon(&data_dir.join("daemon.pid"), &data_dir.join("daemon.sock")).is_ok()
+        && stop_daemon_off_the_runtime(&data_dir.join("daemon.pid"), &data_dir.join("daemon.sock"))
     {
         debug!("Cella daemon stopped (no containers remain)");
+    }
+}
+
+/// Stop the daemon without blocking a runtime worker.
+///
+/// Stopping waits for the daemon process to actually exit, and this is reached
+/// from async commands, so the wait is handed to a thread that is allowed to
+/// block. Kept synchronous because the prune hook that calls it is.
+fn stop_daemon_off_the_runtime(pid_path: &std::path::Path, socket_path: &std::path::Path) -> bool {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    let stop = || daemon::stop_daemon(pid_path, socket_path).is_ok();
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(stop)
+        }
+        _ => stop(),
     }
 }
 

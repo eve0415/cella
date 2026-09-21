@@ -1,6 +1,7 @@
 //! Shared daemon primitives: PID management, process checks, socket helpers.
 
 use std::path::Path;
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
@@ -134,6 +135,15 @@ pub fn start_background_process(args: &[&str]) -> Result<std::process::Child, st
         .spawn()
 }
 
+/// Bind attempts for a previously used control port before giving up on it.
+///
+/// A daemon that was just signalled may still hold the listening socket, so a
+/// single attempt loses the port to an OS-assigned one.
+const RECLAIM_ATTEMPTS: u32 = 5;
+
+/// Delay between reclaim attempts.
+const RECLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Bind a TCP listener on localhost, attempting to reclaim a previously used port.
 ///
 /// If `preferred_port` is non-zero, tries to bind it first. Falls back to
@@ -149,11 +159,21 @@ pub async fn bind_tcp_reclaim(
 
     if preferred_port != 0 {
         let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
-            debug!("Reclaimed TCP port {preferred_port}");
-            return Ok(listener);
+        for attempt in 1..=RECLAIM_ATTEMPTS {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    debug!("Reclaimed TCP port {preferred_port} on attempt {attempt}");
+                    return Ok(listener);
+                }
+                Err(e) if attempt == RECLAIM_ATTEMPTS => {
+                    warn!(
+                        "Cannot reclaim TCP port {preferred_port} after {attempt} attempts ({e}), \
+                         binding an OS-assigned port instead"
+                    );
+                }
+                Err(_) => tokio::time::sleep(RECLAIM_RETRY_INTERVAL).await,
+            }
         }
-        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
     }
 
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -202,6 +222,27 @@ mod tests {
     fn cleanup_files_ignores_missing() {
         let dir = tempfile::tempdir().unwrap();
         cleanup_files(&[&dir.path().join("nonexistent")]);
+    }
+
+    #[tokio::test]
+    async fn bind_tcp_reclaim_waits_for_a_busy_port() {
+        let holder = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        // Mirrors a just-signalled daemon that has not yet released its socket.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(holder);
+        });
+
+        let listener = bind_tcp_reclaim(port).await.unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().port(),
+            port,
+            "a port freed inside the retry window must be reclaimed, not replaced"
+        );
     }
 
     #[cella_testing::runtime_test(docker)]

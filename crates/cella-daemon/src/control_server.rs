@@ -772,7 +772,7 @@ async fn handle_port_open(
     if let Some(tx) = ctx.proxy_cmd_tx
         && !already_forwarded
     {
-        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
         let target = if use_direct_ip {
             if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
                 ProxyStartTarget::DirectIp {
@@ -3043,18 +3043,57 @@ fn extract_port(url: &str) -> Option<u16> {
     host_port.rsplit_once(':')?.1.parse().ok()
 }
 
-/// Wait for a TCP proxy to accept connections, polling up to 2 seconds.
+/// How long a freshly accepted forward is given to prove it is carrying traffic.
+///
+/// A live service says nothing until it is asked, so silence here is the
+/// healthy answer and only an end-of-stream is a verdict.
+const FORWARD_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Wait for a TCP proxy to carry connections, polling up to 2 seconds.
+///
+/// Connecting is not enough to know a forward works. The host-side proxy binds
+/// and accepts before it dials the container, and closes the connection when
+/// that dial fails, so a forward that can never deliver a byte still accepts
+/// instantly. An immediate end-of-stream is that failure seen from the client
+/// side, and it is exactly what the browser is about to run into.
 async fn wait_for_proxy_ready(port: u16) {
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            // The verdict takes a moment to arrive and only produces a log
+            // line, so it must not hold up what the visitor is waiting for.
+            tokio::spawn(async move {
+                if forward_dropped_connection(stream).await {
+                    warn!(
+                        "Port {port} accepted a connection and closed it without sending \
+                         anything, so a page opened against it will not load and a single-use \
+                         login code sent through it will be spent for nothing. Run \
+                         `cella doctor` to see whether the container is unreachable or the \
+                         service behind the forward is simply not running yet."
+                    );
+                }
+            });
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     debug!("Proxy readiness timeout for port {port}, opening browser anyway");
+}
+
+/// Whether a just-accepted forward closed without delivering anything.
+///
+/// Reaching end-of-stream means the proxy accepted and then shut the socket
+/// down, which is what it does whenever its upstream dial fails — whether the
+/// container is unreachable or nothing is listening yet, which this cannot
+/// tell apart. A timeout means the connection is still open, which is what a
+/// working forward to a service awaiting a request looks like.
+async fn forward_dropped_connection(mut stream: tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let mut discard = [0u8; 1];
+    matches!(
+        tokio::time::timeout(FORWARD_EOF_GRACE, stream.read(&mut discard)).await,
+        Ok(Ok(0))
+    )
 }
 
 /// Rewrite a browser URL to use the correct host port.
@@ -3790,6 +3829,51 @@ mod tests {
         let start = std::time::Instant::now();
         wait_for_callback_forwarded(54546, "nonexistent", &pm, 3).await;
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    // ---------------------------------------------------------------
+    // forward_dropped_connection
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_forward_that_accepts_then_drops_is_detected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mirrors the proxy's failure path: accept, fail the upstream dial,
+        // shut the inbound socket down.
+        tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = inbound.shutdown().await;
+            }
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            forward_dropped_connection(stream).await,
+            "a forward that closes without delivering anything must be recognised"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forward_awaiting_a_request_is_not_mistaken_for_a_dead_one() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A live service sends nothing until it is asked for something.
+        tokio::spawn(async move {
+            if let Ok((inbound, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                drop(inbound);
+            }
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            !forward_dropped_connection(stream).await,
+            "silence from a held-open connection is the healthy case"
+        );
     }
 
     // ---------------------------------------------------------------

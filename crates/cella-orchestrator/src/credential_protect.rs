@@ -141,6 +141,15 @@ pub fn read_daemon_connection_info(
     container_name: &str,
 ) -> Option<cella_env::proxy::DaemonConnectionInfo> {
     let data_dir = cella_env::paths::cella_data_dir()?;
+    // The control file deliberately outlives the daemon so the port can be
+    // reclaimed, so its contents are only worth trusting while a daemon is
+    // listening. A graceful stop removes this socket; a daemon killed outright
+    // leaves it behind, so this does not prove liveness on its own. Callers
+    // reach here through `ensure_cella_daemon`, which does check the process
+    // and clears a stale pair before anything reads this.
+    if !data_dir.join("daemon.sock").exists() {
+        return None;
+    }
     let control_path = data_dir.join("daemon.control");
     let content = std::fs::read_to_string(&control_path).ok()?;
     let mut lines = content.lines();

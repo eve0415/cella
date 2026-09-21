@@ -373,6 +373,38 @@ impl PortManager {
         self.allocation.release_container(container_id);
     }
 
+    /// Host ports currently forwarded for `container_id`.
+    pub fn forward_host_ports(&self, container_id: &str) -> Vec<u16> {
+        self.containers
+            .get(container_id)
+            .map_or_else(Vec::new, |c| {
+                c.detected_ports
+                    .iter()
+                    .filter_map(|detected| detected.host_port)
+                    .collect()
+            })
+    }
+
+    /// Whether any of `container_id`'s forwards are reached on the container
+    /// itself rather than through a cross-service tunnel.
+    ///
+    /// A container with no forwards yet counts as direct: nothing contradicts
+    /// it. An unknown container does too, so callers fall through to whatever
+    /// they do when the container is not registered.
+    pub fn has_direct_forward(&self, container_id: &str) -> bool {
+        let Some(container) = self.containers.get(container_id) else {
+            return true;
+        };
+        let mut forwarded = container
+            .detected_ports
+            .iter()
+            .filter(|detected| detected.host_port.is_some());
+        let Some(first) = forwarded.next() else {
+            return true;
+        };
+        first.target_host.is_none() || forwarded.any(|detected| detected.target_host.is_none())
+    }
+
     /// Get all forwarded ports across all containers.
     pub fn all_forwarded_ports(&self) -> Vec<ForwardedPortInfo> {
         let mut result = Vec::new();
@@ -569,6 +601,54 @@ mod tests {
 
         let ports = pm.all_forwarded_ports();
         assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn has_direct_forward_distinguishes_cross_service_only_containers() {
+        let mut pm = PortManager::new(false);
+        for id in ["direct", "cross", "empty"] {
+            pm.register_container(ContainerRegistrationInfo {
+                container_id: id.to_string(),
+                container_name: id.to_string(),
+                container_ip: None,
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+        }
+
+        pm.handle_port_open("direct", 3000, PortProtocol::Tcp, None);
+        pm.handle_forward_open("cross", 5432, Some("db"), PortProtocol::Tcp, None);
+
+        assert!(pm.has_direct_forward("direct"));
+        assert!(
+            !pm.has_direct_forward("cross"),
+            "a container reached only through the tunnel must not be judged by the direct path"
+        );
+        assert!(
+            pm.has_direct_forward("empty"),
+            "no forwards yet is not evidence against the direct path"
+        );
+        assert!(pm.has_direct_forward("never-registered"));
+    }
+
+    #[test]
+    fn has_direct_forward_sees_a_mix_as_direct() {
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+        pm.handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None);
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+
+        assert!(pm.has_direct_forward("c1"));
     }
 
     #[test]

@@ -46,9 +46,28 @@ pub fn orb_local_url(container_name: &str, port: u16) -> String {
     format!("{container_name}.orb.local:{port}")
 }
 
+/// Whether this host reaches containers at their own address rather than
+/// through the agent's reverse tunnel.
+///
+/// Linux shares a network namespace with the container bridge, and `OrbStack`
+/// routes container addresses from the host. Everywhere else the container's
+/// address is unreachable and forwards are tunnelled instead.
+#[must_use]
+pub const fn uses_direct_ip(is_orbstack: bool) -> bool {
+    cfg!(target_os = "linux") || is_orbstack
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_ip_follows_the_runtime() {
+        // OrbStack routes container addresses from the host whatever the OS.
+        assert!(uses_direct_ip(true));
+        // Elsewhere it depends on the host sharing the container's network.
+        assert_eq!(uses_direct_ip(false), cfg!(target_os = "linux"));
+    }
 
     #[test]
     fn orb_local_url_format() {
