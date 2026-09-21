@@ -5,7 +5,7 @@ use inquire::Select;
 
 use miette::IntoDiagnostic as _;
 
-use cella_oci::{TagCache, TagSource};
+use cella_oci::{FetchedTags, TagCache, TagSource};
 
 use super::candidates::{self, AxisSet, Candidates, Limitation};
 use super::jsonc_edit;
@@ -165,20 +165,13 @@ impl UpdateArgs {
 
         // An alias line names no runtime, so which one it points at can only
         // be learned from the registry. Probed only when the image actually
-        // publishes runtime-ful lines beside it, and only when the registry
-        // answered: 1-4 requests, or none.
-        let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
-            Some(probe) if probe_is_worthwhile(fetched.source) => {
-                // The tag list is fetched under the normalized reference, so
-                // the resolver must use it too — `org/image` shorthand would
-                // otherwise parse `org` as a registry and every probe fail.
-                // The user's own spelling is still what gets written back.
-                let resolver =
-                    cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
-                candidates::resolve_alias_runtime(&resolver, &probe).await
-            }
-            _ => None,
-        };
+        // publishes runtime-ful lines beside it: 1-4 requests, or none.
+        // The tag list is fetched under the normalized reference, so the
+        // resolver must use it too — `org/image` shorthand would otherwise
+        // parse `org` as a registry and every probe fail. The user's own
+        // spelling is still what gets written back.
+        let resolver = cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
+        let alias_runtime = probe_alias_runtime(&resolver, &fetched, &tag).await;
 
         let computed = candidates::compute(&fetched.tags, &tag, alias_runtime.as_deref());
         if self.stop_at_floating(computed.as_ref()) {
@@ -381,15 +374,18 @@ impl UpdateArgs {
     }
 }
 
-/// Whether the alias probe is worth attempting.
+/// Resolve an alias regardless of where its tag list came from.
 ///
-/// A stale cache is served only after the registry refused the tag list, so
-/// the digest fetch the probe opens with would just spend the registry
-/// timeout to fail the same way. Skipping it costs nothing the run does not
-/// already lose: an unresolved alias degrades to same-shape offers and says
-/// so through [`Limitation::UnresolvedAlias`], exactly as a failed probe does.
-const fn probe_is_worthwhile(source: TagSource) -> bool {
-    !matches!(source, TagSource::StaleCache)
+/// A failed tag-list request does not imply that manifest pulls fail too, so
+/// even a stale-cache result gets the one bounded probe needed to preserve
+/// runtime and shape candidates.
+async fn probe_alias_runtime<R: cella_oci::AliasResolver + Sync>(
+    resolver: &R,
+    fetched: &FetchedTags,
+    tag: &str,
+) -> Option<String> {
+    let probe = candidates::alias_probe(&fetched.tags, tag)?;
+    candidates::resolve_alias_runtime(resolver, &probe).await
 }
 
 /// How many not-yet-given flags a move still needs.
@@ -838,16 +834,32 @@ mod tests {
         assert!(err.contains("2.0.14-1-trixie"), "got: {err}");
     }
 
-    /// Regression: the stale-cache branch only printed a warning, and the
-    /// alias probe then went to the registry that had just been established
-    /// as unreachable — a round trip that can only end in the timeout.
-    #[test]
-    fn a_stale_cache_skips_the_alias_probe() {
-        assert!(!probe_is_worthwhile(TagSource::StaleCache));
-        assert!(probe_is_worthwhile(TagSource::Registry));
-        assert!(
-            probe_is_worthwhile(TagSource::Cache),
-            "a live cache entry says nothing about the registry being down"
+    /// Regression: any tag-list error falls back to a stale cache, including
+    /// endpoint-specific and later-page failures where manifest pulls still
+    /// work. That source must not suppress the only digest probe.
+    #[tokio::test]
+    async fn a_stale_cache_still_probes_the_alias_runtime() {
+        let raw = include_str!("../../../testdata/mcr-devcontainers-typescript-node-tags.json");
+        let fetched = FetchedTags {
+            tags: serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tag| tag.as_str().unwrap().to_owned())
+                .collect(),
+            source: TagSource::StaleCache,
+        };
+        let resolver = cella_oci::MapResolver::new([
+            ("5.0.3-trixie", "alias-digest"),
+            ("5.0.3-24-trixie", "alias-digest"),
+        ]);
+
+        assert_eq!(fetched.source, TagSource::StaleCache);
+        assert_eq!(
+            probe_alias_runtime(&resolver, &fetched, "5.0.3-trixie")
+                .await
+                .as_deref(),
+            Some("24")
         );
     }
 
