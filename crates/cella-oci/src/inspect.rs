@@ -123,12 +123,13 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
             .await
         {
             Ok(response) => response,
-            // A follow-up page can fail on registries that answer the final
-            // page with `{"tags": null}` (e.g. GHCR when the previous page was
-            // exactly full): the null body fails JSON deserialization. Treat
-            // *only* that case as end-of-list. Network/auth/registry errors
-            // must propagate — otherwise a transient failure on page 2+ would
-            // silently truncate the listing and look like a complete result.
+            // oci-client 0.18 deserializes a `{"tags": null}` page (GHCR
+            // sends one when the previous page was exactly full) into an
+            // empty list, so that case no longer surfaces here. This arm
+            // remains for any other malformed follow-up page. Network, auth
+            // and registry errors must still propagate — otherwise a
+            // transient failure on page 2+ would silently truncate the
+            // listing and look like a complete result.
             Err(OciDistributionError::JsonError(_)) if !all_tags.is_empty() => {
                 debug!("treating null-tags deserialization on follow-up page as end-of-list");
                 break;
