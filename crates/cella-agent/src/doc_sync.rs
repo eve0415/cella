@@ -28,6 +28,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -75,6 +76,15 @@ pub struct DocState {
     baseline: Mutex<serde_json::Value>,
     /// Hash of the raw bytes last written to / read from the container file.
     last_hash: Mutex<String>,
+    /// Whether this container's whole document has been announced on the
+    /// current connection.
+    ///
+    /// The announce is skipped when the file cannot be read at that moment, and
+    /// the daemon is then left with no copy of this document at all — a delta
+    /// against a baseline it may not hold is not something it can seed from. So
+    /// the next forwarded edit carries the whole document again instead of only
+    /// the patch. Cleared at every (re)connect.
+    announced: AtomicBool,
     /// Highest canonical revision applied for this document.
     ///
     /// The daemon serializes its transactions but fans out after releasing the
@@ -103,6 +113,7 @@ impl DocState {
             baseline_path,
             baseline: Mutex::new(baseline),
             last_hash: Mutex::new(initial_hash(&path)),
+            announced: AtomicBool::new(false),
             last_rev: Mutex::new(0),
             path,
             map,
@@ -271,19 +282,30 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
     }
 }
 
-/// Patches to re-announce to the daemon on every (re)connect, one per document.
+/// What to re-announce to the daemon on every (re)connect: this container's
+/// whole document, then the patch against its baseline, per document.
 ///
 /// Sent *before* the connection reader starts, so the read happens before any
 /// inbound push can clobber local edits. An empty patch is still sent: with no
 /// per-container document the daemon cannot tell whether this container is up to
 /// date, and its reply carrying canonical is the only way a container that
 /// changed nothing while disconnected learns what it missed.
+///
+/// The snapshot is what a daemon that came up without a readable host file
+/// seeds from. The baseline below outlives the daemon, so against such a daemon
+/// the patch is a delta against state it does not have — a fragment it must not
+/// push, since an agent applies a push wholesale. A daemon that did read the
+/// host file ignores the snapshot and uses the patch, which is what keeps a
+/// reconnecting container from re-asserting a stale document over a peer.
 pub async fn reannounce_messages() -> Vec<AgentMessage> {
     let mut out = Vec::new();
     for st in states() {
         // Revisions restart with the daemon, so a reconnect may be talking to a
         // fresh one whose numbering is lower than what we last applied.
         *st.last_rev.lock().await = 0;
+        // Likewise, a fresh daemon has never been told what this container
+        // holds. Set again below only if the document could actually be read.
+        st.announced.store(false, Ordering::Relaxed);
         // Clone the baseline and drop the guard before the await: a temporary
         // guard in argument position lives to the end of the `let` statement,
         // so passing `&*lock().await` inline would hold the mutex across
@@ -294,19 +316,38 @@ pub async fn reannounce_messages() -> Vec<AgentMessage> {
         // and the same failed read would leave `pending_local_patch` empty too —
         // so the push would overwrite the local content instead of preserving
         // it. Nothing is lost by waiting: the next watcher event re-derives it.
-        let Some(patch) = derive_patch(st.doc, &st.path, &baseline, st.map.as_ref()).await else {
+        let Some(canonical) = current_canonical(st.doc, &st.path, st.map.as_ref()).await else {
             debug!(
                 "doc sync: {:?} unreadable at (re)connect; not announcing it",
                 st.doc
             );
             continue;
         };
-        out.push(AgentMessage::ConfigDocPatch {
-            doc: st.doc,
-            patch: patch.to_string(),
-        });
+        out.extend(announce(st.doc, &canonical, &baseline));
+        st.announced.store(true, Ordering::Relaxed);
     }
     out
+}
+
+/// The pair that announces one document: the whole thing, then the patch.
+///
+/// In that order, so that a hub with no state of its own has been seeded by the
+/// time the patch it cannot interpret arrives.
+fn announce(
+    doc: SyncDoc,
+    canonical: &serde_json::Value,
+    baseline: &serde_json::Value,
+) -> [AgentMessage; 2] {
+    [
+        AgentMessage::ConfigDocSnapshot {
+            doc,
+            content: canonical.to_string(),
+        },
+        AgentMessage::ConfigDocPatch {
+            doc,
+            patch: cella_env::claude_code::diff_documents(doc, baseline, canonical).to_string(),
+        },
+    ]
 }
 
 /// Read `path` and derive the merge patch taking `baseline` to its current
@@ -318,11 +359,20 @@ pub async fn derive_patch(
     baseline: &serde_json::Value,
     map: Option<&PathMap>,
 ) -> Option<serde_json::Value> {
-    let raw = tokio::fs::read_to_string(path).await.ok()?;
-    let canonical = to_canonical(doc, &raw, map)?;
+    let canonical = current_canonical(doc, path, map).await?;
     Some(cella_env::claude_code::diff_documents(
         doc, baseline, &canonical,
     ))
+}
+
+/// This container's document as it stands, in canonical form. `None` when the
+/// file is unreadable or not JSON — never an empty document.
+async fn current_canonical(
+    doc: SyncDoc,
+    path: &Path,
+    map: Option<&PathMap>,
+) -> Option<serde_json::Value> {
+    to_canonical(doc, &tokio::fs::read_to_string(path).await.ok()?, map)
 }
 
 /// Spawn a watcher per document plus the shared writer task. `apply_rx` receives
@@ -466,10 +516,20 @@ async fn run_watcher(st: Arc<DocState>, control: Arc<Mutex<ReconnectingClient>>)
 
     let control = &control;
     while handle.changes.recv().await.is_some() {
-        forward_change(
-            &st,
-            |msg| async move { control.lock().await.send(&msg).await },
-        )
+        // One lock for the whole announcement: a snapshot and the patch that
+        // follows it must not be split by another document's send.
+        forward_change(&st, |msgs| async move {
+            let mut client = control.lock().await;
+            let mut sent = Ok(());
+            for msg in &msgs {
+                sent = client.send(msg).await;
+                if sent.is_err() {
+                    break;
+                }
+            }
+            drop(client);
+            sent
+        })
         .await;
     }
 }
@@ -492,7 +552,7 @@ async fn run_watcher(st: Arc<DocState>, control: Arc<Mutex<ReconnectingClient>>)
 /// the reconnect re-announce re-derives the same patch.
 async fn forward_change<F, Fut>(st: &DocState, send: F)
 where
-    F: FnOnce(AgentMessage) -> Fut,
+    F: FnOnce(Vec<AgentMessage>) -> Fut,
     Fut: Future<Output = Result<(), CellaPortError>>,
 {
     // Snapshot the baseline *before* reading the file. Taken afterwards, a peer
@@ -517,17 +577,30 @@ where
         return;
     };
     let patch = cella_env::claude_code::diff_documents(st.doc, &baseline, &canonical);
-    if patch.as_object().is_some_and(serde_json::Map::is_empty) {
+    let announced = st.announced.load(Ordering::Relaxed);
+    if announced && patch.as_object().is_some_and(serde_json::Map::is_empty) {
         // Reformatted but semantically identical; nothing to send.
         *st.last_hash.lock().await = hash;
         return;
     }
-    let msg = AgentMessage::ConfigDocPatch {
-        doc: st.doc,
-        patch: patch.to_string(),
+    // An announce that could not read the file left this connection's daemon
+    // with nothing for this document, and it cannot seed from a delta — so the
+    // whole document goes with this edit rather than waiting for a reconnect.
+    let msgs: Vec<AgentMessage> = if announced {
+        vec![AgentMessage::ConfigDocPatch {
+            doc: st.doc,
+            patch: patch.to_string(),
+        }]
+    } else {
+        announce(st.doc, &canonical, &baseline)
+            .into_iter()
+            .collect()
     };
-    match send(msg).await {
-        Ok(()) => *st.last_hash.lock().await = hash,
+    match send(msgs).await {
+        Ok(()) => {
+            *st.last_hash.lock().await = hash;
+            st.announced.store(true, Ordering::Relaxed);
+        }
         Err(e) => warn!(
             "doc sync: failed to send {:?} change to daemon: {e}",
             st.doc
@@ -818,6 +891,158 @@ mod tests {
         );
     }
 
+    /// A (re)connect whose announce could not read the file leaves the daemon
+    /// holding nothing for this document — and it cannot seed from a delta. The
+    /// next edit therefore carries the whole document, and only once.
+    #[tokio::test]
+    async fn an_unannounced_document_is_forwarded_whole() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("known_marketplaces.json");
+        std::fs::write(&path, r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
+        let st = doc_state(
+            tmp.path(),
+            SyncDoc::KnownMarketplaces,
+            "known_marketplaces.json",
+            None,
+        );
+        // The baseline is the seed, as it would be after a create-time sync.
+        std::fs::write(
+            &path,
+            r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"2"}}"#,
+        )
+        .expect("local edit");
+        assert!(
+            !st.announced.load(Ordering::Relaxed),
+            "precondition: this connection's announce never went out"
+        );
+
+        let mut sent = Vec::new();
+        forward_change(&st, |msgs| {
+            sent = msgs;
+            async { Ok(()) }
+        })
+        .await;
+        let [
+            AgentMessage::ConfigDocSnapshot { content, .. },
+            AgentMessage::ConfigDocPatch { .. },
+        ] = sent.as_slice()
+        else {
+            panic!("expected the whole document and then the patch");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).expect("valid json"),
+            json!({"a":{"lastUpdated":"1"},"b":{"lastUpdated":"2"}}),
+            "the daemon must receive everything this container holds"
+        );
+
+        // It is announced now, so a further edit is a patch alone.
+        std::fs::write(
+            &path,
+            r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"3"}}"#,
+        )
+        .expect("second local edit");
+        let mut sent = Vec::new();
+        forward_change(&st, |msgs| {
+            sent = msgs;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(
+            matches!(sent.as_slice(), [AgentMessage::ConfigDocPatch { .. }]),
+            "the whole document is announced once per connection, not per edit"
+        );
+    }
+
+    /// A (re)connect announces the document twice over, and the two carry
+    /// different things: the snapshot is everything this container holds, the
+    /// patch only what moved since the baseline. A daemon that lost its state
+    /// has nothing to apply the patch to, which is why the snapshot goes first.
+    #[test]
+    fn a_reconnect_announces_the_whole_document_before_the_patch() {
+        let baseline = json!({"a":{"lastUpdated":"1"}});
+        let canonical = json!({"a":{"lastUpdated":"1"},"b":{"lastUpdated":"2"}});
+        let [first, second] = announce(SyncDoc::KnownMarketplaces, &canonical, &baseline);
+
+        let AgentMessage::ConfigDocSnapshot { content, .. } = first else {
+            panic!("the whole document must be announced first");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json"),
+            canonical,
+            "the snapshot is the whole document, not a delta"
+        );
+
+        let AgentMessage::ConfigDocPatch { patch, .. } = second else {
+            panic!("the patch must follow");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&patch).expect("valid json"),
+            json!({"b":{"lastUpdated":"2"}}),
+            "the patch stays a delta against the baseline"
+        );
+    }
+
+    /// Why the hub may only push a document it knows to be complete: a push is
+    /// applied *wholesale*, so any key canonical omits is deleted here. This
+    /// container holds `{a, b}` and edits `b`; the patch it sends carries `b`
+    /// alone, because a patch is a delta against the baseline. Feeding that
+    /// delta back as canonical — which is what a hub seeded from it would do —
+    /// destroys `a`.
+    #[tokio::test]
+    async fn a_push_is_applied_wholesale_so_a_partial_canonical_deletes_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("known_marketplaces.json");
+        std::fs::write(
+            &path,
+            r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"1"}}"#,
+        )
+        .expect("seed");
+        let st = doc_state(
+            tmp.path(),
+            SyncDoc::KnownMarketplaces,
+            "known_marketplaces.json",
+            None,
+        );
+        // The baseline is what the daemon last acknowledged; it survives a
+        // daemon restart, so a fresh hub knows less than this container assumes.
+        std::fs::write(
+            &path,
+            r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"2"}}"#,
+        )
+        .expect("local edit to b");
+
+        // This connection's announce landed, so the wire carries the patch alone.
+        st.announced.store(true, Ordering::Relaxed);
+        let mut sent = Vec::new();
+        forward_change(&st, |msgs| {
+            sent = msgs;
+            async { Ok(()) }
+        })
+        .await;
+        let [AgentMessage::ConfigDocPatch { patch, .. }] = sent.as_slice() else {
+            panic!("expected one patch");
+        };
+        let patch: serde_json::Value = serde_json::from_str(patch).expect("valid json");
+        assert_eq!(
+            patch,
+            json!({"b":{"lastUpdated":"2"}}),
+            "the wire carries a delta, not the document"
+        );
+
+        // What a hub with no host file makes of that delta: `{}` + patch.
+        let canonical = cella_env::claude_code::apply_merge_patch(&json!({}), &patch);
+        apply_canonical(&st, &canonical.to_string()).await;
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("written"))
+                .expect("valid json");
+        assert_eq!(
+            on_disk,
+            json!({"b":{"lastUpdated":"2"}}),
+            "the push replaced the document: `a` is gone"
+        );
+    }
+
     /// The daemon fans out after releasing its document lock, so a newer push
     /// can overtake an older one. Applying the older one last would record stale
     /// content as this container's baseline and hash, with nothing to repair it.
@@ -931,7 +1156,6 @@ mod tests {
     async fn forward_change_skips_unchanged_content() {
         // Content whose hash already matches is the agent's own daemon-applied
         // write; it must not be sent back, preventing an echo loop.
-        use std::sync::atomic::{AtomicBool, Ordering};
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(".claude.json"), r#"{"a":1}"#).expect("seed");
         let st = doc_state(tmp.path(), SyncDoc::ClaudeJson, ".claude.json", None);
@@ -956,7 +1180,6 @@ mod tests {
     /// document that would wipe canonical for every peer.
     #[tokio::test]
     async fn forward_change_skips_invalid_json() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(".claude.json"), "{not json").expect("seed");
         let st = doc_state(tmp.path(), SyncDoc::ClaudeJson, ".claude.json", None);

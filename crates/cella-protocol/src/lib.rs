@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version for the agent↔daemon handshake.
 ///
 /// Bumped to 2 when `ClaudeConfigChanged`/`SyncClaudeConfig` were replaced by
-/// the doc-tagged `ConfigDocPatch`/`SyncConfigDoc`. Without the bump a v1 agent
-/// would handshake successfully and then have its whole control connection —
-/// port forwarding, browser, clipboard — torn down by the first unknown
-/// message; with it, the mismatch is rejected cleanly at the handshake.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// the doc-tagged `ConfigDocPatch`/`SyncConfigDoc`, and to 3 when
+/// `ConfigDocSnapshot` was added. Without the bump an older peer would
+/// handshake successfully and then have its whole control connection — port
+/// forwarding, browser, clipboard — torn down by the first unknown message;
+/// with it, the mismatch is rejected cleanly at the handshake.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Absolute path of the Wayland clipboard socket served by the in-container agent.
 ///
@@ -212,6 +213,18 @@ pub enum AgentMessage {
     /// last successfully-synced baseline. A patch rather than the full document so
     /// a container holding a stale copy cannot assert it over a peer's newer state.
     ConfigDocPatch { doc: SyncDoc, patch: String },
+    /// The container's whole `doc`, in canonical form, offered at every
+    /// (re)connect as a seed.
+    ///
+    /// A patch is a delta against a baseline the *container* persists, so it
+    /// outlives the daemon: a daemon that comes up with no readable host file
+    /// knows less than every container's baseline claims, and the fragments it
+    /// would receive are not a document it may push — an agent applies a push
+    /// wholesale. This message is the one thing on the wire known to be
+    /// complete, so it is what such a hub seeds from. A daemon that did load
+    /// the host file ignores it, because a reconnecting container must not be
+    /// able to re-assert its whole document over a peer's newer state.
+    ConfigDocSnapshot { doc: SyncDoc, content: String },
 
     // -- Worktree operations (in-container CLI → daemon) --------------------
     /// Request to create a worktree-backed branch and its container.
@@ -1549,6 +1562,21 @@ mod tests {
         let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
         assert!(
             matches!(decoded, AgentMessage::ConfigDocPatch { doc, .. } if doc == SyncDoc::KnownMarketplaces)
+        );
+    }
+
+    #[test]
+    fn config_doc_snapshot_roundtrip() {
+        let msg = AgentMessage::ConfigDocSnapshot {
+            doc: SyncDoc::KnownMarketplaces,
+            content: r#"{"m":{"lastUpdated":"2026-08-04T07:08:16.499Z"}}"#.to_string(),
+        };
+        let encoded = serde_json::to_string(&msg).expect("encode");
+        assert!(encoded.contains("\"type\":\"config_doc_snapshot\""));
+        assert!(encoded.contains("\"doc\":\"known_marketplaces\""));
+        let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
+        assert!(
+            matches!(decoded, AgentMessage::ConfigDocSnapshot { doc, .. } if doc == SyncDoc::KnownMarketplaces)
         );
     }
 
