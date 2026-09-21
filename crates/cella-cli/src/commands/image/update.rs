@@ -165,9 +165,10 @@ impl UpdateArgs {
 
         // An alias line names no runtime, so which one it points at can only
         // be learned from the registry. Probed only when the image actually
-        // publishes runtime-ful lines beside it: 1-4 requests, or none.
+        // publishes runtime-ful lines beside it, and only when the registry
+        // answered: 1-4 requests, or none.
         let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
-            Some(probe) => {
+            Some(probe) if probe_is_worthwhile(fetched.source) => {
                 // The tag list is fetched under the normalized reference, so
                 // the resolver must use it too — `org/image` shorthand would
                 // otherwise parse `org` as a registry and every probe fail.
@@ -176,7 +177,7 @@ impl UpdateArgs {
                     cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
                 candidates::resolve_alias_runtime(&resolver, &probe).await
             }
-            None => None,
+            _ => None,
         };
 
         let computed = candidates::compute(&fetched.tags, &tag, alias_runtime.as_deref());
@@ -378,6 +379,17 @@ impl UpdateArgs {
 
         found.version_bump.clone()
     }
+}
+
+/// Whether the alias probe is worth attempting.
+///
+/// A stale cache is served only after the registry refused the tag list, so
+/// the digest fetch the probe opens with would just spend the registry
+/// timeout to fail the same way. Skipping it costs nothing the run does not
+/// already lose: an unresolved alias degrades to same-shape offers and says
+/// so through [`Limitation::UnresolvedAlias`], exactly as a failed probe does.
+const fn probe_is_worthwhile(source: TagSource) -> bool {
+    !matches!(source, TagSource::StaleCache)
 }
 
 /// How many not-yet-given flags a move still needs.
@@ -824,6 +836,19 @@ mod tests {
         let err = unknown_tag_error("9.9.9-trixie", &found);
         assert!(err.contains("9.9.9-trixie"));
         assert!(err.contains("2.0.14-1-trixie"), "got: {err}");
+    }
+
+    /// Regression: the stale-cache branch only printed a warning, and the
+    /// alias probe then went to the registry that had just been established
+    /// as unreachable — a round trip that can only end in the timeout.
+    #[test]
+    fn a_stale_cache_skips_the_alias_probe() {
+        assert!(!probe_is_worthwhile(TagSource::StaleCache));
+        assert!(probe_is_worthwhile(TagSource::Registry));
+        assert!(
+            probe_is_worthwhile(TagSource::Cache),
+            "a live cache entry says nothing about the registry being down"
+        );
     }
 
     #[test]
