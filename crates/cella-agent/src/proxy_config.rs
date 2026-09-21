@@ -4,13 +4,13 @@
 //! and builds the rule matcher for request evaluation.
 
 use std::collections::HashSet;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 use cella_network::rules::RuleMatcher;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 /// A credential-protected domain route.
 #[derive(Debug, Clone)]
@@ -97,10 +97,10 @@ impl AgentProxyConfig {
         // Open log file.
         let log_file = open_log_file(raw.log_path.as_deref());
 
-        let ca_cert_der = raw.ca_cert_pem.as_deref().and_then(|pem| {
-            let mut reader = BufReader::new(pem.as_bytes());
-            rustls_pemfile::certs(&mut reader).find_map(Result::ok)
-        });
+        let ca_cert_der = raw
+            .ca_cert_pem
+            .as_deref()
+            .and_then(|pem| CertificateDer::pem_slice_iter(pem.as_bytes()).find_map(Result::ok));
 
         let credential_routes = raw
             .credential_routes
@@ -293,6 +293,72 @@ mod tests {
         let config = AgentProxyConfig::from_json(&json).unwrap();
         assert_eq!(config.ca_cert_pem.as_deref(), Some("CERT_PEM"));
         assert_eq!(config.ca_key_pem.as_deref(), Some("KEY_PEM"));
+        // Not actually PEM, so nothing is decoded into the DER slot.
+        assert!(config.ca_cert_der.is_none());
+    }
+
+    #[test]
+    fn from_json_decodes_ca_cert_der() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = cella_network::ca::ca_certificate_params()
+            .self_signed(&key)
+            .unwrap();
+
+        let json = serde_json::json!({
+            "listen_port": 8080,
+            "mode": "denylist",
+            "rules": [],
+            "ca_cert_pem": cert.pem(),
+        })
+        .to_string();
+
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.ca_cert_der.as_deref(), Some(cert.der().as_ref()));
+    }
+
+    #[test]
+    fn from_json_skips_non_certificate_pem_sections() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = cella_network::ca::ca_certificate_params()
+            .self_signed(&key)
+            .unwrap();
+        // The private key block comes first; the certificate must still be found.
+        let bundle = format!("{}{}", key.serialize_pem(), cert.pem());
+
+        let json = serde_json::json!({
+            "listen_port": 8080,
+            "mode": "denylist",
+            "rules": [],
+            "ca_cert_pem": bundle,
+        })
+        .to_string();
+
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.ca_cert_der.as_deref(), Some(cert.der().as_ref()));
+    }
+
+    #[test]
+    fn from_json_recovers_from_a_malformed_certificate_block() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = cella_network::ca::ca_certificate_params()
+            .self_signed(&key)
+            .unwrap();
+        // A certificate section that fails to decode must be skipped, not fused on.
+        let bundle = format!(
+            "-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n{}",
+            cert.pem()
+        );
+
+        let json = serde_json::json!({
+            "listen_port": 8080,
+            "mode": "denylist",
+            "rules": [],
+            "ca_cert_pem": bundle,
+        })
+        .to_string();
+
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.ca_cert_der.as_deref(), Some(cert.der().as_ref()));
     }
 
     #[test]
