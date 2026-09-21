@@ -1,6 +1,6 @@
 {
   "name": "cella",
-  "image": "mcr.microsoft.com/devcontainers/rust:2.0.14-trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:2.1.1-trixie",
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {
       "extensions": "github/gh-stack",
