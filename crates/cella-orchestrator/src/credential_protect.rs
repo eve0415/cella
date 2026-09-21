@@ -76,7 +76,7 @@ fn build_entry(provider: &MergedProvider, phantom_token: String) -> PhantomToken
 }
 
 fn has_env_var(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| !v.is_empty())
+    std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
 /// Register phantom tokens with the daemon via management socket.
