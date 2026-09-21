@@ -344,12 +344,16 @@ impl ProxyForwardingConfig {
     /// `skip_rules` drops user-configured rules (the caller's rule policy);
     /// `credentials_protect` is the `credentials.protect` setting.
     pub fn resolve(
-        net_config: cella_network::config::NetworkConfig,
+        mut net_config: cella_network::config::NetworkConfig,
         skip_rules: bool,
         credentials_protect: bool,
         managed_agent: bool,
     ) -> Self {
-        let has_rules = net_config.has_rules() && !skip_rules;
+        if skip_rules {
+            net_config.rules.clear();
+            net_config.mode = cella_network::config::NetworkMode::Denylist;
+        }
+        let has_rules = net_config.has_rules();
         let credentials_protect = credentials_protect && managed_agent;
         let needs_proxy = (has_rules || credentials_protect) && managed_agent;
 
@@ -680,6 +684,32 @@ mod tests {
         assert!(
             protected.has_blocking_rules,
             "skip_rules must not disable credential protection"
+        );
+    }
+
+    #[test]
+    fn resolve_removes_explicitly_skipped_rules_from_credential_proxy_config() {
+        let net_config = cella_network::config::NetworkConfig {
+            mode: cella_network::config::NetworkMode::Allowlist,
+            rules: vec![cella_network::config::NetworkRule {
+                domain: "allowed.example.com".to_string(),
+                paths: vec![],
+                action: cella_network::config::RuleAction::Allow,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = ProxyForwardingConfig::resolve(net_config, true, true, true);
+        let agent_config = resolved
+            .full_config
+            .expect("credential protection still requires an agent proxy config");
+
+        assert!(resolved.has_blocking_rules);
+        assert!(agent_config.rules.is_empty());
+        assert_eq!(
+            agent_config.mode,
+            cella_network::config::NetworkMode::Denylist,
+            "denylist with no rules permits unmatched traffic"
         );
     }
 
