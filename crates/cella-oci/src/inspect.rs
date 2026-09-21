@@ -93,11 +93,11 @@ pub async fn fetch_manifest_with_digest(
 /// last tag name from the previous page as the `last` parameter on the next
 /// call.
 ///
-/// Some registries (e.g. GHCR) return `{"tags": null}` on the final page
-/// instead of an empty array, which causes `oci_client`'s
-/// `TagResponse { tags: Vec<String> }` to produce a deserialization error.
-/// We avoid triggering that path by stopping as soon as a page returns fewer
-/// tags than [`TAG_PAGE_SIZE`] — a partial page always means end-of-list.
+/// We stop as soon as a page returns fewer tags than [`TAG_PAGE_SIZE`],
+/// because a partial page always means end-of-list. Some registries (e.g.
+/// GHCR) answer the final page with `{"tags": null}` rather than an empty
+/// array; oci-client 0.18 deserializes that into an empty list, so it arrives
+/// here as an ordinary final page rather than an error.
 ///
 /// # Errors
 ///
@@ -191,9 +191,8 @@ enum PagePlan {
 /// Registries end a listing in three different ways, and only the first is the
 /// one the spec describes:
 ///
-/// - **Short page** — the normal end. Stopping here also avoids a follow-up
-///   request that would trip the `{"tags": null}` deserialization bug some
-///   registries (including GHCR) hit on the final page.
+/// - **Short page** — the normal end, and the only one the spec describes.
+///   It also saves a follow-up request that would return nothing.
 /// - **Over-full page** — the registry ignored `?n=` and answered with the
 ///   whole list. MCR does this: `devcontainers/rust` returns all 408 tags
 ///   however small an `n` you ask for.
