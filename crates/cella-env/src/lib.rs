@@ -35,11 +35,13 @@ pub use platform::DockerRuntime;
 /// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
 
-/// In-container path of the combined CA bundle (host CAs + MITM CA).
+/// In-container path of the combined CA bundle (host CAs + MITM CA +
+/// `network.proxy.ca_cert`).
 ///
 /// Pointed to by `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and
-/// `REQUESTS_CA_BUNDLE` so that TLS clients inside the container trust
-/// both the host's CAs and cella's MITM CA.
+/// `REQUESTS_CA_BUNDLE` so that TLS clients ignoring the system trust store
+/// still trust the host's CAs, cella's MITM CA, and any configured
+/// corporate CA.
 pub const CA_BUNDLE_PATH: &str = "/tmp/.cella/ca-bundle.pem";
 
 /// A bind mount to add to the container at creation time.
@@ -362,12 +364,13 @@ impl ProxyForwardingConfig {
 /// Inject MITM CA trust into the container.
 ///
 /// Adds the MITM CA cert to the system trust store (distro-appropriate path)
-/// and uploads a combined PEM bundle (host CAs + MITM CA) that application-level
-/// env vars point to.
+/// and uploads a combined PEM bundle (host CAs + MITM CA + the configured
+/// `network.proxy.ca_cert`) that application-level env vars point to.
 fn inject_mitm_ca_trust(
     fwd: &mut EnvForwarding,
     distro: &ca_bundle::ContainerDistro,
     mitm_cert_pem: &str,
+    additional_ca_path: Option<&str>,
 ) {
     // System trust store: upload MITM CA cert.
     let mitm_path = distro.ca_cert_path("cella-mitm-ca.crt");
@@ -389,7 +392,7 @@ fn inject_mitm_ca_trust(
 
     // Application-level: combined CA bundle for runtimes that ignore the
     // system trust store (Node.js, Python requests, Go, curl).
-    let combined = ca_bundle::build_combined_ca_bundle(mitm_cert_pem);
+    let combined = ca_bundle::build_combined_ca_bundle(mitm_cert_pem, additional_ca_path);
     fwd.post_start.file_uploads.push(FileUpload {
         container_path: CA_BUNDLE_PATH.to_string(),
         content: combined.into_bytes(),
@@ -471,7 +474,7 @@ pub fn prepare_env_forwarding(
         // If MITM TLS interception is needed (path-level blocking or
         // credential protection), inject the MITM CA into the system trust
         // store and set application-level env vars pointing to a combined
-        // CA bundle (host CAs + MITM CA).
+        // CA bundle (host CAs + MITM CA + the configured CA).
         let has_path_rules = net_config
             .full_config
             .as_ref()
@@ -479,7 +482,7 @@ pub fn prepare_env_forwarding(
         let needs_mitm = has_path_rules || net_config.credentials_protect;
 
         if needs_mitm && let Ok(ca) = cella_network::ca::ensure_ca() {
-            inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem);
+            inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem, additional_ca);
         }
     }
 
@@ -686,6 +689,7 @@ mod tests {
             &mut fwd,
             &distro,
             "-----BEGIN CERTIFICATE-----\nMITM\n-----END CERTIFICATE-----\n",
+            None,
         );
 
         // System trust store upload.
@@ -741,7 +745,7 @@ mod tests {
         let mut fwd = EnvForwarding::default();
         let distro = ca_bundle::ContainerDistro::Debian;
         let mitm_pem = "-----BEGIN CERTIFICATE-----\nTEST_MITM_CA\n-----END CERTIFICATE-----\n";
-        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem);
+        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem, None);
 
         let bundle_upload = fwd
             .post_start
@@ -758,10 +762,45 @@ mod tests {
     }
 
     #[test]
+    fn inject_mitm_ca_trust_combined_bundle_contains_configured_ca() {
+        use std::io::Write;
+
+        let mut corp = tempfile::NamedTempFile::new().expect("temp file");
+        write!(
+            corp,
+            "-----BEGIN CERTIFICATE-----\nCORP_CA\n-----END CERTIFICATE-----\n"
+        )
+        .expect("write corp CA");
+
+        let mut fwd = EnvForwarding::default();
+        let distro = ca_bundle::ContainerDistro::Debian;
+        let mitm_pem = "-----BEGIN CERTIFICATE-----\nTEST_MITM_CA\n-----END CERTIFICATE-----\n";
+        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem, corp.path().to_str());
+
+        let bundle_upload = fwd
+            .post_start
+            .file_uploads
+            .iter()
+            .find(|u| u.container_path == CA_BUNDLE_PATH)
+            .expect("combined bundle upload should exist");
+
+        let content = String::from_utf8(bundle_upload.content.clone()).unwrap();
+        assert!(
+            content.contains("TEST_MITM_CA"),
+            "combined bundle should contain the MITM CA PEM"
+        );
+        assert!(
+            content.contains("CORP_CA"),
+            "combined bundle should contain network.proxy.ca_cert, or runtimes that \
+             ignore the system trust store never see it"
+        );
+    }
+
+    #[test]
     fn inject_mitm_ca_trust_unknown_distro_uploads_both_paths() {
         let mut fwd = EnvForwarding::default();
         let distro = ca_bundle::ContainerDistro::Unknown;
-        inject_mitm_ca_trust(&mut fwd, &distro, "CERT");
+        inject_mitm_ca_trust(&mut fwd, &distro, "CERT", None);
 
         let mitm_count = fwd
             .post_start
