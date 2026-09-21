@@ -34,7 +34,12 @@ Implements the environment-related portions of the [Dev Container specification]
 ### Key Function
 
 ```rust
-pub fn prepare_env_forwarding(config: &Value, remote_user: &str) -> EnvForwarding
+pub fn prepare_env_forwarding(
+    config: &Value,
+    remote_user: &str,
+    workspace_folder: &Path,
+    network: Option<&ProxyForwardingConfig>,
+) -> EnvForwarding
 ```
 
 This is the main entry point. It detects the runtime, probes the host environment, and assembles the complete forwarding configuration.

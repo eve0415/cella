@@ -28,7 +28,7 @@ Full-workspace equivalents (`--workspace`) take minutes; run per-crate while ite
 - Unit tests colocate in source (`#[cfg(test)] mod tests`), not separate directories.
 - Integration tests use `#[runtime_test]` from `cella-testing`; they compile always and skip when the runtime is unavailable.
 - Add a regression test with every bug fix, and unit tests with new code.
-- `cargo-insta` is often absent in dev containers. `cargo test` still checks snapshot correctness; do not claim `cargo insta` ran if it is not installed.
+- The dev container installs `cargo-insta` via `postCreateCommand`, so run the snapshot gate. Never claim `cargo insta` ran without running it.
 
 ## Commits
 

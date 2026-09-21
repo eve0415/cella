@@ -1392,7 +1392,7 @@ mod tests {
         );
     }
 
-    /// Absent rc file: nothing is created,    /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
+    /// Absent rc file: nothing is created, nothing is printed, exit 0. Such a
     /// container gets no PATH block either, so `cella` is not on PATH there.
     #[test]
     fn injection_skips_a_missing_profile() {
