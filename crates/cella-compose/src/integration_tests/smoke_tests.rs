@@ -27,6 +27,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
         feature_entrypoints: Vec::new(),
+        agent_proxy_startup: crate::override_file::AgentProxyStartup::Immediate,
         user_entrypoint: Vec::new(),
         user_command: None,
         build_only: false,

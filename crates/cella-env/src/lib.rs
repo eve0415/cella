@@ -34,6 +34,8 @@ pub use platform::DockerRuntime;
 /// so it must not live in an image layer or env var) and read by `cella-agent`
 /// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
+/// Marker written after the agent proxy has successfully bound its listen port.
+pub const AGENT_PROXY_READY_PATH: &str = "/tmp/.cella/proxy-ready";
 
 /// In-container path of the combined CA bundle (host CAs + MITM CA +
 /// `network.proxy.ca_cert`).

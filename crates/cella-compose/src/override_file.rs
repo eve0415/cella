@@ -24,6 +24,15 @@ pub struct ComposeSecret {
     pub environment: Option<String>,
 }
 
+/// Whether the compose service entrypoint waits for the agent proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProxyStartup {
+    /// Preserve the service's normal startup timing.
+    Immediate,
+    /// Wait until the agent confirms that its forward proxy is listening.
+    WaitUntilReady,
+}
+
 /// Configuration for generating the override compose file.
 pub struct OverrideConfig {
     /// The primary service name (must match a service in the user's compose file).
@@ -86,6 +95,8 @@ pub struct OverrideConfig {
     /// `exec`d. Empty (with `override_command == false`) emits no entrypoint block
     /// at all, preserving the current override byte-for-byte.
     pub feature_entrypoints: Vec<String>,
+    /// Whether to hold the service entrypoint until the agent proxy is listening.
+    pub agent_proxy_startup: AgentProxyStartup,
     /// The resolved `userEntrypoint` for the wrapped entrypoint, per the official
     /// compose logic: `overrideCommand ? [] : (service.entrypoint || image
     /// entrypoint($-escaped))`. Emitted as JSON-quoted array elements after the
@@ -234,8 +245,21 @@ fn yaml_flow_scalar(value: &str) -> String {
 ///
 /// Deliberately contains NO agent restart loop: on the compose path the agent is
 /// launched separately via `nohup` after `up` (see `compose_up::launch_agent_exec`).
-fn build_wrapped_entrypoint_script(feature_entrypoints: &[String]) -> String {
+fn build_wrapped_entrypoint_script(
+    feature_entrypoints: &[String],
+    wait_for_agent_proxy: bool,
+) -> String {
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
+    if wait_for_agent_proxy {
+        let ready_path = cella_env::AGENT_PROXY_READY_PATH;
+        let _ = writeln!(
+            script,
+            "wait_file=/tmp/.cella-proxy-wait-$$$$\n\
+             : > \"$$wait_file\"\n\
+             while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do sleep 1; done\n\
+             rm -f \"$$wait_file\""
+        );
+    }
     for ep in feature_entrypoints {
         script.push_str(ep);
         script.push('\n');
@@ -256,11 +280,17 @@ fn build_wrapped_entrypoint_script(feature_entrypoints: &[String]) -> String {
 ///   sets `None` when it equals the compose-declared command, matching the
 ///   official `userCommand !== composeCommand` gate).
 fn write_entrypoint_section(yaml: &mut String, config: &OverrideConfig) {
-    if config.feature_entrypoints.is_empty() && !config.override_command {
+    if config.feature_entrypoints.is_empty()
+        && !config.override_command
+        && config.agent_proxy_startup == AgentProxyStartup::Immediate
+    {
         return;
     }
 
-    let script = build_wrapped_entrypoint_script(&config.feature_entrypoints);
+    let script = build_wrapped_entrypoint_script(
+        &config.feature_entrypoints,
+        config.agent_proxy_startup == AgentProxyStartup::WaitUntilReady,
+    );
 
     let mut elements = vec![
         yaml_flow_scalar("/bin/sh"),
@@ -538,6 +568,7 @@ mod tests {
             request_gpu: false,
             security: MergedSecurityConfig::default(),
             feature_entrypoints: Vec::new(),
+            agent_proxy_startup: AgentProxyStartup::Immediate,
             user_entrypoint: Vec::new(),
             user_command: None,
             build_only: false,
@@ -1396,6 +1427,31 @@ mod tests {
         assert!(!yaml.contains("while true"), "yaml:\n{yaml}");
         // No `command:` when user_command is None (compose command applies).
         assert!(!yaml.contains("command:"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn agent_proxy_is_ready_before_compose_entrypoint_runs() {
+        let mut config = base_config();
+        config.agent_proxy_startup = AgentProxyStartup::WaitUntilReady;
+        config.feature_entrypoints = vec!["install-feature".to_string()];
+        config.user_entrypoint = vec!["start-service".to_string()];
+
+        let yaml = generate_override_yaml(&config);
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("proxy-wait override must be valid YAML");
+        let entrypoint = parsed["services"]["app"]["entrypoint"]
+            .as_sequence()
+            .expect("entrypoint is a sequence");
+        let script = entrypoint[2].as_str().expect("script element is a string");
+        let wait = script.find(cella_env::AGENT_PROXY_READY_PATH).unwrap();
+        let feature = script.find("install-feature").unwrap();
+        let service = script.find("exec \"$$@\"").unwrap();
+
+        assert!(wait < feature, "feature setup ran before proxy readiness");
+        assert!(
+            wait < service,
+            "service entrypoint ran before proxy readiness"
+        );
     }
 
     #[test]
