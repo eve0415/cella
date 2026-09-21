@@ -5,7 +5,6 @@
 
 use oci_client::Reference;
 use oci_client::client::{ClientConfig, ClientProtocol};
-use oci_client::errors::OciDistributionError;
 use tracing::debug;
 
 use crate::build_registry_auth;
@@ -94,11 +93,11 @@ pub async fn fetch_manifest_with_digest(
 /// last tag name from the previous page as the `last` parameter on the next
 /// call.
 ///
-/// Some registries (e.g. GHCR) return `{"tags": null}` on the final page
-/// instead of an empty array, which causes `oci_client`'s
-/// `TagResponse { tags: Vec<String> }` to produce a deserialization error.
-/// We avoid triggering that path by stopping as soon as a page returns fewer
-/// tags than [`TAG_PAGE_SIZE`] — a partial page always means end-of-list.
+/// We stop as soon as a page returns fewer tags than [`TAG_PAGE_SIZE`],
+/// because a partial page always means end-of-list. Some registries (e.g.
+/// GHCR) answer the final page with `{"tags": null}` rather than an empty
+/// array; oci-client 0.18 deserializes that into an empty list, so it arrives
+/// here as an ordinary final page rather than an error.
 ///
 /// # Errors
 ///
@@ -118,23 +117,15 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
     let mut last: Option<String> = None;
 
     loop {
-        let response = match client
+        // Every failure propagates, including a malformed page. oci-client
+        // 0.18 turns GHCR's `{"tags": null}` final page into an empty list,
+        // so the one case that used to need swallowing no longer reaches
+        // here, and a silent break would now truncate a listing on a
+        // transient page-2 failure and look like a complete result.
+        let response = client
             .list_tags(&oci_ref, &auth, Some(TAG_PAGE_SIZE), last.as_deref())
             .await
-        {
-            Ok(response) => response,
-            // A follow-up page can fail on registries that answer the final
-            // page with `{"tags": null}` (e.g. GHCR when the previous page was
-            // exactly full): the null body fails JSON deserialization. Treat
-            // *only* that case as end-of-list. Network/auth/registry errors
-            // must propagate — otherwise a transient failure on page 2+ would
-            // silently truncate the listing and look like a complete result.
-            Err(OciDistributionError::JsonError(_)) if !all_tags.is_empty() => {
-                debug!("treating null-tags deserialization on follow-up page as end-of-list");
-                break;
-            }
-            Err(e) => return Err(crate::TagListError::new(reference, &e).into()),
-        };
+            .map_err(|e| crate::TagListError::new(reference, &e))?;
 
         let next_last = response.tags.last().cloned();
         let plan = plan_page(response.tags.len(), last.as_deref(), next_last.as_deref());
@@ -200,9 +191,8 @@ enum PagePlan {
 /// Registries end a listing in three different ways, and only the first is the
 /// one the spec describes:
 ///
-/// - **Short page** — the normal end. Stopping here also avoids a follow-up
-///   request that would trip the `{"tags": null}` deserialization bug some
-///   registries (including GHCR) hit on the final page.
+/// - **Short page** — the normal end, and the only one the spec describes.
+///   It also saves a follow-up request that would return nothing.
 /// - **Over-full page** — the registry ignored `?n=` and answered with the
 ///   whole list. MCR does this: `devcontainers/rust` returns all 408 tags
 ///   however small an `n` you ask for.

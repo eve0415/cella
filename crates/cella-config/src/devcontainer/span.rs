@@ -66,7 +66,7 @@ impl SourceText {
         // Skip past the last key and colon to find the value
         let pos = skip_past_colon(bytes, pos)?;
         let value_start = skip_whitespace(bytes, pos);
-        let value_end = find_value_end(bytes, value_start)?;
+        let value_end = skip_value(bytes, value_start)?;
 
         Some(Range {
             offset: value_start,
@@ -134,7 +134,7 @@ fn find_key_in_object(bytes: &[u8], mut pos: usize, key: &str) -> Option<usize> 
     }
 }
 
-fn skip_whitespace(bytes: &[u8], mut pos: usize) -> usize {
+const fn skip_whitespace(bytes: &[u8], mut pos: usize) -> usize {
     while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
         pos += 1;
     }
@@ -152,7 +152,7 @@ fn skip_past_colon(bytes: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-fn skip_string(bytes: &[u8], mut pos: usize) -> Option<usize> {
+const fn skip_string(bytes: &[u8], mut pos: usize) -> Option<usize> {
     if pos >= bytes.len() || bytes[pos] != b'"' {
         return None;
     }
@@ -179,7 +179,7 @@ fn read_json_string(bytes: &[u8], pos: usize) -> Option<String> {
     std::str::from_utf8(content).ok().map(String::from)
 }
 
-fn segment_byte_len(bytes: &[u8], pos: usize) -> usize {
+const fn segment_byte_len(bytes: &[u8], pos: usize) -> usize {
     let mut i = pos;
     while i < bytes.len() && bytes[i] != b'"' {
         if bytes[i] == b'\\' {
@@ -191,7 +191,7 @@ fn segment_byte_len(bytes: &[u8], pos: usize) -> usize {
     i - pos
 }
 
-fn skip_value(bytes: &[u8], mut pos: usize) -> Option<usize> {
+const fn skip_value(bytes: &[u8], mut pos: usize) -> Option<usize> {
     pos = skip_whitespace(bytes, pos);
     if pos >= bytes.len() {
         return None;
@@ -225,7 +225,7 @@ fn skip_value(bytes: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-fn skip_balanced(bytes: &[u8], mut pos: usize, open: u8, close: u8) -> Option<usize> {
+const fn skip_balanced(bytes: &[u8], mut pos: usize, open: u8, close: u8) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
 
@@ -251,10 +251,6 @@ fn skip_balanced(bytes: &[u8], mut pos: usize, open: u8, close: u8) -> Option<us
         pos += 1;
     }
     None
-}
-
-fn find_value_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    skip_value(bytes, pos)
 }
 
 #[cfg(test)]
