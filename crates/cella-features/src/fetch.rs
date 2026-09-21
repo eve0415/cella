@@ -156,13 +156,12 @@ impl FeatureFetcher for HttpFetcher {
 /// original path is returned directly.
 pub struct LocalFetcher;
 
-impl FeatureFetcher for LocalFetcher {
-    async fn fetch(
-        &self,
-        reference: &NormalizedRef,
-        _platform: &Platform,
-        _cache: &FeatureCache,
-    ) -> Result<PathBuf, FeatureError> {
+impl LocalFetcher {
+    /// Validate the local target and return its path.
+    ///
+    /// Split out because none of these checks await -- the trait impl below
+    /// only has to hand the result back as a ready future.
+    fn validate(reference: &NormalizedRef) -> Result<PathBuf, FeatureError> {
         let NormalizedRef::LocalTarget { absolute_path } = reference else {
             return Err(FeatureError::InvalidReference {
                 reference: reference.to_string(),
@@ -192,6 +191,17 @@ impl FeatureFetcher for LocalFetcher {
     }
 }
 
+impl FeatureFetcher for LocalFetcher {
+    fn fetch(
+        &self,
+        reference: &NormalizedRef,
+        _platform: &Platform,
+        _cache: &FeatureCache,
+    ) -> impl Future<Output = Result<PathBuf, FeatureError>> + Send {
+        std::future::ready(Self::validate(reference))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock fetcher (test support)
 // ---------------------------------------------------------------------------
@@ -208,20 +218,19 @@ pub struct MockFetcher {
 
 #[cfg(test)]
 impl FeatureFetcher for MockFetcher {
-    async fn fetch(
+    fn fetch(
         &self,
         reference: &NormalizedRef,
         _platform: &Platform,
         _cache: &FeatureCache,
-    ) -> Result<PathBuf, FeatureError> {
+    ) -> impl Future<Output = Result<PathBuf, FeatureError>> + Send {
         let key = reference.to_string();
-        self.responses
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| FeatureError::FetchFailed {
+        std::future::ready(self.responses.get(&key).cloned().ok_or_else(|| {
+            FeatureError::FetchFailed {
                 url: key,
                 message: "no mock response configured for this reference".to_owned(),
-            })
+            }
+        }))
     }
 }
 
