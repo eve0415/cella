@@ -5,7 +5,6 @@
 
 use oci_client::Reference;
 use oci_client::client::{ClientConfig, ClientProtocol};
-use oci_client::errors::OciDistributionError;
 use tracing::debug;
 
 use crate::build_registry_auth;
@@ -118,24 +117,15 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
     let mut last: Option<String> = None;
 
     loop {
-        let response = match client
+        // Every failure propagates, including a malformed page. oci-client
+        // 0.18 turns GHCR's `{"tags": null}` final page into an empty list,
+        // so the one case that used to need swallowing no longer reaches
+        // here, and a silent break would now truncate a listing on a
+        // transient page-2 failure and look like a complete result.
+        let response = client
             .list_tags(&oci_ref, &auth, Some(TAG_PAGE_SIZE), last.as_deref())
             .await
-        {
-            Ok(response) => response,
-            // oci-client 0.18 deserializes a `{"tags": null}` page (GHCR
-            // sends one when the previous page was exactly full) into an
-            // empty list, so that case no longer surfaces here. This arm
-            // remains for any other malformed follow-up page. Network, auth
-            // and registry errors must still propagate — otherwise a
-            // transient failure on page 2+ would silently truncate the
-            // listing and look like a complete result.
-            Err(OciDistributionError::JsonError(_)) if !all_tags.is_empty() => {
-                debug!("treating null-tags deserialization on follow-up page as end-of-list");
-                break;
-            }
-            Err(e) => return Err(crate::TagListError::new(reference, &e).into()),
-        };
+            .map_err(|e| crate::TagListError::new(reference, &e))?;
 
         let next_last = response.tags.last().cloned();
         let plan = plan_page(response.tags.len(), last.as_deref(), next_last.as_deref());
