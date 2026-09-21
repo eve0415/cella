@@ -218,6 +218,9 @@ impl UpdateArgs {
             .choose(&found, &fetched.tags)
             .map_err(boxed_err_to_report)?
         else {
+            if let Some(report) = self.decline_report(&reference, &found)? {
+                println!("{report}");
+            }
             return Ok(());
         };
 
@@ -252,6 +255,35 @@ impl UpdateArgs {
     fn reports_only(&self, found: &Candidates) -> bool {
         let applying = self.to.is_some() || (self.apply.yes && !found.is_empty());
         matches!(self.output.resolve(), OutputFormat::Json) && !applying
+    }
+
+    /// The report stdout is still owed when nothing was applied.
+    ///
+    /// `--yes` that finds candidates but no allowed move has already named
+    /// the missing flag on stderr; stdout has said nothing at all, and a
+    /// consumer parsing it cannot tell that from "nothing to do". Rendering
+    /// the same report `--check` would have produced keeps the two apart —
+    /// the applied run carries an `applied` key, this one carries `moves`.
+    ///
+    /// The exit status stays 0 either way: a move withheld for want of
+    /// consent is a report, not a failure, and every other stopping point in
+    /// this command that is not a real error exits 0 too.
+    ///
+    /// `None` outside JSON, where the candidate table and the blocked-move
+    /// advice have already gone to stderr.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report cannot be serialized.
+    fn decline_report(
+        &self,
+        reference: &str,
+        found: &Candidates,
+    ) -> miette::Result<Option<String>> {
+        if !matches!(self.output.resolve(), OutputFormat::Json) {
+            return Ok(None);
+        }
+        render_json(reference, found).map(Some)
     }
 
     /// Whether an unrankable current tag ends the run.
@@ -725,6 +757,58 @@ mod tests {
             ])
             .reports_only(&bump),
             "--to already applied under json and must keep doing so"
+        );
+    }
+
+    /// Regression: `--yes --output json` over a pin that is current on its
+    /// own tag line, with the only move blocked for want of a consent flag,
+    /// printed nothing to stdout and exited 0. A consumer could not tell
+    /// that from "nothing to offer".
+    #[test]
+    fn a_blocked_yes_still_reports_on_stdout() {
+        let found = Candidates {
+            current: "3.0.5-noble".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![candidates::VariantMove {
+                tag: "3.0.5-ubuntu26.04".to_owned(),
+                from: "noble".to_owned(),
+                to: "ubuntu26.04".to_owned(),
+                axes: AxisSet::RELEASE,
+            }],
+            limitation: None,
+        };
+
+        let args = parse_update(&["cella", "image", "update", "--yes", "--output", "json"]);
+        assert!(
+            !args.reports_only(&found),
+            "precondition: --yes falls past the report-only return"
+        );
+        assert_eq!(
+            args.auto_choice(&found),
+            None,
+            "precondition: the only move needs --allow-os-change"
+        );
+
+        let report = args
+            .decline_report("mcr.microsoft.com/devcontainers/base", &found)
+            .unwrap()
+            .expect("a blocked run must still print the candidates");
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(value["image"]["current"], "3.0.5-noble");
+        assert_eq!(value["image"]["moves"][0]["tag"], "3.0.5-ubuntu26.04");
+        assert_eq!(
+            value["image"]["applied"],
+            serde_json::Value::Null,
+            "nothing was applied, so the applied key must stay absent"
+        );
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"])
+                .decline_report("mcr.microsoft.com/devcontainers/base", &found)
+                .unwrap(),
+            None,
+            "the text path already said this on stderr"
         );
     }
 
