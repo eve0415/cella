@@ -295,6 +295,15 @@ pub async fn on_agent_change(
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
         let patch_changed = merged != st.canonical;
         st.canonical = merged;
+        // A container that put content into canonical is a valid source, so the
+        // hub may speak from here on. The criterion is the *result*, not "the
+        // patch was non-empty": a reannounce carries `{}` and a pure deletion
+        // carries only nulls, and neither leaves anything behind worth pushing.
+        // Seeding here, inside the transaction, is what keeps the host write and
+        // the broadcast in agreement — `write_host` below is unconditional on
+        // `seeded`, so a hub that wrote this patch to disk but stayed muted
+        // would leave the host holding content no container was ever told about.
+        st.seeded |= st.canonical.as_object().is_some_and(|o| !o.is_empty());
         host_changed || patch_changed
     })
     .await
@@ -923,6 +932,111 @@ mod tests {
 
         assert!(state.lock().await.seeded);
         assert!(agent.try_recv().is_ok(), "a seeded hub pushes again");
+    }
+
+    /// The hub also seeds from the other direction: with no host file at all, a
+    /// container's non-empty patch is a valid source. The host write and the
+    /// push have to agree — a hub that writes the patch to disk but stays muted
+    /// leaves the host holding content no container is ever told about.
+    #[tokio::test]
+    async fn a_patch_seeds_an_empty_hub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        // No host file at all.
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        assert!(!state.lock().await.seeded, "precondition");
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = register_agent(&handles, "cella-a");
+
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            r#"{"a":{"lastUpdated":"1"}}"#,
+            "cella-a",
+        )
+        .await;
+
+        assert!(state.lock().await.seeded, "a non-empty patch is a source");
+
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&host).expect("host file written"))
+                .expect("valid json");
+        assert_eq!(on_disk["a"]["lastUpdated"], json!("1"));
+
+        let DaemonMessage::SyncConfigDoc { content, .. } = agent
+            .try_recv()
+            .expect("the container that seeded the hub must be told what the host now holds")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["a"]["lastUpdated"],
+            json!("1")
+        );
+    }
+
+    /// Two containers against a host that has no manifest. While the hub cannot
+    /// seed from a patch, each container's content is written to the host file
+    /// and neither container is told, so they stay isolated for the life of the
+    /// daemon.
+    #[tokio::test]
+    async fn a_second_container_learns_what_the_first_seeded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("known_marketplaces.json");
+        // No host file at all.
+        let state = Arc::new(Mutex::new(DocSyncState::load(
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+        )));
+        let handles: Handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = register_agent(&handles, "cella-a");
+        let mut b = register_agent(&handles, "cella-b");
+
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            r#"{"from-a":{"lastUpdated":"1"}}"#,
+            "cella-a",
+        )
+        .await;
+
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            b.try_recv().expect("B must be told about A's content")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("valid json")["from-a"]["lastUpdated"],
+            json!("1")
+        );
+
+        on_agent_change(
+            &state,
+            &handles,
+            Some(&host),
+            SyncDoc::KnownMarketplaces,
+            r#"{"from-b":{"lastUpdated":"2"}}"#,
+            "cella-b",
+        )
+        .await;
+
+        // A's first message is the echo of its own patch; the second carries B.
+        a.try_recv().expect("A's own echo");
+        let DaemonMessage::SyncConfigDoc { content, .. } =
+            a.try_recv().expect("A must be told about B's content")
+        else {
+            panic!("expected SyncConfigDoc");
+        };
+        let merged = serde_json::from_str::<serde_json::Value>(&content).expect("valid json");
+        assert_eq!(merged["from-a"]["lastUpdated"], json!("1"));
+        assert_eq!(merged["from-b"]["lastUpdated"], json!("2"));
     }
 
     /// Revisions must advance with each canonical state so an agent can drop a
