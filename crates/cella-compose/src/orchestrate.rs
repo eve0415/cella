@@ -2042,20 +2042,13 @@ pub fn build_proxy_forwarding_config(
 ) -> Option<cella_env::ProxyForwardingConfig> {
     let settings = cella_config::CellaConfig::load(&resolved.workspace_root, Some(resolved))
         .unwrap_or_default();
-    let net_config = settings.network.to_network_config();
-    let has_rules = net_config.has_rules() && !skip_rules;
 
-    Some(cella_env::ProxyForwardingConfig {
-        proxy: net_config.proxy.clone(),
-        has_blocking_rules: has_rules && managed_agent,
-        full_config: if has_rules && managed_agent {
-            Some(net_config)
-        } else {
-            None
-        },
-        container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-        credentials_protect: settings.credentials.protect && managed_agent,
-    })
+    Some(cella_env::ProxyForwardingConfig::resolve(
+        settings.network.to_network_config(),
+        skip_rules,
+        settings.credentials.protect,
+        managed_agent,
+    ))
 }
 
 #[cfg(test)]

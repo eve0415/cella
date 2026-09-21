@@ -1581,17 +1581,14 @@ impl EnsureUpContext<'_> {
     ) -> cella_env::EnvForwarding {
         let net_config = settings.network.to_network_config();
         let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
-        let has_rules = net_config.has_rules() && !skip_rules;
 
         let managed_agent = self.client.capabilities().managed_agent;
-        let needs_proxy = (has_rules || settings.credentials.protect) && managed_agent;
-        let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
-            proxy: net_config.proxy.clone(),
-            has_blocking_rules: needs_proxy,
-            full_config: if needs_proxy { Some(net_config) } else { None },
-            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-            credentials_protect: settings.credentials.protect && managed_agent,
-        });
+        let proxy_fwd = Some(cella_env::ProxyForwardingConfig::resolve(
+            net_config,
+            skip_rules,
+            settings.credentials.protect,
+            managed_agent,
+        ));
         let mut env_fwd = cella_env::prepare_env_forwarding(
             config,
             remote_user,

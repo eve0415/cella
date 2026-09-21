@@ -329,6 +329,36 @@ pub struct ProxyForwardingConfig {
     pub credentials_protect: bool,
 }
 
+impl ProxyForwardingConfig {
+    /// Derive proxy forwarding from resolved network settings.
+    ///
+    /// Proxy blocking rules need the agent-side proxy, and credential
+    /// protection needs the same proxy to rewrite the traffic it protects, so
+    /// either one on its own is enough to route through it — and neither is
+    /// possible on a backend that never provisions an agent.
+    ///
+    /// `skip_rules` drops user-configured rules (the caller's rule policy);
+    /// `credentials_protect` is the `credentials.protect` setting.
+    pub fn resolve(
+        net_config: cella_network::config::NetworkConfig,
+        skip_rules: bool,
+        credentials_protect: bool,
+        managed_agent: bool,
+    ) -> Self {
+        let has_rules = net_config.has_rules() && !skip_rules;
+        let credentials_protect = credentials_protect && managed_agent;
+        let needs_proxy = (has_rules || credentials_protect) && managed_agent;
+
+        Self {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: needs_proxy,
+            full_config: if needs_proxy { Some(net_config) } else { None },
+            container_distro: ca_bundle::ContainerDistro::Unknown,
+            credentials_protect,
+        }
+    }
+}
+
 /// Inject MITM CA trust into the container.
 ///
 /// Adds the MITM CA cert to the system trust store (distro-appropriate path)
@@ -579,6 +609,73 @@ mod tests {
         assert!(pfc.full_config.is_some());
         assert_eq!(pfc.container_distro, ca_bundle::ContainerDistro::Debian);
         assert!(!pfc.credentials_protect);
+    }
+
+    #[test]
+    fn resolve_routes_through_proxy_for_credentials_protect_without_rules() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        assert!(
+            !net_config.has_rules(),
+            "precondition: no user-configured rules"
+        );
+
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, true);
+
+        assert!(
+            pfc.has_blocking_rules,
+            "credentials.protect alone must route traffic through the agent proxy"
+        );
+        assert!(
+            pfc.full_config.is_some(),
+            "the agent needs the network config to run the proxy"
+        );
+        assert!(pfc.credentials_protect);
+    }
+
+    #[test]
+    fn resolve_skips_proxy_without_managed_agent() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, false);
+
+        assert!(
+            !pfc.has_blocking_rules,
+            "no managed agent means no proxy to route through"
+        );
+        assert!(pfc.full_config.is_none());
+        assert!(!pfc.credentials_protect);
+    }
+
+    #[test]
+    fn resolve_skips_proxy_when_nothing_is_requested() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, false, true);
+
+        assert!(!pfc.has_blocking_rules);
+        assert!(pfc.full_config.is_none());
+    }
+
+    #[test]
+    fn resolve_honours_skip_rules_but_not_for_credentials_protect() {
+        let net_config = cella_network::config::NetworkConfig {
+            rules: vec![cella_network::config::NetworkRule {
+                domain: "example.com".to_string(),
+                paths: vec![],
+                action: cella_network::config::RuleAction::Block,
+            }],
+            ..Default::default()
+        };
+
+        let skipped = ProxyForwardingConfig::resolve(net_config.clone(), true, false, true);
+        assert!(
+            !skipped.has_blocking_rules,
+            "skip_rules must drop user-configured rules"
+        );
+
+        let protected = ProxyForwardingConfig::resolve(net_config, true, true, true);
+        assert!(
+            protected.has_blocking_rules,
+            "skip_rules must not disable credential protection"
+        );
     }
 
     #[test]
