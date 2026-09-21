@@ -2,15 +2,15 @@
   "name": "cella",
   "image": "mcr.microsoft.com/devcontainers/rust:2.1.1-trixie",
   "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {
+    "ghcr.io/devcontainers/features/github-cli:1.1.2": {
       "extensions": "github/gh-stack",
       "installDirectlyFromGitHubRelease": true,
       "version": "latest"
     },
-    "ghcr.io/devcontainers/features/node:2": {
-      "version": "lts",
+    "ghcr.io/devcontainers/features/node:2.1.0": {
+      "nvmVersion": "latest",
       "pnpmVersion": "none",
-      "nvmVersion": "latest"
+      "version": "lts"
     }
   },
   "postCreateCommand": "cargo install cargo-insta"
