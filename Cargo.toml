@@ -61,8 +61,8 @@ tokio = { version = "=1.53.1", features = [
 # Serialization
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-yaml_serde = "=0.10.4"
-toml = "=1.1.4"
+yaml_serde = "=0.10.7"
+toml = "=1.1.6"
 
 # Encoding
 base64 = "=0.23.1"
@@ -75,8 +75,8 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "=4.6.6", features = ["derive"] }
-clap_complete = "=4.6.9"
+clap = { version = "=4.6.7", features = ["derive"] }
+clap_complete = "=4.6.11"
 
 # Interactive prompts
 inquire = "=0.9.4"
@@ -85,7 +85,7 @@ inquire = "=0.9.4"
 miette = { version = "=7.6.0", features = ["fancy"] }
 
 # Docker client
-bollard = "=0.21.0"
+bollard = "=0.21.1"
 
 # Hashing
 sha2 = "=0.11.0"
@@ -98,7 +98,7 @@ bytes = "=1.12.1"
 
 # Terminal
 crossterm = { version = "=0.29.0", default-features = false }
-owo-colors = "=4.3.0"
+owo-colors = "=4.4.0"
 terminal_size = "=0.4.4"
 
 # Progress display
@@ -111,7 +111,7 @@ chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 tar = "=0.4.46"
 
 # HTTP client
-reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "stream"] }
 
 # Filesystem
 dirs = "=6.0.0"
@@ -119,7 +119,7 @@ dirs = "=6.0.0"
 # Compression
 # zlib-rs backend: pure Rust (no C toolchain), ~1.26x faster inflate than the
 # default miniz_oxide on realistic payloads. See benches/extract.rs.
-flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] }
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 
 # OCI registry
 # Renamed successor of oci-distribution (oras-project/rust-oci-client).
@@ -138,20 +138,20 @@ semver = "=1.0.28"
 glob = "=0.3.4"
 
 # JSONC editing
-jsonc-parser = { version = "=0.33.1", features = ["cst"] }
+jsonc-parser = { version = "=0.33.2", features = ["cst"] }
 
 # Certificate management
-rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
-rustls = { version = "=0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-native-certs = "=0.8.4"
 rustls-pemfile = "=2.2.0"
-tokio-rustls = "=0.26.4"
+tokio-rustls = "=0.26.5"
 tokio-stream = "=0.1.19"
 
 # HTTP proxy (MITM relay)
-hyper = { version = "=1.11.0", features = ["server", "client", "http1", "http2"] }
+hyper = { version = "=1.11.1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
-http-body-util = "=0.1.4"
+http-body-util = "=0.1.5"
 
 # File watching
 notify = "=8.2.0"
@@ -163,12 +163,12 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal", "te
 portable-pty = "=0.9.0"
 
 # Proc macros
-syn = { version = "=3.0.3", features = ["full"] }
+syn = { version = "=3.0.6", features = ["full"] }
 quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.24.0", features = ["v4"] }
+uuid = { version = "=1.26.1", features = ["v4"] }
 
 # Credential cache memory safety
 zeroize = "=1.9.0"
@@ -178,7 +178,7 @@ zeroize = "=1.9.0"
 # is opt-in, so nothing here adds a C dependency to the static agent binary.
 wayland-server = "=0.31.14"
 # epoll for the server loop; already in the tree via wayland-backend.
-rustix = { version = "=1.1.4", features = ["event"] }
+rustix = { version = "=1.1.5", features = ["event"] }
 wayland-protocols = "=0.32.13"
 wayland-protocols-wlr = "=0.3.12"
 
@@ -192,7 +192,7 @@ wl-clipboard-rs = "=0.9.3"
 arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
 filetime = "=0.2.29"
 insta = { version = "=1.48.0", features = ["json", "yaml", "redactions"] }
-trybuild = "=1.0.120"
+trybuild = "=1.0.121"
 divan = "=0.1.21"
 
 # Internal crates
