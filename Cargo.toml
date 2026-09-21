@@ -114,7 +114,7 @@ tar = "=0.4.46"
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "stream"] }
 
 # Filesystem
-dirs = "=6.0.0"
+dirs = "=7.0.0"
 
 # Compression
 # zlib-rs backend: pure Rust (no C toolchain), ~1.26x faster inflate than the
