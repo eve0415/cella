@@ -1708,6 +1708,18 @@ fn command_v_probe(binary: &str) -> String {
     format!("printf '%s' '{PROBE_MARKER}'; command -v {binary}; printf '%s' '{PROBE_MARKER}'")
 }
 
+/// Resolve only an executable file, past aliases and shell functions.
+///
+/// The selected login shell may be fish, so it only launches `sh` with a
+/// quoted script. The script itself uses POSIX syntax supported by sh, dash,
+/// bash and `BusyBox`, and inherits the login shell's effective `PATH`.
+fn executable_path_probe(binary: &str) -> String {
+    let escaped_binary = binary.replace('\'', "'\\''");
+    format!(
+        "printf '%s' '{PROBE_MARKER}'; command sh -c 'unalias \"$1\" 2>/dev/null; unset -f \"$1\" 2>/dev/null; command -v \"$1\"' sh '{escaped_binary}'; printf '%s' '{PROBE_MARKER}'"
+    )
+}
+
 /// What one probe answered.
 enum ProbeAnswer {
     /// An absolute path, usable both as an answer and as a symlink source.
@@ -1761,6 +1773,70 @@ fn resolved_executable_path(stdout: &str) -> Option<String> {
     line.starts_with('/').then(|| line.to_string())
 }
 
+async fn run_command_probe(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    shell: &str,
+    login_arg: &str,
+    command: String,
+    env: Option<Vec<String>>,
+) -> Result<ProbeAnswer, BackendError> {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![shell.to_string(), login_arg.to_string(), command],
+                user: Some(user.to_string()),
+                env,
+                working_dir: None,
+            },
+        )
+        .await
+        .map(|result| classify_probe(&result))
+}
+
+/// Probe one login mode, retrying non-path answers without aliases or
+/// functions before deciding that the answer cannot name an executable.
+async fn resolve_login_probe(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    shell: &str,
+    login_arg: &str,
+    binary: &str,
+    env: Option<Vec<String>>,
+) -> Result<ProbeAnswer, BackendError> {
+    let answer = run_command_probe(
+        client,
+        container_id,
+        user,
+        shell,
+        login_arg,
+        command_v_probe(binary),
+        env.clone(),
+    )
+    .await?;
+    let ProbeAnswer::Unresolved(original) = answer else {
+        return Ok(answer);
+    };
+
+    match run_command_probe(
+        client,
+        container_id,
+        user,
+        shell,
+        login_arg,
+        executable_path_probe(binary),
+        env,
+    )
+    .await?
+    {
+        ProbeAnswer::Path(path) => Ok(ProbeAnswer::Path(path)),
+        ProbeAnswer::NotFound | ProbeAnswer::Unresolved(_) => Ok(ProbeAnswer::Unresolved(original)),
+    }
+}
+
 /// Check whether `binary` is callable by a login shell, mirroring the exact
 /// wrapping `cella exec` uses at `crates/cella-cli/src/commands/exec.rs`.
 ///
@@ -1776,48 +1852,43 @@ pub async fn verify_tool_callable(
     probed_env: Option<&ProbedEnv>,
 ) -> VerifyOutcome {
     let env = tool_exec_env(probed_env);
-    let cmd_str = command_v_probe(binary);
 
     // 1. Login-shell probe — matches cella exec's `<shell> -lc ...` wrap.
-    let lc_result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![shell.to_string(), "-lc".to_string(), cmd_str.clone()],
-                user: Some(user.to_string()),
-                env: env.clone(),
-                working_dir: None,
-            },
-        )
-        .await;
-    match lc_result {
-        Ok(r) => match classify_probe(&r) {
-            ProbeAnswer::Path(path) => return VerifyOutcome::Reachable(path),
-            ProbeAnswer::Unresolved(answer) => return VerifyOutcome::Unresolved(answer),
-            ProbeAnswer::NotFound => {}
-        },
+    let unresolved = match Box::pin(resolve_login_probe(
+        client,
+        container_id,
+        user,
+        shell,
+        "-lc",
+        binary,
+        env.clone(),
+    ))
+    .await
+    {
+        Ok(ProbeAnswer::Path(path)) => return VerifyOutcome::Reachable(path),
+        Ok(ProbeAnswer::Unresolved(answer)) => Some(answer),
+        Ok(ProbeAnswer::NotFound) => None,
         Err(e) => return VerifyOutcome::ProbeError(e.to_string()),
-    }
+    };
 
     // 2. Login+interactive fallback — catches installers that only touched
     //    `.bashrc` / `.zshrc`, which `-lc` does not source.
-    let lic_result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![shell.to_string(), "-lic".to_string(), cmd_str],
-                user: Some(user.to_string()),
-                env,
-                working_dir: None,
-            },
-        )
-        .await;
-    match lic_result {
-        Ok(r) => match classify_probe(&r) {
-            ProbeAnswer::Path(path) => VerifyOutcome::InstalledElsewhere(path),
-            ProbeAnswer::Unresolved(answer) => VerifyOutcome::Unresolved(answer),
-            ProbeAnswer::NotFound => VerifyOutcome::NotInstalled,
-        },
+    match Box::pin(resolve_login_probe(
+        client,
+        container_id,
+        user,
+        shell,
+        "-lic",
+        binary,
+        env,
+    ))
+    .await
+    {
+        Ok(ProbeAnswer::Path(path)) => VerifyOutcome::InstalledElsewhere(path),
+        Ok(ProbeAnswer::Unresolved(answer)) => VerifyOutcome::Unresolved(answer),
+        Ok(ProbeAnswer::NotFound) => {
+            unresolved.map_or(VerifyOutcome::NotInstalled, VerifyOutcome::Unresolved)
+        }
         Err(e) => VerifyOutcome::ProbeError(e.to_string()),
     }
 }
@@ -4402,7 +4473,8 @@ exit 1
     //
     // Call sequence:
     //   1. `<shell> -lc "command -v <binary>"` (must match cella exec wrap)
-    //   2. `<shell> -lic "command -v <binary>"` (only if 1 exited non-zero)
+    //   2. an alias/function-bypassing `-lc` probe if 1 answers a non-path
+    //   3. the same pair under `-lic` if no executable was found under `-lc`
 
     fn ok_stdout(code: i64, stdout: &str) -> ExecResult {
         ExecResult {
@@ -4509,12 +4581,21 @@ exit 1
     /// command substitution, `$?` and operators fish spells differently.
     #[test]
     fn command_v_probe_brackets_the_answer_without_shell_specific_syntax() {
-        let cmd = command_v_probe("claude");
-        assert!(cmd.contains("command -v claude"), "{cmd}");
-        assert_eq!(cmd.matches(PROBE_MARKER).count(), 2, "{cmd}");
-        for forbidden in ["$(", "$?", "=$"] {
-            assert!(!cmd.contains(forbidden), "{forbidden} in {cmd}");
+        let commands = [command_v_probe("claude"), executable_path_probe("claude")];
+        for command in commands {
+            assert_eq!(command.matches(PROBE_MARKER).count(), 2, "{command}");
+            for forbidden in ["$(", "$?", "="] {
+                assert!(!command.contains(forbidden), "{forbidden} in {command}");
+            }
         }
+    }
+
+    #[test]
+    fn executable_path_probe_uses_a_clean_posix_shell() {
+        assert_eq!(
+            executable_path_probe("claude"),
+            "printf '%s' '__cella_command_v__'; command sh -c 'unalias \"$1\" 2>/dev/null; unset -f \"$1\" 2>/dev/null; command -v \"$1\"' sh 'claude'; printf '%s' '__cella_command_v__'"
+        );
     }
 
     /// With the markers in place the exit status belongs to the closing
@@ -4579,15 +4660,16 @@ exit 1
         );
     }
 
-    /// An rc file that aliases the tool makes `command -v` answer with the
-    /// alias definition. That text is not a path and must not become a
-    /// symlink target.
+    /// An interactive rc file can put both an alias and the real executable
+    /// on PATH. `cella exec` quotes the command name and therefore runs the
+    /// executable, so verification must resolve past the alias too.
     #[tokio::test]
-    async fn verify_tool_callable_rejects_an_alias_from_the_interactive_probe() {
+    async fn verify_tool_callable_resolves_an_executable_behind_an_interactive_alias() {
         let alias = "alias claude='/opt/wrapper/claude --dangerously-skip-permissions'";
         let backend = MockBackend::new(vec![
             Ok(ok_exit(1)), // -lc: not found
             Ok(ok_stdout(0, &bracketed(alias))),
+            Ok(ok_stdout(0, &bracketed("/home/vscode/.local/bin/claude"))),
         ]);
         let outcome = verify_tool_callable(
             &backend,
@@ -4598,12 +4680,19 @@ exit 1
             None,
         )
         .await;
-        assert_eq!(outcome, VerifyOutcome::Unresolved(alias.to_string()));
+        assert_eq!(
+            outcome,
+            VerifyOutcome::InstalledElsewhere("/home/vscode/.local/bin/claude".to_string())
+        );
     }
 
     #[tokio::test]
     async fn verify_tool_callable_rejects_a_shell_function_from_the_login_probe() {
-        let backend = MockBackend::new(vec![Ok(ok_stdout(0, &bracketed("claude")))]);
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, &bracketed("claude"))),
+            Ok(ok_stdout(0, &bracketed(""))),
+            Ok(ok_stdout(0, &bracketed(""))),
+        ]);
         let outcome = verify_tool_callable(
             &backend,
             "test-container",
@@ -4616,6 +4705,59 @@ exit 1
         assert_eq!(outcome, VerifyOutcome::Unresolved("claude".to_string()));
     }
 
+    #[tokio::test]
+    async fn verified_install_step_succeeds_with_an_executable_behind_an_alias() {
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
+
+        let alias = "alias claude='/opt/wrapper/claude'";
+        let executable = "/home/vscode/.local/bin/claude";
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)),
+            Ok(ok_stdout(0, &bracketed(alias))),
+            Ok(ok_stdout(0, &bracketed(executable))),
+            Ok(ok_exit(0)),
+            Ok(ok_exit(0)),
+            Ok(ok_stdout(0, &bracketed("/usr/local/bin/claude"))),
+        ]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+            fallback_bin_dir: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Claude Code");
+
+        let succeeded = verified_install_step(&ctx, "claude", Some(ok_exit(0)), step).await;
+        phase.finish();
+
+        assert!(succeeded);
+        backend.assert_all_responses_consumed();
+        let calls = backend.calls();
+        assert_eq!(
+            calls[2].cmd,
+            vec![
+                "/bin/bash".to_string(),
+                "-lic".to_string(),
+                executable_path_probe("claude")
+            ]
+        );
+        let link = calls
+            .iter()
+            .find_map(|call| call.cmd.iter().find(|part| part.contains("ln -sfn")))
+            .expect("the executable found behind the alias should be linked");
+        assert!(link.contains(executable), "{link}");
+        assert!(!link.contains(alias), "{link}");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, ProgressEvent::PhaseChildCompleted { .. }))
+        );
+    }
+
     /// Regression: the alias text used to be handed to `ln -sfn` as the
     /// symlink source, leaving a broken `/usr/local/bin/<tool>` behind.
     #[tokio::test]
@@ -4626,6 +4768,7 @@ exit 1
         let backend = MockBackend::new(vec![
             Ok(ok_exit(1)), // -lc: not found
             Ok(ok_stdout(0, &bracketed(alias))),
+            Ok(ok_stdout(0, &bracketed(""))),
         ]);
         let ctx = InstallCtx {
             client: &backend,
