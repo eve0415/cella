@@ -142,10 +142,11 @@ pub fn read_daemon_connection_info(
 ) -> Option<cella_env::proxy::DaemonConnectionInfo> {
     let data_dir = cella_env::paths::cella_data_dir()?;
     // The control file deliberately outlives the daemon so the port can be
-    // reclaimed, which means its contents are only trustworthy while a daemon
-    // is actually listening. Without this, a failed start would hand the
-    // container a port the OS may since have given to something else, along
-    // with the daemon's auth token.
+    // reclaimed, so its contents are only worth trusting while a daemon is
+    // listening. A graceful stop removes this socket; a daemon killed outright
+    // leaves it behind, so this does not prove liveness on its own. Callers
+    // reach here through `ensure_cella_daemon`, which does check the process
+    // and clears a stale pair before anything reads this.
     if !data_dir.join("daemon.sock").exists() {
         return None;
     }

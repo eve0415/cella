@@ -3064,10 +3064,11 @@ async fn wait_for_proxy_ready(port: u16) {
             tokio::spawn(async move {
                 if forward_dropped_connection(stream).await {
                     warn!(
-                        "Port {port} accepts connections and then drops them, so this host \
-                         cannot reach the container behind that forward. A page opened against \
-                         it will not load, and a single-use login code sent through it will be \
-                         spent for nothing."
+                        "Port {port} accepted a connection and closed it without sending \
+                         anything, so a page opened against it will not load and a single-use \
+                         login code sent through it will be spent for nothing. Run \
+                         `cella doctor` to see whether the container is unreachable or the \
+                         service behind the forward is simply not running yet."
                     );
                 }
             });
@@ -3081,9 +3082,10 @@ async fn wait_for_proxy_ready(port: u16) {
 /// Whether a just-accepted forward closed without delivering anything.
 ///
 /// Reaching end-of-stream means the proxy accepted and then shut the socket
-/// down, which is what it does when its dial into the container fails. A
-/// timeout means the connection is still open, which is what a working forward
-/// to a service awaiting a request looks like.
+/// down, which is what it does whenever its upstream dial fails — whether the
+/// container is unreachable or nothing is listening yet, which this cannot
+/// tell apart. A timeout means the connection is still open, which is what a
+/// working forward to a service awaiting a request looks like.
 async fn forward_dropped_connection(mut stream: tokio::net::TcpStream) -> bool {
     use tokio::io::AsyncReadExt;
 

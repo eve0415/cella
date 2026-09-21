@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
@@ -448,10 +448,10 @@ fn warn_if_control_port_moved(preferred_port: u16, listener: &tokio::net::TcpLis
     if actual == preferred_port {
         return;
     }
-    error!(
-        "Control port moved from {preferred_port} to {actual}: containers started earlier still \
-         point at {preferred_port} and cannot reconnect. Run `cella up` in each affected \
-         workspace to refresh them."
+    warn!(
+        "Control port moved from {preferred_port} to {actual}. Any container started before this \
+         daemon still points at {preferred_port} and cannot reconnect; run `cella up` in those \
+         workspaces to refresh them. Nothing is stranded if none are running."
     );
 }
 
