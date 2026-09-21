@@ -71,7 +71,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -82,7 +82,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "arboard",
  "base64 0.23.1",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "cella-backend"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-env",
  "cella-features",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "heck",
  "indexmap",
@@ -454,11 +454,11 @@ dependencies = [
 
 [[package]]
 name = "cella-completion"
-version = "0.9.2"
+version = "0.9.3"
 
 [[package]]
 name = "cella-compose"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-codegen",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "cella-container"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-testing",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "base64 0.23.1",
  "cella-daemon-client",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon-client"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-env",
  "cella-protocol",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "bollard",
  "cella-backend",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-network",
  "cella-protocol",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "cella-filesync"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "hex",
  "notify",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "hex",
  "insta",
@@ -668,14 +668,14 @@ dependencies = [
 
 [[package]]
 name = "cella-jsonc"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cella-network"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "base64 0.23.1",
  "divan",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "cella-oci"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "base64 0.23.1",
  "cella-testing",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "cella-orchestrator"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-protocol",
  "miette",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "cella-protocol"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "regex",
  "serde",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "cella-proxy"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "futures-util",
  "hex",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "cella-templates"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "cella-test-macros"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "cella-testing"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "bollard",
  "cella-test-macros",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "cella-tool-install"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "cella-wayland"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "arboard",
  "cella-protocol",
@@ -1255,7 +1255,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1350,7 +1350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2083,7 +2083,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2444,7 +2444,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2657,7 +2657,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2921,7 +2921,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3128,7 +3128,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3186,7 +3186,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3478,7 +3478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3618,7 +3618,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3637,7 +3637,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4364,7 +4364,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
