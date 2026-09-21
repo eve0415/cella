@@ -63,15 +63,16 @@ pub async fn check_containers(ctx: &CheckContext, daemon_running: bool) -> Vec<C
     };
 
     if ctx.all {
-        check_all_containers(client.as_ref(), deadline).await
+        check_all_containers(client.as_ref(), deadline, needs_daemon).await
     } else {
-        check_workspace_container(ctx, client.as_ref(), deadline).await
+        check_workspace_container(ctx, client.as_ref(), deadline, needs_daemon).await
     }
 }
 
 async fn check_all_containers(
     client: &dyn ContainerBackend,
     deadline: std::time::Instant,
+    needs_daemon: bool,
 ) -> Vec<CategoryReport> {
     match client.list_cella_containers(true).await {
         Ok(containers) if containers.is_empty() => {
@@ -93,7 +94,8 @@ async fn check_all_containers(
             // Both arms are bounded by what is left of the budget, so neither
             // can hold the category past the point where its results are lost.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let (mut probes, collected) = tokio::join!(probe_containers(ids, remaining), async {
+            let probe_all = probe_containers(ids, remaining, needs_daemon);
+            let (mut probes, collected) = tokio::join!(probe_all, async {
                 let mut collected: Vec<Vec<CheckResult>> = Vec::new();
                 for container in &containers {
                     if std::time::Instant::now() >= deadline {
@@ -159,6 +161,7 @@ async fn check_workspace_container(
     ctx: &CheckContext,
     client: &dyn ContainerBackend,
     deadline: std::time::Instant,
+    needs_daemon: bool,
 ) -> Vec<CategoryReport> {
     let Some(ref workspace) = ctx.workspace_folder else {
         return vec![CategoryReport::new(
@@ -197,7 +200,7 @@ async fn check_workspace_container(
 
             let (checks, probe) = tokio::join!(
                 tokio::time::timeout(remaining, check_single_container(client, &container.id)),
-                check_host_can_reach_container(&container.id, remaining)
+                check_host_can_reach_container(&container.id, remaining, needs_daemon)
             );
             let mut checks = checks.unwrap_or_else(|_| {
                 vec![CheckResult {
@@ -434,6 +437,7 @@ async fn check_credentials(
 async fn check_host_can_reach_container(
     container_id: &str,
     budget: std::time::Duration,
+    needs_daemon: bool,
 ) -> Option<CheckResult> {
     let mgmt_socket = cella_env::paths::daemon_socket_path()?;
     let client = cella_daemon_client::DaemonClient::new(mgmt_socket);
@@ -441,13 +445,47 @@ async fn check_host_can_reach_container(
     let Ok(answer) = tokio::time::timeout(budget, client.probe_container(container_id)).await
     else {
         return Some(CheckResult {
-            name: "container reachable from host".into(),
+            name: REACHABILITY_CHECK.into(),
             severity: Severity::Warning,
             detail: "the daemon did not answer a reachability probe in time".into(),
             fix_hint: Some("Check the daemon with `cella daemon status`".into()),
         });
     };
-    let result = answer.ok()?;
+
+    Some(grade_probe_answer(
+        answer.map_err(|e| e.to_string()),
+        needs_daemon,
+    ))
+}
+
+/// The name every reachability result is reported under.
+const REACHABILITY_CHECK: &str = "container reachable from host";
+
+/// Turn a probe answer into the check it reports.
+///
+/// A client error is a probe that did not run rather than a finding: an
+/// unreachable container arrives as `Unreachable`. What it is worth depends on
+/// the backend — one without a managed agent has no daemon to answer, and the
+/// container category runs for it whether the daemon is up or not, so the same
+/// error is only informational there.
+fn grade_probe_answer(
+    answer: Result<ContainerProbeResult, String>,
+    needs_daemon: bool,
+) -> CheckResult {
+    let result = match answer {
+        Ok(result) => result,
+        Err(error) if needs_daemon => {
+            return CheckResult {
+                name: REACHABILITY_CHECK.into(),
+                severity: Severity::Warning,
+                detail: format!("the daemon did not answer a reachability probe: {error}"),
+                fix_hint: Some("Check the daemon with `cella daemon status`".into()),
+            };
+        }
+        Err(error) => ContainerProbeResult::Unknown {
+            reason: format!("reachability was not checked: {error}"),
+        },
+    };
 
     let (severity, detail, fix_hint) = match result {
         ContainerProbeResult::Reachable { detail } => (Severity::Pass, detail, None),
@@ -464,12 +502,12 @@ async fn check_host_can_reach_container(
         | ContainerProbeResult::Unknown { reason } => (Severity::Info, reason, None),
     };
 
-    Some(CheckResult {
-        name: "container reachable from host".into(),
+    CheckResult {
+        name: REACHABILITY_CHECK.into(),
         severity,
         detail,
         fix_hint,
-    })
+    }
 }
 
 /// Probe every container at once.
@@ -482,6 +520,7 @@ async fn check_host_can_reach_container(
 async fn probe_containers(
     container_ids: Vec<String>,
     budget: std::time::Duration,
+    needs_daemon: bool,
 ) -> HashMap<String, CheckResult> {
     // Bounding each probe rather than the set means one container going quiet
     // costs its own result, not everyone else's.
@@ -489,7 +528,7 @@ async fn probe_containers(
     let mut probes = tokio::task::JoinSet::new();
     for id in container_ids {
         probes.spawn(async move {
-            let check = check_host_can_reach_container(&id, per_probe).await;
+            let check = check_host_can_reach_container(&id, per_probe, needs_daemon).await;
             (id, check)
         });
     }
@@ -627,6 +666,53 @@ mod tests {
         let ctx = ctx_no_docker(None);
         let reports = check_containers(&ctx, true).await;
         assert!(reports[0].checks[0].fix_hint.is_none());
+    }
+
+    // ── Reachability probe grading ─────────────────────────────────────────
+
+    #[test]
+    fn a_client_error_is_reported_when_a_daemon_is_expected() {
+        let check = grade_probe_answer(Err("connection refused".to_string()), true);
+        assert_eq!(check.name, REACHABILITY_CHECK);
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(check.detail.contains("connection refused"), "{check:?}");
+        assert!(check.fix_hint.is_some());
+    }
+
+    /// An unmanaged backend (e.g. Apple Container) reaches the probe with the
+    /// daemon legitimately absent, so the same client error is not a warning.
+    #[test]
+    fn a_client_error_is_informational_without_a_managed_agent() {
+        let check = grade_probe_answer(Err("connection refused".to_string()), false);
+        assert_eq!(check.severity, Severity::Info);
+        assert!(check.detail.contains("connection refused"), "{check:?}");
+        assert!(check.fix_hint.is_none());
+    }
+
+    #[test]
+    fn an_unreachable_container_is_an_error_on_every_backend() {
+        for needs_daemon in [true, false] {
+            let check = grade_probe_answer(
+                Ok(ContainerProbeResult::Unreachable {
+                    error: "no route to host".to_string(),
+                }),
+                needs_daemon,
+            );
+            assert_eq!(check.severity, Severity::Error);
+            assert!(check.detail.contains("no route to host"), "{check:?}");
+        }
+    }
+
+    #[test]
+    fn a_reachable_container_passes() {
+        let check = grade_probe_answer(
+            Ok(ContainerProbeResult::Reachable {
+                detail: "172.17.0.2:22 answered".to_string(),
+            }),
+            true,
+        );
+        assert_eq!(check.severity, Severity::Pass);
+        assert_eq!(check.detail, "172.17.0.2:22 answered");
     }
 
     #[tokio::test]
