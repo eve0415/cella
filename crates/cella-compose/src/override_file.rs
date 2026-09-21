@@ -252,11 +252,21 @@ fn build_wrapped_entrypoint_script(
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
     if wait_for_agent_proxy {
         let ready_path = cella_env::AGENT_PROXY_READY_PATH;
+        let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
         let _ = writeln!(
             script,
             "wait_file=/tmp/.cella-proxy-wait-$$$$\n\
              : > \"$$wait_file\"\n\
-             while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do sleep 1; done\n\
+             elapsed=0\n\
+             while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do\n\
+               if [ \"$$elapsed\" -ge {timeout_secs} ]; then\n\
+                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check /tmp/cella-agent.log\" >&2\n\
+                 rm -f \"$$wait_file\"\n\
+                 exit 1\n\
+               fi\n\
+               sleep 1\n\
+               elapsed=$$((elapsed + 1))\n\
+             done\n\
              rm -f \"$$wait_file\""
         );
     }
@@ -1452,6 +1462,36 @@ mod tests {
             wait < service,
             "service entrypoint ran before proxy readiness"
         );
+    }
+
+    #[test]
+    fn agent_proxy_wait_is_bounded_and_fails_closed() {
+        let mut config = base_config();
+        config.agent_proxy_startup = AgentProxyStartup::WaitUntilReady;
+
+        let yaml = generate_override_yaml(&config);
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("proxy-wait override must be valid YAML");
+        let entrypoint = parsed["services"]["app"]["entrypoint"]
+            .as_sequence()
+            .expect("entrypoint is a sequence");
+        let script = entrypoint[2].as_str().expect("script element is a string");
+        let ready_path = cella_env::AGENT_PROXY_READY_PATH;
+        let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
+        let bounded_wait = format!(
+            "elapsed=0\n\
+             while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do\n\
+               if [ \"$$elapsed\" -ge {timeout_secs} ]; then\n\
+                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check /tmp/cella-agent.log\" >&2\n\
+                 rm -f \"$$wait_file\"\n\
+                 exit 1\n\
+               fi\n\
+               sleep 1\n\
+               elapsed=$$((elapsed + 1))\n\
+             done"
+        );
+
+        assert!(script.contains(&bounded_wait), "script:\n{script}");
     }
 
     #[test]

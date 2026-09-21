@@ -265,11 +265,11 @@ async fn wait_for_agent_proxy(
     container_id: &str,
     ready_path: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
     let script = format!(
-        "attempt=0; while [ ! -f \"{ready_path}\" ]; do \
-         attempt=$((attempt + 1)); \
-         [ \"$attempt\" -ge 30 ] && exit 1; \
-         sleep 1; done"
+        "elapsed=0; while [ ! -f \"{ready_path}\" ]; do \
+         [ \"$elapsed\" -ge {timeout_secs} ] && exit 1; \
+         sleep 1; elapsed=$((elapsed + 1)); done"
     );
     let result = client
         .exec_command(

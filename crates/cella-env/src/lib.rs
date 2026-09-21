@@ -36,6 +36,11 @@ pub use platform::DockerRuntime;
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
 /// Marker written after the agent proxy has successfully bound its listen port.
 pub const AGENT_PROXY_READY_PATH: &str = "/tmp/.cella/proxy-ready";
+/// Maximum time to wait for the agent proxy marker during compose startup.
+///
+/// Thirty seconds preserves the existing compose orchestration readiness bound
+/// while preventing a failed agent or proxy bind from blocking startup forever.
+pub const AGENT_PROXY_READY_TIMEOUT_SECS: u64 = 30;
 
 /// In-container path of the combined CA bundle (host CAs + MITM CA +
 /// `network.proxy.ca_cert`).
