@@ -27,8 +27,7 @@ impl Release {
 /// Codenames cella knows. Deliberately incomplete: a missing entry costs
 /// an OS-move suggestion, a wrong entry silently misorders releases.
 ///
-/// Debian `forky` (14) and Ubuntu `resolute` (26.04) are omitted because
-/// their release numbers are unconfirmed.
+/// Debian `forky` (14) is omitted because it is unreleased.
 const CODENAMES: &[(&str, &str, u32)] = &[
     ("buster", "debian", 1000),
     ("bullseye", "debian", 1100),
@@ -37,6 +36,7 @@ const CODENAMES: &[(&str, &str, u32)] = &[
     ("focal", "ubuntu", 2004),
     ("jammy", "ubuntu", 2204),
     ("noble", "ubuntu", 2404),
+    ("resolute", "ubuntu", 2604),
 ];
 
 /// Families that also appear spelled out with a version number, in both
@@ -139,6 +139,13 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_variant("resolute"),
+            Some(Release {
+                family: "ubuntu",
+                ord: 2604
+            })
+        );
+        assert_eq!(
             parse_variant("alpine3.20"),
             Some(Release {
                 family: "alpine",
@@ -180,5 +187,6 @@ mod tests {
         // would be offered from a release to itself.
         assert_eq!(parse_variant("bookworm"), parse_variant("debian-12"));
         assert_eq!(parse_variant("noble"), parse_variant("ubuntu-24.04"));
+        assert_eq!(parse_variant("resolute"), parse_variant("ubuntu26.04"));
     }
 }
