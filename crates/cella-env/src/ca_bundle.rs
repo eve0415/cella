@@ -97,18 +97,7 @@ pub fn prepare_ca_injection(additional_ca_path: Option<&str>) -> Option<CaInject
 
     // Append additional CA cert if configured.
     if let Some(ca_path) = additional_ca_path {
-        match read_additional_ca_cert(ca_path) {
-            Ok(extra_pem) => {
-                if !pem_bundle.is_empty() && !pem_bundle.ends_with('\n') {
-                    pem_bundle.push('\n');
-                }
-                pem_bundle.push_str(&extra_pem);
-                tracing::info!("Added additional CA cert from {ca_path}");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read additional CA cert: {e}");
-            }
-        }
+        append_ca_file(&mut pem_bundle, ca_path);
     }
 
     if pem_bundle.is_empty() {
@@ -123,23 +112,49 @@ pub fn prepare_ca_injection(additional_ca_path: Option<&str>) -> Option<CaInject
     })
 }
 
-/// Build a combined PEM bundle containing host CAs and an additional PEM cert.
+/// Append `pem` to `bundle`, keeping the certs newline-separated.
+fn append_pem(bundle: &mut String, pem: &str) {
+    if !bundle.is_empty() && !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
+    bundle.push_str(pem);
+}
+
+/// Append the CA cert stored at `ca_path` on the host.
 ///
-/// Used to create a bundle that replaces the default trust store while
-/// also trusting the MITM CA. Returns the host bundle content alone if
-/// no additional cert is provided, or the additional cert alone if no
-/// host bundle is detected.
-pub fn build_combined_ca_bundle(additional_pem: &str) -> String {
+/// An unreadable file is warned about and skipped — TLS setup never fails
+/// the container bring-up.
+fn append_ca_file(bundle: &mut String, ca_path: &str) {
+    match read_additional_ca_cert(ca_path) {
+        Ok(pem) => {
+            append_pem(bundle, &pem);
+            tracing::info!("Added additional CA cert from {ca_path}");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read additional CA cert: {e}");
+        }
+    }
+}
+
+/// Build a combined PEM bundle: host CAs, the MITM CA, and the configured CA.
+///
+/// Used to create a bundle that replaces the default trust store for runtimes
+/// that ignore the system one. `additional_ca_path` is a host path (the
+/// `network.proxy.ca_cert` setting), read here and skipped with a warning if
+/// it cannot be read. Certs the host has none of are simply left out, so the
+/// result can be the MITM CA alone.
+pub fn build_combined_ca_bundle(mitm_pem: &str, additional_ca_path: Option<&str>) -> String {
     let mut bundle = String::new();
 
     if let Some(host_bundle) = detect_host_ca_bundle() {
         bundle.push_str(&host_bundle.pem_bundle);
     }
 
-    if !bundle.is_empty() && !bundle.ends_with('\n') {
-        bundle.push('\n');
+    append_pem(&mut bundle, mitm_pem);
+
+    if let Some(ca_path) = additional_ca_path {
+        append_ca_file(&mut bundle, ca_path);
     }
-    bundle.push_str(additional_pem);
 
     bundle
 }
@@ -358,12 +373,54 @@ ID=custom
     }
 
     #[test]
-    fn build_combined_ca_bundle_includes_additional_pem() {
-        let additional = "-----BEGIN CERTIFICATE-----\nMITM_CA\n-----END CERTIFICATE-----\n";
-        let bundle = build_combined_ca_bundle(additional);
+    fn build_combined_ca_bundle_includes_mitm_pem() {
+        let mitm = "-----BEGIN CERTIFICATE-----\nMITM_CA\n-----END CERTIFICATE-----\n";
+        let bundle = build_combined_ca_bundle(mitm, None);
         assert!(
             bundle.contains("MITM_CA"),
-            "combined bundle should contain the additional PEM"
+            "combined bundle should contain the MITM PEM"
         );
+    }
+
+    #[test]
+    fn build_combined_ca_bundle_includes_configured_ca() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        write!(
+            file,
+            "-----BEGIN CERTIFICATE-----\nCORP_CA\n-----END CERTIFICATE-----\n"
+        )
+        .expect("write corp CA");
+
+        // No trailing newline: the MITM cert must still be separated from the
+        // corporate one.
+        let mitm = "-----BEGIN CERTIFICATE-----\nMITM_CA\n-----END CERTIFICATE-----";
+        let bundle = build_combined_ca_bundle(mitm, file.path().to_str());
+
+        assert!(
+            bundle.contains("MITM_CA"),
+            "combined bundle should contain the MITM PEM"
+        );
+        assert!(
+            bundle.contains("CORP_CA"),
+            "combined bundle should contain the configured network.proxy.ca_cert"
+        );
+        assert!(
+            bundle.contains("-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nCORP_CA"),
+            "certs must stay newline-separated; got {bundle}"
+        );
+    }
+
+    #[test]
+    fn build_combined_ca_bundle_skips_unreadable_configured_ca() {
+        let mitm = "-----BEGIN CERTIFICATE-----\nMITM_CA\n-----END CERTIFICATE-----\n";
+        let bundle = build_combined_ca_bundle(mitm, Some("/nonexistent/corp-ca.pem"));
+
+        assert!(
+            bundle.contains("MITM_CA"),
+            "an unreadable configured CA must not drop the MITM PEM"
+        );
+        assert!(!bundle.contains("CORP_CA"));
     }
 }

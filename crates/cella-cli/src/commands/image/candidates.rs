@@ -1161,10 +1161,11 @@ mod tests {
         );
     }
 
-    /// dotnet publishes `9.0-bookworm-slim` and `11.0-preview-resolute`,
-    /// neither of which resolves to a release cella knows. That yields no
-    /// moves — the point is that it degrades rather than panicking on the
-    /// empty-prefix path.
+    /// dotnet publishes `9.0-bookworm-slim`, which names no release cella
+    /// knows, and `11.0-preview-resolute`, which names one behind a prefix
+    /// that is not a runtime version. Neither yields a move — the point is
+    /// that both degrade rather than panicking on the empty-prefix path, and
+    /// that the second says why its runtime axis is missing.
     #[test]
     fn a_variant_with_no_recognised_release_yields_no_moves() {
         let tags: Vec<String> = [
@@ -1177,11 +1178,45 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
 
-        for pin in ["2.1.4-9.0-bookworm-slim", "2.1.4-11.0-preview-resolute"] {
+        for (pin, limitation) in [
+            ("2.1.4-9.0-bookworm-slim", None),
+            (
+                "2.1.4-11.0-preview-resolute",
+                Some(Limitation::UndecomposableVariant),
+            ),
+        ] {
             let c = compute(&tags, pin, None).unwrap();
             assert!(c.moves.is_empty(), "{pin} got {:?}", c.moves);
-            assert_eq!(c.limitation, None);
+            assert_eq!(c.limitation, limitation, "{pin}");
         }
+    }
+
+    /// Regression: `resolute` was not in the codename table, so a `-noble`
+    /// pin was offered its Ubuntu 26.04 move spelled `ubuntu26.04` — the
+    /// numeric alias — against the rule that the codename is canonical.
+    #[test]
+    fn the_ubuntu_26_04_move_is_offered_under_its_codename() {
+        let raw = include_str!("../../../../cella-oci/testdata/mcr-devcontainers-base-tags.json");
+        let tags: Vec<String> = serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            tags.iter().any(|t| t == "3.0.5-resolute")
+                && tags.iter().any(|t| t == "3.0.5-ubuntu26.04"),
+            "fixture precondition: both spellings are published"
+        );
+
+        let c = compute(&tags, "3.0.5-noble", None).unwrap();
+        let listed: Vec<(&str, &str)> = c
+            .moves
+            .iter()
+            .map(|m| (m.to.as_str(), m.tag.as_str()))
+            .collect();
+        assert_eq!(listed, vec![("resolute", "3.0.5-resolute")]);
+        assert_eq!(c.moves[0].axes, AxisSet::RELEASE);
     }
 
     /// Digests captured from mcr.microsoft.com/devcontainers/typescript-node.

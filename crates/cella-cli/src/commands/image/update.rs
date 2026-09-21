@@ -5,7 +5,7 @@ use inquire::Select;
 
 use miette::IntoDiagnostic as _;
 
-use cella_oci::{TagCache, TagSource};
+use cella_oci::{FetchedTags, TagCache, TagSource};
 
 use super::candidates::{self, AxisSet, Candidates, Limitation};
 use super::jsonc_edit;
@@ -166,18 +166,12 @@ impl UpdateArgs {
         // An alias line names no runtime, so which one it points at can only
         // be learned from the registry. Probed only when the image actually
         // publishes runtime-ful lines beside it: 1-4 requests, or none.
-        let alias_runtime = match candidates::alias_probe(&fetched.tags, &tag) {
-            Some(probe) => {
-                // The tag list is fetched under the normalized reference, so
-                // the resolver must use it too — `org/image` shorthand would
-                // otherwise parse `org` as a registry and every probe fail.
-                // The user's own spelling is still what gets written back.
-                let resolver =
-                    cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
-                candidates::resolve_alias_runtime(&resolver, &probe).await
-            }
-            None => None,
-        };
+        // The tag list is fetched under the normalized reference, so the
+        // resolver must use it too — `org/image` shorthand would otherwise
+        // parse `org` as a registry and every probe fail. The user's own
+        // spelling is still what gets written back.
+        let resolver = cella_oci::RegistryResolver::new(cella_oci::normalize_reference(&reference));
+        let alias_runtime = probe_alias_runtime(&resolver, &fetched, &tag).await;
 
         let computed = candidates::compute(&fetched.tags, &tag, alias_runtime.as_deref());
         if self.stop_at_floating(computed.as_ref()) {
@@ -218,6 +212,9 @@ impl UpdateArgs {
             .choose(&found, &fetched.tags)
             .map_err(boxed_err_to_report)?
         else {
+            if let Some(report) = self.decline_report(&reference, &found)? {
+                println!("{report}");
+            }
             return Ok(());
         };
 
@@ -252,6 +249,35 @@ impl UpdateArgs {
     fn reports_only(&self, found: &Candidates) -> bool {
         let applying = self.to.is_some() || (self.apply.yes && !found.is_empty());
         matches!(self.output.resolve(), OutputFormat::Json) && !applying
+    }
+
+    /// The report stdout is still owed when nothing was applied.
+    ///
+    /// `--yes` that finds candidates but no allowed move has already named
+    /// the missing flag on stderr; stdout has said nothing at all, and a
+    /// consumer parsing it cannot tell that from "nothing to do". Rendering
+    /// the same report `--check` would have produced keeps the two apart —
+    /// the applied run carries an `applied` key, this one carries `moves`.
+    ///
+    /// The exit status stays 0 either way: a move withheld for want of
+    /// consent is a report, not a failure, and every other stopping point in
+    /// this command that is not a real error exits 0 too.
+    ///
+    /// `None` outside JSON, where the candidate table and the blocked-move
+    /// advice have already gone to stderr.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report cannot be serialized.
+    fn decline_report(
+        &self,
+        reference: &str,
+        found: &Candidates,
+    ) -> miette::Result<Option<String>> {
+        if !matches!(self.output.resolve(), OutputFormat::Json) {
+            return Ok(None);
+        }
+        render_json(reference, found).map(Some)
     }
 
     /// Whether an unrankable current tag ends the run.
@@ -346,6 +372,20 @@ impl UpdateArgs {
 
         found.version_bump.clone()
     }
+}
+
+/// Resolve an alias regardless of where its tag list came from.
+///
+/// A failed tag-list request does not imply that manifest pulls fail too, so
+/// even a stale-cache result gets the one bounded probe needed to preserve
+/// runtime and shape candidates.
+async fn probe_alias_runtime<R: cella_oci::AliasResolver + Sync>(
+    resolver: &R,
+    fetched: &FetchedTags,
+    tag: &str,
+) -> Option<String> {
+    let probe = candidates::alias_probe(&fetched.tags, tag)?;
+    candidates::resolve_alias_runtime(resolver, &probe).await
 }
 
 /// How many not-yet-given flags a move still needs.
@@ -728,6 +768,58 @@ mod tests {
         );
     }
 
+    /// Regression: `--yes --output json` over a pin that is current on its
+    /// own tag line, with the only move blocked for want of a consent flag,
+    /// printed nothing to stdout and exited 0. A consumer could not tell
+    /// that from "nothing to offer".
+    #[test]
+    fn a_blocked_yes_still_reports_on_stdout() {
+        let found = Candidates {
+            current: "3.0.5-noble".to_owned(),
+            version_bump: None,
+            pin: None,
+            moves: vec![candidates::VariantMove {
+                tag: "3.0.5-ubuntu26.04".to_owned(),
+                from: "noble".to_owned(),
+                to: "ubuntu26.04".to_owned(),
+                axes: AxisSet::RELEASE,
+            }],
+            limitation: None,
+        };
+
+        let args = parse_update(&["cella", "image", "update", "--yes", "--output", "json"]);
+        assert!(
+            !args.reports_only(&found),
+            "precondition: --yes falls past the report-only return"
+        );
+        assert_eq!(
+            args.auto_choice(&found),
+            None,
+            "precondition: the only move needs --allow-os-change"
+        );
+
+        let report = args
+            .decline_report("mcr.microsoft.com/devcontainers/base", &found)
+            .unwrap()
+            .expect("a blocked run must still print the candidates");
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(value["image"]["current"], "3.0.5-noble");
+        assert_eq!(value["image"]["moves"][0]["tag"], "3.0.5-ubuntu26.04");
+        assert_eq!(
+            value["image"]["applied"],
+            serde_json::Value::Null,
+            "nothing was applied, so the applied key must stay absent"
+        );
+
+        assert_eq!(
+            parse_update(&["cella", "image", "update", "--yes"])
+                .decline_report("mcr.microsoft.com/devcontainers/base", &found)
+                .unwrap(),
+            None,
+            "the text path already said this on stderr"
+        );
+    }
+
     #[test]
     fn unknown_to_tag_lists_the_computed_candidates() {
         let found = Candidates {
@@ -740,6 +832,35 @@ mod tests {
         let err = unknown_tag_error("9.9.9-trixie", &found);
         assert!(err.contains("9.9.9-trixie"));
         assert!(err.contains("2.0.14-1-trixie"), "got: {err}");
+    }
+
+    /// Regression: any tag-list error falls back to a stale cache, including
+    /// endpoint-specific and later-page failures where manifest pulls still
+    /// work. That source must not suppress the only digest probe.
+    #[tokio::test]
+    async fn a_stale_cache_still_probes_the_alias_runtime() {
+        let raw = include_str!("../../../testdata/mcr-devcontainers-typescript-node-tags.json");
+        let fetched = FetchedTags {
+            tags: serde_json::from_str::<serde_json::Value>(raw).unwrap()["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tag| tag.as_str().unwrap().to_owned())
+                .collect(),
+            source: TagSource::StaleCache,
+        };
+        let resolver = cella_oci::MapResolver::new([
+            ("5.0.3-trixie", "alias-digest"),
+            ("5.0.3-24-trixie", "alias-digest"),
+        ]);
+
+        assert_eq!(fetched.source, TagSource::StaleCache);
+        assert_eq!(
+            probe_alias_runtime(&resolver, &fetched, "5.0.3-trixie")
+                .await
+                .as_deref(),
+            Some("24")
+        );
     }
 
     #[test]

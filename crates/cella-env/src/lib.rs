@@ -34,12 +34,21 @@ pub use platform::DockerRuntime;
 /// so it must not live in an image layer or env var) and read by `cella-agent`
 /// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
+/// Marker written after the agent proxy has successfully bound its listen port.
+pub const AGENT_PROXY_READY_PATH: &str = "/tmp/.cella/proxy-ready";
+/// Maximum time to wait for the agent proxy marker during compose startup.
+///
+/// Thirty seconds preserves the existing compose orchestration readiness bound
+/// while preventing a failed agent or proxy bind from blocking startup forever.
+pub const AGENT_PROXY_READY_TIMEOUT_SECS: u64 = 30;
 
-/// In-container path of the combined CA bundle (host CAs + MITM CA).
+/// In-container path of the combined CA bundle (host CAs + MITM CA +
+/// `network.proxy.ca_cert`).
 ///
 /// Pointed to by `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and
-/// `REQUESTS_CA_BUNDLE` so that TLS clients inside the container trust
-/// both the host's CAs and cella's MITM CA.
+/// `REQUESTS_CA_BUNDLE` so that TLS clients ignoring the system trust store
+/// still trust the host's CAs, cella's MITM CA, and any configured
+/// corporate CA.
 pub const CA_BUNDLE_PATH: &str = "/tmp/.cella/ca-bundle.pem";
 
 /// A bind mount to add to the container at creation time.
@@ -329,15 +338,50 @@ pub struct ProxyForwardingConfig {
     pub credentials_protect: bool,
 }
 
+impl ProxyForwardingConfig {
+    /// Derive proxy forwarding from resolved network settings.
+    ///
+    /// Proxy blocking rules need the agent-side proxy, and credential
+    /// protection needs the same proxy to rewrite the traffic it protects, so
+    /// either one on its own is enough to route through it — and neither is
+    /// possible on a backend that never provisions an agent.
+    ///
+    /// `skip_rules` drops user-configured rules (the caller's rule policy);
+    /// `credentials_protect` is the `credentials.protect` setting.
+    pub fn resolve(
+        mut net_config: cella_network::config::NetworkConfig,
+        skip_rules: bool,
+        credentials_protect: bool,
+        managed_agent: bool,
+    ) -> Self {
+        if skip_rules {
+            net_config.rules.clear();
+            net_config.mode = cella_network::config::NetworkMode::Denylist;
+        }
+        let has_rules = net_config.has_rules();
+        let credentials_protect = credentials_protect && managed_agent;
+        let needs_proxy = (has_rules || credentials_protect) && managed_agent;
+
+        Self {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: needs_proxy,
+            full_config: if needs_proxy { Some(net_config) } else { None },
+            container_distro: ca_bundle::ContainerDistro::Unknown,
+            credentials_protect,
+        }
+    }
+}
+
 /// Inject MITM CA trust into the container.
 ///
 /// Adds the MITM CA cert to the system trust store (distro-appropriate path)
-/// and uploads a combined PEM bundle (host CAs + MITM CA) that application-level
-/// env vars point to.
+/// and uploads a combined PEM bundle (host CAs + MITM CA + the configured
+/// `network.proxy.ca_cert`) that application-level env vars point to.
 fn inject_mitm_ca_trust(
     fwd: &mut EnvForwarding,
     distro: &ca_bundle::ContainerDistro,
     mitm_cert_pem: &str,
+    additional_ca_path: Option<&str>,
 ) {
     // System trust store: upload MITM CA cert.
     let mitm_path = distro.ca_cert_path("cella-mitm-ca.crt");
@@ -359,7 +403,7 @@ fn inject_mitm_ca_trust(
 
     // Application-level: combined CA bundle for runtimes that ignore the
     // system trust store (Node.js, Python requests, Go, curl).
-    let combined = ca_bundle::build_combined_ca_bundle(mitm_cert_pem);
+    let combined = ca_bundle::build_combined_ca_bundle(mitm_cert_pem, additional_ca_path);
     fwd.post_start.file_uploads.push(FileUpload {
         container_path: CA_BUNDLE_PATH.to_string(),
         content: combined.into_bytes(),
@@ -441,7 +485,7 @@ pub fn prepare_env_forwarding(
         // If MITM TLS interception is needed (path-level blocking or
         // credential protection), inject the MITM CA into the system trust
         // store and set application-level env vars pointing to a combined
-        // CA bundle (host CAs + MITM CA).
+        // CA bundle (host CAs + MITM CA + the configured CA).
         let has_path_rules = net_config
             .full_config
             .as_ref()
@@ -449,7 +493,7 @@ pub fn prepare_env_forwarding(
         let needs_mitm = has_path_rules || net_config.credentials_protect;
 
         if needs_mitm && let Ok(ca) = cella_network::ca::ensure_ca() {
-            inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem);
+            inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem, additional_ca);
         }
     }
 
@@ -582,6 +626,99 @@ mod tests {
     }
 
     #[test]
+    fn resolve_routes_through_proxy_for_credentials_protect_without_rules() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        assert!(
+            !net_config.has_rules(),
+            "precondition: no user-configured rules"
+        );
+
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, true);
+
+        assert!(
+            pfc.has_blocking_rules,
+            "credentials.protect alone must route traffic through the agent proxy"
+        );
+        assert!(
+            pfc.full_config.is_some(),
+            "the agent needs the network config to run the proxy"
+        );
+        assert!(pfc.credentials_protect);
+    }
+
+    #[test]
+    fn resolve_skips_proxy_without_managed_agent() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, false);
+
+        assert!(
+            !pfc.has_blocking_rules,
+            "no managed agent means no proxy to route through"
+        );
+        assert!(pfc.full_config.is_none());
+        assert!(!pfc.credentials_protect);
+    }
+
+    #[test]
+    fn resolve_skips_proxy_when_nothing_is_requested() {
+        let net_config = cella_network::config::NetworkConfig::default();
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, false, true);
+
+        assert!(!pfc.has_blocking_rules);
+        assert!(pfc.full_config.is_none());
+    }
+
+    #[test]
+    fn resolve_honours_skip_rules_but_not_for_credentials_protect() {
+        let net_config = cella_network::config::NetworkConfig {
+            rules: vec![cella_network::config::NetworkRule {
+                domain: "example.com".to_string(),
+                paths: vec![],
+                action: cella_network::config::RuleAction::Block,
+            }],
+            ..Default::default()
+        };
+
+        let skipped = ProxyForwardingConfig::resolve(net_config.clone(), true, false, true);
+        assert!(
+            !skipped.has_blocking_rules,
+            "skip_rules must drop user-configured rules"
+        );
+
+        let protected = ProxyForwardingConfig::resolve(net_config, true, true, true);
+        assert!(
+            protected.has_blocking_rules,
+            "skip_rules must not disable credential protection"
+        );
+    }
+
+    #[test]
+    fn resolve_removes_explicitly_skipped_rules_from_credential_proxy_config() {
+        let net_config = cella_network::config::NetworkConfig {
+            mode: cella_network::config::NetworkMode::Allowlist,
+            rules: vec![cella_network::config::NetworkRule {
+                domain: "allowed.example.com".to_string(),
+                paths: vec![],
+                action: cella_network::config::RuleAction::Allow,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = ProxyForwardingConfig::resolve(net_config, true, true, true);
+        let agent_config = resolved
+            .full_config
+            .expect("credential protection still requires an agent proxy config");
+
+        assert!(resolved.has_blocking_rules);
+        assert!(agent_config.rules.is_empty());
+        assert_eq!(
+            agent_config.mode,
+            cella_network::config::NetworkMode::Denylist,
+            "denylist with no rules permits unmatched traffic"
+        );
+    }
+
+    #[test]
     fn inject_mitm_ca_trust_adds_uploads_and_env_vars() {
         let mut fwd = EnvForwarding::default();
         let distro = ca_bundle::ContainerDistro::Debian;
@@ -589,6 +726,7 @@ mod tests {
             &mut fwd,
             &distro,
             "-----BEGIN CERTIFICATE-----\nMITM\n-----END CERTIFICATE-----\n",
+            None,
         );
 
         // System trust store upload.
@@ -644,7 +782,7 @@ mod tests {
         let mut fwd = EnvForwarding::default();
         let distro = ca_bundle::ContainerDistro::Debian;
         let mitm_pem = "-----BEGIN CERTIFICATE-----\nTEST_MITM_CA\n-----END CERTIFICATE-----\n";
-        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem);
+        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem, None);
 
         let bundle_upload = fwd
             .post_start
@@ -661,10 +799,45 @@ mod tests {
     }
 
     #[test]
+    fn inject_mitm_ca_trust_combined_bundle_contains_configured_ca() {
+        use std::io::Write;
+
+        let mut corp = tempfile::NamedTempFile::new().expect("temp file");
+        write!(
+            corp,
+            "-----BEGIN CERTIFICATE-----\nCORP_CA\n-----END CERTIFICATE-----\n"
+        )
+        .expect("write corp CA");
+
+        let mut fwd = EnvForwarding::default();
+        let distro = ca_bundle::ContainerDistro::Debian;
+        let mitm_pem = "-----BEGIN CERTIFICATE-----\nTEST_MITM_CA\n-----END CERTIFICATE-----\n";
+        inject_mitm_ca_trust(&mut fwd, &distro, mitm_pem, corp.path().to_str());
+
+        let bundle_upload = fwd
+            .post_start
+            .file_uploads
+            .iter()
+            .find(|u| u.container_path == CA_BUNDLE_PATH)
+            .expect("combined bundle upload should exist");
+
+        let content = String::from_utf8(bundle_upload.content.clone()).unwrap();
+        assert!(
+            content.contains("TEST_MITM_CA"),
+            "combined bundle should contain the MITM CA PEM"
+        );
+        assert!(
+            content.contains("CORP_CA"),
+            "combined bundle should contain network.proxy.ca_cert, or runtimes that \
+             ignore the system trust store never see it"
+        );
+    }
+
+    #[test]
     fn inject_mitm_ca_trust_unknown_distro_uploads_both_paths() {
         let mut fwd = EnvForwarding::default();
         let distro = ca_bundle::ContainerDistro::Unknown;
-        inject_mitm_ca_trust(&mut fwd, &distro, "CERT");
+        inject_mitm_ca_trust(&mut fwd, &distro, "CERT", None);
 
         let mitm_count = fwd
             .post_start

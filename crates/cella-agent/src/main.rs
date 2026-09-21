@@ -276,7 +276,12 @@ async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
             Ok(config) => {
                 let config = std::sync::Arc::new(config);
                 match forward_proxy::start_forward_proxy(config).await {
-                    Ok(handle) => info!("Forward proxy started on {}", handle.local_addr),
+                    Ok(handle) => {
+                        info!("Forward proxy started on {}", handle.local_addr);
+                        if let Err(e) = std::fs::write(cella_env::AGENT_PROXY_READY_PATH, []) {
+                            error!("Failed to publish forward proxy readiness: {e}");
+                        }
+                    }
                     Err(e) => error!("Failed to start forward proxy: {e}"),
                 }
             }

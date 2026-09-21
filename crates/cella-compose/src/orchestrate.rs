@@ -18,7 +18,7 @@ use cella_backend::container_setup::{
 use cella_backend::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
 use cella_backend::progress::ProgressSender;
 use cella_backend::{
-    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
+    ContainerBackend, ContainerInfo, ContainerState, FileToUpload, LifecycleContext, MountSpec,
     SshAgentProxyStatus, agent_env_vars, names::lexical_absolute, run_lifecycle_phase,
 };
 use cella_config::devcontainer::resolve::ResolvedConfig;
@@ -206,6 +206,10 @@ pub enum ComposeUpOutcome {
 pub type DotfilesInstallFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 
+/// Boxed future returned by [`ComposeUpHooks::launch_agent`].
+pub type AgentLaunchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+
 /// Callbacks for operations that live outside the orchestrator's dependency
 /// graph (daemon management, agent launch, etc.).
 pub trait ComposeUpHooks: Send + Sync {
@@ -241,7 +245,8 @@ pub trait ComposeUpHooks: Send + Sync {
         client: &'a dyn ContainerBackend,
         container_id: &'a str,
         agent_arch: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+        wait_for_proxy: bool,
+    ) -> AgentLaunchFuture<'a>;
 
     /// Run container setup after creation (env injection,
     /// credentials, tool installation, userEnvProbe).
@@ -376,8 +381,13 @@ pub async fn compose_up(
     }
 
     // 5-13. Prepare environment, write override, start services
-    let (remote_user, resolved_features, agent_arch, ssh_agent_proxy) =
-        prepare_and_start(&ctx, &project).await?;
+    let PreparedComposeStart {
+        remote_user,
+        resolved_features,
+        agent_arch,
+        ssh_agent_proxy,
+        agent_proxy_config,
+    } = prepare_and_start(&ctx, &project).await?;
 
     // 14-20. Post-start: find container, setup, lifecycle, output
     let mut result = finalize_compose(
@@ -386,6 +396,7 @@ pub async fn compose_up(
         &remote_user,
         resolved_features.as_ref(),
         &agent_arch,
+        agent_proxy_config.as_ref(),
     )
     .await?;
     result.ssh_agent_proxy = ssh_agent_proxy;
@@ -446,6 +457,8 @@ struct ComposeRuntimeResolution {
     image_user: String,
     /// Env-forwarding plan (mutated downstream when starting services).
     env_fwd: cella_env::EnvForwarding,
+    /// Proxy config that must be uploaded before the compose agent launches.
+    agent_proxy_config: Option<cella_env::FileUpload>,
     /// ssh-agent proxy status, surfaced in the up result.
     ssh_agent_proxy: Option<SshAgentProxyStatus>,
     /// Merged security props applied to the primary service.
@@ -457,6 +470,28 @@ struct ComposeRuntimeResolution {
     /// substituted, sourced from the same merged feature/image-metadata config as
     /// the security props (mirrors the single-container `feature_config.entrypoints`).
     feature_entrypoints: Vec<String>,
+}
+
+struct PreparedComposeStart {
+    remote_user: String,
+    resolved_features: Option<cella_features::ResolvedFeatures>,
+    agent_arch: String,
+    ssh_agent_proxy: Option<SshAgentProxyStatus>,
+    agent_proxy_config: Option<cella_env::FileUpload>,
+}
+
+fn ensure_compose_supported(
+    client: &dyn ContainerBackend,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if client.capabilities().compose {
+        Ok(())
+    } else {
+        Err(format!(
+            "selected backend '{}' does not support Docker Compose devcontainers",
+            client.kind()
+        )
+        .into())
+    }
 }
 
 /// Resolve the compose project's remote user, env-forwarding plan, ssh-agent
@@ -527,10 +562,17 @@ async fn resolve_user_and_env(
         client.host_gateway(),
     )
     .await;
+    let agent_proxy_config = env_fwd
+        .post_start
+        .file_uploads
+        .iter()
+        .find(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH)
+        .cloned();
     ComposeRuntimeResolution {
         remote_user,
         image_user,
         env_fwd,
+        agent_proxy_config,
         ssh_agent_proxy,
         security,
         metadata_label,
@@ -542,25 +584,11 @@ async fn resolve_user_and_env(
 async fn prepare_and_start(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
-) -> Result<
-    (
-        String,
-        Option<cella_features::ResolvedFeatures>,
-        String,
-        Option<SshAgentProxyStatus>,
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<PreparedComposeStart, Box<dyn std::error::Error + Send + Sync>> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
 
-    if !client.capabilities().compose {
-        return Err(format!(
-            "selected backend '{}' does not support Docker Compose devcontainers",
-            client.kind()
-        )
-        .into());
-    }
+    ensure_compose_supported(client)?;
 
     // 5. Check Docker Compose version supports additional_contexts (>= 2.17.0)
     crate::check_compose_features_support().await?;
@@ -620,6 +648,7 @@ async fn prepare_and_start(
         // Feature entrypoints + entrypoint/command resolution are emitted only in
         // the final override; the build override never runs the container.
         feature_entrypoints: Vec::new(),
+        wait_for_agent_proxy: false,
         user_entrypoint_command: crate::override_file::UserEntrypointCommand::default(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
@@ -639,6 +668,7 @@ async fn prepare_and_start(
         remote_user,
         image_user,
         mut env_fwd,
+        agent_proxy_config,
         ssh_agent_proxy,
         security,
         metadata_label,
@@ -666,12 +696,35 @@ async fn prepare_and_start(
     .await?;
 
     let resolved_features = features_build.map(|b| b.resolved_features);
-    Ok((remote_user, resolved_features, agent_arch, ssh_agent_proxy))
+    Ok(PreparedComposeStart {
+        remote_user,
+        resolved_features,
+        agent_arch,
+        ssh_agent_proxy,
+        agent_proxy_config,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Finalize (steps 14-20)
 // ---------------------------------------------------------------------------
+
+async fn upload_agent_proxy_config(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    proxy_config: Option<&cella_env::FileUpload>,
+) -> Result<bool, cella_backend::BackendError> {
+    let Some(proxy_config) = proxy_config else {
+        return Ok(false);
+    };
+    let upload = FileToUpload {
+        path: proxy_config.container_path.clone(),
+        content: proxy_config.content.clone(),
+        mode: proxy_config.mode,
+    };
+    client.upload_files(container_id, &[upload]).await?;
+    Ok(true)
+}
 
 /// Find primary container, run post-create setup, lifecycle phases, and
 /// return the result.
@@ -681,6 +734,7 @@ async fn finalize_compose(
     remote_user: &str,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     agent_arch: &str,
+    agent_proxy_config: Option<&cella_env::FileUpload>,
 ) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
@@ -712,7 +766,22 @@ async fn finalize_compose(
         .register_container(client, &primary.id, config, cfg.container_name)
         .await;
 
-    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe).
+    // 17. Upload the proxy config before the agent reads CELLA_PROXY_CONFIG.
+    let wait_for_proxy = upload_agent_proxy_config(client, &primary.id, agent_proxy_config).await?;
+
+    // 18. Publish daemon address to the shared agent volume before the
+    // agent starts reading it. Without this, the agent is left relying on
+    // the container's (immutable) env vars and has no way to learn about
+    // a daemon restart that changed the port.
+    hooks.sync_agent_runtime(client).await;
+
+    // 19. Launch the agent and wait for its proxy before any setup command can
+    // inherit the agent-proxy environment baked into the compose service.
+    hooks
+        .launch_agent(client, &primary.id, agent_arch, wait_for_proxy)
+        .await?;
+
+    // 20. Post-create setup (UID, env, credentials, tools, userEnvProbe).
     let lifecycle_remote_env = cfg.lifecycle_remote_env();
     let lifecycle_env = hooks
         .post_create_setup(
@@ -725,16 +794,7 @@ async fn finalize_compose(
         )
         .await;
 
-    // 18. Publish daemon address to the shared agent volume before the
-    // agent starts reading it. Without this, the agent is left relying on
-    // the container's (immutable) env vars and has no way to learn about
-    // a daemon restart that changed the port.
-    hooks.sync_agent_runtime(client).await;
-
-    // 19. Launch agent as background process via exec
-    hooks.launch_agent(client, &primary.id, agent_arch).await;
-
-    // 20. Run lifecycle phases (primary service only). Honor the lifecycle
+    // 21. Run lifecycle phases (primary service only). Honor the lifecycle
     // gate: --skip-post-create drops everything, --prebuild and
     // --skip-non-blocking-commands stop after the waitFor phase, and
     // --skip-post-attach drops only postAttachCommand. Compose runs phases
@@ -969,6 +1029,8 @@ struct OverrideContext {
     /// entrypoint. Read only by `write_final_override` (the runtime override); the
     /// build override leaves entrypoints empty.
     feature_entrypoints: Vec<String>,
+    /// Whether the service entrypoint must wait for the agent proxy.
+    wait_for_agent_proxy: bool,
     /// Resolved `userEntrypoint`/`userCommand` for the wrapped entrypoint (per the
     /// official compose logic). Read only by `write_final_override`.
     user_entrypoint_command: crate::override_file::UserEntrypointCommand,
@@ -1012,6 +1074,7 @@ fn write_build_override(
         // the final override; this build override is overwritten by
         // `write_final_override` before `compose up`.
         feature_entrypoints: Vec::new(),
+        agent_proxy_startup: crate::override_file::AgentProxyStartup::Immediate,
         user_entrypoint: Vec::new(),
         user_command: None,
         // The `up` flow provisions the agent volume during setup and reuses this
@@ -1317,6 +1380,11 @@ fn write_final_override(
         // Wrapped entrypoint: feature entrypoints run before the service's
         // original entrypoint+command is exec'd (resolved in build_override_and_start).
         feature_entrypoints: ov.feature_entrypoints.clone(),
+        agent_proxy_startup: if ov.wait_for_agent_proxy {
+            crate::override_file::AgentProxyStartup::WaitUntilReady
+        } else {
+            crate::override_file::AgentProxyStartup::Immediate
+        },
         user_entrypoint: ov.user_entrypoint_command.entrypoint.clone(),
         user_command: ov.user_entrypoint_command.command.clone(),
         // The final `up` override runs the container; keep the runtime sections.
@@ -1457,16 +1525,23 @@ async fn build_override_and_start(
 
     let request_gpu = resolve_compose_gpu(ctx, config).await;
 
+    let wait_for_agent_proxy = env_fwd
+        .post_start
+        .file_uploads
+        .iter()
+        .any(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH);
+
     // Resolve the wrapped entrypoint's userEntrypoint/userCommand: the service's
     // own entrypoint/command (from the resolved compose config) falling back to
     // the image's ENTRYPOINT/CMD, gated by `overrideCommand`. Skipped (default —
     // empty/None) when there are no feature entrypoints and the command is not
     // overridden, so the no-feature override stays byte-for-byte unchanged.
-    let user_entrypoint_command = if feature_entrypoints.is_empty() && !project.override_command {
-        crate::override_file::UserEntrypointCommand::default()
-    } else {
-        resolve_compose_user_entrypoint_command(ctx, project, features_build).await?
-    };
+    let user_entrypoint_command =
+        if feature_entrypoints.is_empty() && !project.override_command && !wait_for_agent_proxy {
+            crate::override_file::UserEntrypointCommand::default()
+        } else {
+            resolve_compose_user_entrypoint_command(ctx, project, features_build).await?
+        };
 
     let mut ov_ctx = OverrideContext {
         agent_vol_name,
@@ -1477,6 +1552,7 @@ async fn build_override_and_start(
         request_gpu,
         security,
         feature_entrypoints,
+        wait_for_agent_proxy,
         user_entrypoint_command,
     };
 
@@ -2042,20 +2118,13 @@ pub fn build_proxy_forwarding_config(
 ) -> Option<cella_env::ProxyForwardingConfig> {
     let settings = cella_config::CellaConfig::load(&resolved.workspace_root, Some(resolved))
         .unwrap_or_default();
-    let net_config = settings.network.to_network_config();
-    let has_rules = net_config.has_rules() && !skip_rules;
 
-    Some(cella_env::ProxyForwardingConfig {
-        proxy: net_config.proxy.clone(),
-        has_blocking_rules: has_rules && managed_agent,
-        full_config: if has_rules && managed_agent {
-            Some(net_config)
-        } else {
-            None
-        },
-        container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-        credentials_protect: settings.credentials.protect && managed_agent,
-    })
+    Some(cella_env::ProxyForwardingConfig::resolve(
+        settings.network.to_network_config(),
+        skip_rules,
+        settings.credentials.protect,
+        managed_agent,
+    ))
 }
 
 #[cfg(test)]
@@ -2408,8 +2477,10 @@ mod tests {
                 _client: &'a dyn ContainerBackend,
                 _container_id: &'a str,
                 _agent_arch: &'a str,
-            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-                Box::pin(async {})
+                wait_for_proxy: bool,
+            ) -> AgentLaunchFuture<'a> {
+                let _ = wait_for_proxy;
+                Box::pin(async { Ok(()) })
             }
 
             fn post_create_setup<'a>(

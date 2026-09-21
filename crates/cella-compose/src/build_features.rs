@@ -149,6 +149,7 @@ pub async fn compose_build(
             // override (`write_final_override`); `docker compose build` ignores
             // these keys, so leave them empty.
             feature_entrypoints: Vec::new(),
+            agent_proxy_startup: crate::override_file::AgentProxyStartup::Immediate,
             user_entrypoint: Vec::new(),
             user_command: None,
             // Build-only: `docker compose build` needs no agent volume and this
@@ -296,6 +297,7 @@ fn write_labels_only_override(
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
         feature_entrypoints: Vec::new(),
+        agent_proxy_startup: crate::override_file::AgentProxyStartup::Immediate,
         user_entrypoint: Vec::new(),
         user_command: None,
         build_only: true,
