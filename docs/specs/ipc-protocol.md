@@ -17,7 +17,7 @@ Layers 1 and 2 use **newline-delimited JSON** (NDJSON): each message is a single
 Layer 3 (Git Credential Helper) does **not** use JSON. It uses the git credential helper protocol: `key=value` lines terminated by a blank line over stdin/stdout.
 
 ```
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 ```
 
 ## Connection Multiplexing
@@ -61,7 +61,7 @@ Sent by the agent as the first message after connecting. Not internally tagged -
 
 | Field | Type | Description |
 |---|---|---|
-| `protocol_version` | `u32` | MUST match `PROTOCOL_VERSION` (1) |
+| `protocol_version` | `u32` | MUST match `PROTOCOL_VERSION` (3) |
 | `agent_version` | `string` | Agent binary version |
 | `container_name` | `string` | Container name for routing (agent self-identifies) |
 | `auth_token` | `string` | Auth token for validating the connection |

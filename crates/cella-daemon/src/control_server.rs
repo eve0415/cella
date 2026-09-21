@@ -515,6 +515,66 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
     }))
 }
 
+/// Route a config-document message to its hub, returning whether `msg` was one.
+///
+/// A patch is applied to the canonical document; a snapshot seeds a hub that
+/// came up without a readable host file. Either way the host file is written,
+/// the result re-broadcast to the other agents, and canonical sent back to the
+/// sender so a reconnecting container converges.
+///
+/// Ingest is gated on the sender's opt-in (symmetric with the broadcast gate): a
+/// container that wasn't granted config forwarding must not be able to write any
+/// host document or poison peer containers. The single gate covers all three
+/// documents, matching the single `claude_config_sync` flag.
+async fn handle_config_doc_message(
+    msg: &AgentMessage,
+    ctx: &ControlContext,
+    hs: &HandshakeResult,
+) -> bool {
+    let (doc, body, snapshot) = match msg {
+        AgentMessage::ConfigDocPatch { doc, patch } => (doc, patch, false),
+        AgentMessage::ConfigDocSnapshot { doc, content } => (doc, content, true),
+        _ => return false,
+    };
+    if !hs.claude_config_sync {
+        warn!(
+            "Dropping {doc:?} config sync message from {} (did not opt into config sync)",
+            hs.container_name
+        );
+        return true;
+    }
+    let Some(hub) = ctx.doc_sync.get(doc) else {
+        warn!(
+            "Dropping {doc:?} config sync message from {}: no hub for that document",
+            hs.container_name
+        );
+        return true;
+    };
+    let host_path = Some(hub.host_path.as_path());
+    if snapshot {
+        crate::doc_sync::on_agent_snapshot(
+            &hub.state,
+            &ctx.container_handles,
+            host_path,
+            *doc,
+            body,
+            &hs.container_name,
+        )
+        .await;
+    } else {
+        crate::doc_sync::on_agent_change(
+            &hub.state,
+            &ctx.container_handles,
+            host_path,
+            *doc,
+            body,
+            &hs.container_name,
+        )
+        .await;
+    }
+    true
+}
+
 /// Handle an agent TCP connection after the `AgentHello` has been parsed.
 /// Route a single inbound agent message: `~/.claude.json` sync, worktree/task
 /// operations (which need streaming writer access), or the generic handler.
@@ -524,38 +584,7 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
     hs: &HandshakeResult,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // Config document sync: apply the agent's merge patch to the canonical
-    // document, write the host file, re-broadcast to the other agents, and reply
-    // to the sender with canonical so a reconnecting container converges.
-    //
-    // Ingest is gated on the sender's opt-in (symmetric with the broadcast
-    // gate): a container that wasn't granted config forwarding must not be able
-    // to write any host document or poison peer containers. The single gate
-    // covers all three documents, matching the single `claude_config_sync` flag.
-    if let AgentMessage::ConfigDocPatch { doc, patch } = &msg {
-        if !hs.claude_config_sync {
-            warn!(
-                "Dropping ConfigDocPatch from {} (did not opt into config sync)",
-                hs.container_name
-            );
-            return Ok(());
-        }
-        let Some(hub) = ctx.doc_sync.get(doc) else {
-            warn!(
-                "Dropping {doc:?} patch from {}: no hub for that document",
-                hs.container_name
-            );
-            return Ok(());
-        };
-        crate::doc_sync::on_agent_change(
-            &hub.state,
-            &ctx.container_handles,
-            Some(hub.host_path.as_path()),
-            *doc,
-            patch,
-            &hs.container_name,
-        )
-        .await;
+    if handle_config_doc_message(&msg, ctx, hs).await {
         return Ok(());
     }
 
@@ -1024,7 +1053,7 @@ pub(crate) async fn handle_agent_message(
 
         // Handled upstream in the message loop (needs the canonical sync state
         // and broadcast access); never reaches this catch-all in practice.
-        AgentMessage::ConfigDocPatch { .. } => None,
+        AgentMessage::ConfigDocPatch { .. } | AgentMessage::ConfigDocSnapshot { .. } => None,
 
         // Worktree/exec/task operations are handled in the message loop via
         // handle_worktree_message() which has writer access for streaming.
