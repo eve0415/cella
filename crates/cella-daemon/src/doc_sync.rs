@@ -902,10 +902,10 @@ mod tests {
         );
     }
 
-    /// Once a container contributes real content the hub has a source, and
-    /// normal push behaviour resumes.
+    /// A host file that was malformed at startup seeds the hub as soon as it
+    /// parses, and normal push behaviour resumes from there.
     #[tokio::test]
-    async fn a_patch_seeds_an_empty_hub() {
+    async fn a_readable_host_file_seeds_an_empty_hub() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = dir.path().join("known_marketplaces.json");
         std::fs::write(&host, "{").expect("malformed host file");
