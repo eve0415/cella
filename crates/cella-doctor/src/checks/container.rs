@@ -93,46 +93,41 @@ async fn check_all_containers(
             // Both arms are bounded by what is left of the budget, so neither
             // can hold the category past the point where its results are lost.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let (probes, collected) = tokio::join!(
-                tokio::time::timeout(remaining, probe_containers(ids)),
-                async {
-                    let mut collected: Vec<Vec<CheckResult>> = Vec::new();
-                    for container in &containers {
-                        if std::time::Instant::now() >= deadline {
-                            collected.push(vec![CheckResult {
-                                name: "skipped".into(),
-                                severity: Severity::Info,
-                                detail: "ran out of time before this container was checked".into(),
-                                fix_hint: Some(
-                                    "Check one workspace at a time with `cella doctor`".into(),
-                                ),
-                            }]);
-                            continue;
-                        }
-                        // Bounded per container: an unresponsive host otherwise
-                        // never returns here, and the deadline above is only
-                        // consulted between containers.
-                        let remaining =
-                            deadline.saturating_duration_since(std::time::Instant::now());
-                        let checks = tokio::time::timeout(
-                            remaining,
-                            check_single_container(client, &container.id),
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            vec![CheckResult {
-                                name: "checks".into(),
-                                severity: Severity::Warning,
-                                detail: "this container stopped responding partway through".into(),
-                                fix_hint: None,
-                            }]
-                        });
-                        collected.push(checks);
+            let (mut probes, collected) = tokio::join!(probe_containers(ids, remaining), async {
+                let mut collected: Vec<Vec<CheckResult>> = Vec::new();
+                for container in &containers {
+                    if std::time::Instant::now() >= deadline {
+                        collected.push(vec![CheckResult {
+                            name: "skipped".into(),
+                            severity: Severity::Info,
+                            detail: "ran out of time before this container was checked".into(),
+                            fix_hint: Some(
+                                "Check one workspace at a time with `cella doctor`".into(),
+                            ),
+                        }]);
+                        continue;
                     }
-                    collected
+                    // Bounded per container: an unresponsive host otherwise
+                    // never returns here, and the deadline above is only
+                    // consulted between containers.
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let checks = tokio::time::timeout(
+                        remaining,
+                        check_single_container(client, &container.id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        vec![CheckResult {
+                            name: "checks".into(),
+                            severity: Severity::Warning,
+                            detail: "this container stopped responding partway through".into(),
+                            fix_hint: None,
+                        }]
+                    });
+                    collected.push(checks);
                 }
-            );
-            let mut probes = probes.unwrap_or_default();
+                collected
+            });
 
             // The category's status is derived from its checks, so the probe
             // has to be merged before the report is built or an unreachable
@@ -188,11 +183,22 @@ async fn check_workspace_container(
         Ok(container) => {
             let name = format!("Container: {}", container.name);
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return vec![CategoryReport::new(
+                    name,
+                    vec![CheckResult {
+                        name: "skipped".into(),
+                        severity: Severity::Info,
+                        detail: "ran out of time before this container was checked".into(),
+                        fix_hint: None,
+                    }],
+                )];
+            }
+
             let (checks, probe) = tokio::join!(
                 tokio::time::timeout(remaining, check_single_container(client, &container.id)),
-                tokio::time::timeout(remaining, check_host_can_reach_container(&container.id))
+                check_host_can_reach_container(&container.id, remaining)
             );
-            let probe = probe.ok().flatten();
             let mut checks = checks.unwrap_or_else(|_| {
                 vec![CheckResult {
                     name: "checks".into(),
@@ -425,12 +431,14 @@ async fn check_credentials(
 /// the port count above stays reassuring while every connection is dropped
 /// upstream. The daemon answers this because it is the process that performs
 /// the connection user traffic depends on.
-async fn check_host_can_reach_container(container_id: &str) -> Option<CheckResult> {
+async fn check_host_can_reach_container(
+    container_id: &str,
+    budget: std::time::Duration,
+) -> Option<CheckResult> {
     let mgmt_socket = cella_env::paths::daemon_socket_path()?;
     let client = cella_daemon_client::DaemonClient::new(mgmt_socket);
 
-    let Ok(answer) =
-        tokio::time::timeout(PROBE_REQUEST_TIMEOUT, client.probe_container(container_id)).await
+    let Ok(answer) = tokio::time::timeout(budget, client.probe_container(container_id)).await
     else {
         return Some(CheckResult {
             name: "container reachable from host".into(),
@@ -471,11 +479,17 @@ async fn check_host_can_reach_container(container_id: &str) -> Option<CheckResul
 /// keeps the cost of several unreachable containers at roughly one probe rather
 /// than one per container, which is what stops the whole category from being
 /// discarded exactly when it has something to report.
-async fn probe_containers(container_ids: Vec<String>) -> HashMap<String, CheckResult> {
+async fn probe_containers(
+    container_ids: Vec<String>,
+    budget: std::time::Duration,
+) -> HashMap<String, CheckResult> {
+    // Bounding each probe rather than the set means one container going quiet
+    // costs its own result, not everyone else's.
+    let per_probe = budget.min(PROBE_REQUEST_TIMEOUT);
     let mut probes = tokio::task::JoinSet::new();
     for id in container_ids {
         probes.spawn(async move {
-            let check = check_host_can_reach_container(&id).await;
+            let check = check_host_can_reach_container(&id, per_probe).await;
             (id, check)
         });
     }
