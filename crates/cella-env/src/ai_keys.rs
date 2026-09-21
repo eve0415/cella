@@ -96,7 +96,7 @@ pub fn detect_ai_keys(
 pub fn any_ai_key_present() -> bool {
     AI_PROVIDERS
         .iter()
-        .any(|p| std::env::var(p.env_var).ok().is_some_and(|v| !v.is_empty()))
+        .any(|p| std::env::var(p.env_var).is_ok_and(|v| !v.is_empty()))
 }
 
 /// Return the names of AI API keys detected on the host (for logging).
@@ -106,7 +106,7 @@ pub fn detect_ai_key_names(provider_enabled: &dyn Fn(&str) -> bool) -> Vec<&'sta
     AI_PROVIDERS
         .iter()
         .filter(|p| provider_enabled(p.id))
-        .filter(|p| std::env::var(p.env_var).ok().is_some_and(|v| !v.is_empty()))
+        .filter(|p| std::env::var(p.env_var).is_ok_and(|v| !v.is_empty()))
         .map(|p| p.env_var)
         .collect()
 }
