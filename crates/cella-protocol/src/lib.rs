@@ -438,6 +438,11 @@ pub enum ContainerProbeResult {
     Reachable { detail: String },
     /// The container's network stack could not be reached.
     Unreachable { error: String },
+    /// The runtime routes container addresses on this host, but this daemon
+    /// could not use that path when the container registered, so its forwards
+    /// were put on the agent's tunnel instead. They work; the host is not
+    /// delivering what the runtime advertises. Carries what the probe saw.
+    SwitchedToTunnel { observed: String },
     /// This daemon does not reach the container by IP, so there is nothing to
     /// probe; the agent connection is the meaningful signal instead.
     NotApplicable { reason: String },

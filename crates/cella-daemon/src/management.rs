@@ -252,37 +252,80 @@ async fn handle_probe_container(
     container_id: String,
     ctx: &ManagementContext,
 ) -> ManagementResponse {
-    let runtime_uses_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
     // A cross-service forward carries a `target_host` and is tunnelled whatever
     // the runtime, so a container whose every forward is cross-service does not
     // depend on the direct path and must not be judged by it.
     let pm = ctx.port_manager.lock().await;
     let ip = pm.container_ip(&container_id).map(str::to_string);
+    let transport = pm.transport(&container_id);
     let has_direct_forward = pm.has_direct_forward(&container_id);
     let host_ports = pm.forward_host_ports(&container_id);
     drop(pm);
 
-    let result = if !runtime_uses_direct_ip || !has_direct_forward {
-        cella_protocol::ContainerProbeResult::NotApplicable {
-            reason: "forwards for this container run through the agent tunnel, so there is no \
-                     direct connection to test"
-                .to_string(),
-        }
-    } else {
-        match ip {
+    let result = match transport {
+        Some(ContainerTransport::Tunnel) => tunnelled_verdict(&ctx.probe_memo, ip.as_deref()).await,
+        _ if !has_direct_forward => no_direct_path_to_test(),
+        _ => match ip {
             Some(ip) => {
                 let probed = crate::reachability::probe_ip(&ip).await;
-                corroborate(probed, &host_ports, &ctx.forward_health).await
+                let corroborated = corroborate(probed, &host_ports, &ctx.forward_health).await;
+                name_the_path(corroborated)
             }
             None => cella_protocol::ContainerProbeResult::Unknown {
                 reason: format!("the daemon has no recorded address for {container_id}"),
             },
-        }
+        },
     };
 
     ManagementResponse::ContainerProbe {
         container_id,
         result,
+    }
+}
+
+fn no_direct_path_to_test() -> cella_protocol::ContainerProbeResult {
+    cella_protocol::ContainerProbeResult::NotApplicable {
+        reason: "forwards for this container run through the agent tunnel, so there is no direct \
+                 connection to test"
+            .to_string(),
+    }
+}
+
+/// Report a container whose forwards the daemon does not dial by address.
+///
+/// Where the runtime never offered that path, saying so is the whole answer.
+/// Where it did and the probe was refused, the forwards still work but the
+/// host is denying this process a route it advertises, so the verdict carries
+/// what was seen rather than reading as a normal tunnelled container.
+async fn tunnelled_verdict(
+    memo: &crate::reachability::SharedProbeMemo,
+    ip: Option<&str>,
+) -> cella_protocol::ContainerProbeResult {
+    let recalled = match ip {
+        Some(ip) => memo.lock().await.recall(ip).cloned(),
+        None => None,
+    };
+    match recalled {
+        Some(cella_protocol::ContainerProbeResult::Unreachable { error }) => {
+            cella_protocol::ContainerProbeResult::SwitchedToTunnel { observed: error }
+        }
+        _ => no_direct_path_to_test(),
+    }
+}
+
+/// Name the path a healthy verdict is about, since reaching a container's
+/// address and reaching it through the agent are different facts and the
+/// report has to say which one it tested.
+fn name_the_path(
+    result: cella_protocol::ContainerProbeResult,
+) -> cella_protocol::ContainerProbeResult {
+    match result {
+        cella_protocol::ContainerProbeResult::Reachable { detail } => {
+            cella_protocol::ContainerProbeResult::Reachable {
+                detail: format!("{detail}, and its forwards are dialled at that address"),
+            }
+        }
+        other => other,
     }
 }
 
@@ -1099,6 +1142,109 @@ mod tests {
             result,
             cella_protocol::ContainerProbeResult::Reachable { .. }
         ));
+    }
+
+    /// Register one container and answer a probe for it, without going near a
+    /// network: every case here is decided by what registration recorded.
+    async fn probe_after_registering(
+        ctx: &ManagementContext,
+        transport: ContainerTransport,
+        recalled: Option<cella_protocol::ContainerProbeResult>,
+    ) -> cella_protocol::ContainerProbeResult {
+        ctx.port_manager.lock().await.register_container(
+            crate::port_manager::ContainerRegistrationInfo {
+                transport,
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            },
+        );
+        if let Some(verdict) = recalled {
+            ctx.probe_memo.lock().await.remember("172.20.0.5", verdict);
+        }
+
+        let resp = handle_probe_container("c1".to_string(), ctx).await;
+        let ManagementResponse::ContainerProbe { result, .. } = resp else {
+            panic!("expected a container probe response");
+        };
+        result
+    }
+
+    #[tokio::test]
+    async fn a_container_switched_by_the_probe_is_worth_reporting() {
+        let (ctx, _srx) = test_management_context(0);
+        let result = probe_after_registering(
+            &ctx,
+            ContainerTransport::Tunnel,
+            Some(cella_protocol::ContainerProbeResult::Unreachable {
+                error: "connecting to 172.20.0.5 failed: No route to host (os error 65)"
+                    .to_string(),
+            }),
+        )
+        .await;
+
+        let cella_protocol::ContainerProbeResult::SwitchedToTunnel { observed } = result else {
+            panic!("a host that refused the direct path must not report as ordinary: {result:?}");
+        };
+        assert!(observed.contains("No route to host"), "{observed}");
+    }
+
+    #[tokio::test]
+    async fn a_container_that_was_always_tunnelled_is_not_a_finding() {
+        // No probe was ever refused for it, so there is nothing to warn about:
+        // this is a runtime that does not route container addresses at all.
+        let (ctx, _srx) = test_management_context(0);
+        let result = probe_after_registering(&ctx, ContainerTransport::Tunnel, None).await;
+        assert!(
+            matches!(
+                result,
+                cella_protocol::ContainerProbeResult::NotApplicable { .. }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cross_service_only_container_is_not_a_finding() {
+        // Its forwards carry a target host and take the tunnel whatever the
+        // transport, so the direct path is not what it depends on.
+        let (ctx, _srx) = test_management_context(0);
+        {
+            let mut pm = ctx.port_manager.lock().await;
+            pm.register_container(crate::port_manager::ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            pm.handle_forward_open(
+                "c1",
+                5432,
+                Some("db"),
+                cella_protocol::PortProtocol::Tcp,
+                None,
+            );
+        }
+
+        let resp = handle_probe_container("c1".to_string(), &ctx).await;
+        let ManagementResponse::ContainerProbe { result, .. } = resp else {
+            panic!("expected a container probe response");
+        };
+        assert!(
+            matches!(
+                result,
+                cella_protocol::ContainerProbeResult::NotApplicable { .. }
+            ),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

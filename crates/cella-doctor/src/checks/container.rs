@@ -498,6 +498,23 @@ fn grade_probe_answer(
                     .to_string(),
             ),
         ),
+        ContainerProbeResult::SwitchedToTunnel { observed } => (
+            Severity::Warning,
+            format!(
+                "forwards for this container go through the agent tunnel because the daemon \
+                 could not reach its address when it registered: {observed}"
+            ),
+            Some(
+                "The forwards work, but this host is not giving the daemon the direct route its \
+                 container runtime advertises, and they stop working whenever the container's \
+                 agent is not connected. On macOS a local-network policy denial scoped to the \
+                 daemon process looks exactly like this: check Privacy & Security > Local \
+                 Network in System Settings, and any firewall rule naming cella. The verdict is \
+                 held for as long as the daemon runs, so after changing that, run `cella daemon \
+                 stop` and start the workspace again."
+                    .to_string(),
+            ),
+        ),
         ContainerProbeResult::NotApplicable { reason }
         | ContainerProbeResult::Unknown { reason } => (Severity::Info, reason, None),
     };
@@ -701,6 +718,44 @@ mod tests {
             assert_eq!(check.severity, Severity::Error);
             assert!(check.detail.contains("no route to host"), "{check:?}");
         }
+    }
+
+    /// The forwards work, so this is not an error — but the host is denying
+    /// the daemon a route its runtime advertises, and nothing else says so.
+    #[test]
+    fn a_container_moved_onto_the_tunnel_by_a_probe_is_a_warning() {
+        for needs_daemon in [true, false] {
+            let check = grade_probe_answer(
+                Ok(ContainerProbeResult::SwitchedToTunnel {
+                    observed: "connecting to 172.20.0.5 failed: No route to host".to_string(),
+                }),
+                needs_daemon,
+            );
+            assert_eq!(check.severity, Severity::Warning);
+            assert!(check.detail.contains("agent tunnel"), "{check:?}");
+            assert!(check.detail.contains("No route to host"), "{check:?}");
+            assert!(
+                check
+                    .fix_hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("Local Network")),
+                "the likeliest cause has to be named: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normally_tunnelled_container_is_only_informational() {
+        let check = grade_probe_answer(
+            Ok(ContainerProbeResult::NotApplicable {
+                reason: "forwards for this container run through the agent tunnel, so there is \
+                         no direct connection to test"
+                    .to_string(),
+            }),
+            true,
+        );
+        assert_eq!(check.severity, Severity::Info);
+        assert!(check.fix_hint.is_none());
     }
 
     #[test]

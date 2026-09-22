@@ -88,10 +88,11 @@ pub async fn probe_ip(ip: &str) -> ContainerProbeResult {
 /// A policy that denies this process the container bridge denies the whole
 /// interface rather than one address, so a neighbouring container's verdict
 /// answers for the block. That matters because registration is a blocking
-/// request and response per container: compose brings its services up one at
-/// a time, so an unmemoized probe would add its own timeout to every service
-/// of every `cella up`. Healthy verdicts are kept for the same reason — a host
-/// that works pays for at most one probe per block.
+/// request and response per container, and a daemon that has just started
+/// re-registers every running container in one sequential loop: an unmemoized
+/// probe would add its own timeout once per container there. Healthy verdicts
+/// are kept for the same reason — a host that works pays for at most one probe
+/// per block.
 #[derive(Default)]
 pub(crate) struct ProbeMemo {
     verdicts: HashMap<String, ContainerProbeResult>,
@@ -111,7 +112,7 @@ impl ProbeMemo {
         self.verdicts.get(&block_of(ip))
     }
 
-    fn remember(&mut self, ip: &str, verdict: ContainerProbeResult) {
+    pub(crate) fn remember(&mut self, ip: &str, verdict: ContainerProbeResult) {
         self.verdicts.insert(block_of(ip), verdict);
     }
 }

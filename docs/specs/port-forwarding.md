@@ -47,6 +47,13 @@ Three crates implement this system:
 | `Localhost` | Host-port proxy already bound | `proxy -> 127.0.0.1:host_port` |
 | `AgentTunnel` | Colima, Docker Desktop for Mac | `proxy -> reverse tunnel -> container:port` |
 
+The runtime decides which mode is *available*, not whether this process can use it: a host may route container addresses and still deny the daemon that route, in which case every direct forward binds, accepts and drops.
+Registration therefore probes the container's own address wherever the runtime offers direct addressing, and records `Direct` or `Tunnel` on the container; every forward for it reads that record rather than rederiving the rule.
+Only an explicit refusal — host or network unreachable, or permission denied — moves a container onto the tunnel, because the probe dials a port the workspace does not use and silence there is indistinguishable from a filter.
+Verdicts are memoized per /24 for the daemon's lifetime, since a denial is scoped to the process and the interface rather than to one address.
+Every cella container normally sits on one shared bridge network, so in practice the first verdict answers for all of them: re-registering a container re-reads that verdict, and only an address in another /24 — or a restarted daemon — probes again.
+`cella doctor` reports a container moved onto the tunnel this way as a warning: its forwards work, but they now depend on the agent being connected, and the host is not delivering the route its runtime advertises.
+
 ## Port Detection
 
 ### Proc scanning
