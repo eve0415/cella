@@ -638,6 +638,27 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Log a control-socket client arriving or leaving.
+///
+/// Every in-container `cella` subcommand, the git credential helper and the
+/// clipboard and browser handlers open this socket as transient clients, so
+/// reporting them as the agent makes a burst of ordinary CLI activity
+/// indistinguishable from an agent that cannot stay connected.
+fn log_client_arrival(hs: &HandshakeResult, connected: bool) {
+    match (hs.transient, connected) {
+        (false, true) => info!("Agent connected for container {}", hs.container_name),
+        (false, false) => info!("Agent disconnected for container {}", hs.container_name),
+        (true, true) => debug!(
+            "Transient client connected for container {}",
+            hs.container_name
+        ),
+        (true, false) => debug!(
+            "Transient client disconnected for container {}",
+            hs.container_name
+        ),
+    }
+}
+
 async fn handle_agent_connection_after_hello(
     agent_hello: AgentHello,
     mut reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
@@ -649,7 +670,7 @@ async fn handle_agent_connection_after_hello(
     };
     let mut line = String::new();
 
-    info!("Agent connected for container {}", hs.container_name);
+    log_client_arrival(&hs, true);
 
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
@@ -720,7 +741,7 @@ async fn handle_agent_connection_after_hello(
             }
         }
     }
-    info!("Agent disconnected for container {}", hs.container_name);
+    log_client_arrival(&hs, false);
 
     result
 }
@@ -3528,6 +3549,71 @@ mod tests {
             matches!(result, Ok(None)),
             "handshake must reject and return Ok(None) for unknown container"
         );
+    }
+
+    /// Capture what `log_client_arrival` emits at info level.
+    ///
+    /// The gate this pins is one the surrounding handler already applies to
+    /// every state mutation, so a burst of ordinary CLI activity inside a
+    /// container must not read as an agent that cannot stay connected.
+    fn info_output_for(transient: bool) -> String {
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone, Default)]
+        struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let mut hs = handshake_for("cella-demo-1234abcd", false);
+        hs.transient = transient;
+
+        let buf = CaptureWriter::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(buf)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_client_arrival(&hs, true);
+            log_client_arrival(&hs, false);
+        });
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_transient_client_is_not_reported_as_the_agent() {
+        let captured = info_output_for(true);
+        assert!(
+            !captured.contains("Agent connected"),
+            "a one-shot CLI client must not read as the agent arriving: {captured}"
+        );
+        assert!(
+            !captured.contains("Agent disconnected"),
+            "a one-shot CLI client must not read as the agent leaving: {captured}"
+        );
+    }
+
+    #[test]
+    fn the_persistent_agent_is_still_reported() {
+        let captured = info_output_for(false);
+        assert!(captured.contains("Agent connected"), "{captured}");
+        assert!(captured.contains("Agent disconnected"), "{captured}");
     }
 
     fn handshake_for(name: &str, claude_config_sync: bool) -> HandshakeResult {
