@@ -509,7 +509,9 @@ fn grade_probe_answer(
                  container runtime advertises, and they stop working whenever the container's \
                  agent is not connected. On macOS a local-network policy denial scoped to the \
                  daemon process looks exactly like this: check Privacy & Security > Local \
-                 Network in System Settings, and any firewall rule naming cella. The verdict is \
+                 Network in System Settings, and any firewall rule naming cella. A grant held by \
+                 the terminal that started the daemon does not always reach the daemon itself. \
+                 The verdict is \
                  held for as long as the daemon runs, so after changing that, run `cella daemon \
                  stop` and start the workspace again."
                     .to_string(),
