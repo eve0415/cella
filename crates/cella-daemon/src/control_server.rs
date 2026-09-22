@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
 use crate::credential::invoke_git_credential;
-use crate::port_manager::PortManager;
+use crate::port_manager::{ContainerTransport, PortManager};
 use crate::proxy::ProxyCommand;
 use crate::tunnel::TunnelBroker;
 
@@ -38,7 +38,6 @@ pub(crate) struct ControlContext {
     pub cella_bin: std::path::PathBuf,
     pub tunnel_broker: Arc<TunnelBroker>,
     pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
-    pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
     /// One merge hub per synced document, each with its own lock so a plugin
     /// manifest write never blocks a `~/.claude.json` write. Keyed by document,
@@ -629,13 +628,33 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
         proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
         container_ip: hs.container_ip.as_deref(),
         container_name: Some(&hs.container_name),
-        is_orbstack: ctx.is_orbstack,
         hostname_route_table: ctx.hostname_route_table.clone(),
     };
     if let Some(resp) = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await {
         send_message(writer, &resp).await?;
     }
     Ok(())
+}
+
+/// Log a control-socket client arriving or leaving.
+///
+/// Every in-container `cella` subcommand, the git credential helper and the
+/// clipboard and browser handlers open this socket as transient clients, so
+/// reporting them as the agent makes a burst of ordinary CLI activity
+/// indistinguishable from an agent that cannot stay connected.
+fn log_client_arrival(hs: &HandshakeResult, connected: bool) {
+    match (hs.transient, connected) {
+        (false, true) => info!("Agent connected for container {}", hs.container_name),
+        (false, false) => info!("Agent disconnected for container {}", hs.container_name),
+        (true, true) => debug!(
+            "Transient client connected for container {}",
+            hs.container_name
+        ),
+        (true, false) => debug!(
+            "Transient client disconnected for container {}",
+            hs.container_name
+        ),
+    }
 }
 
 async fn handle_agent_connection_after_hello(
@@ -649,7 +668,7 @@ async fn handle_agent_connection_after_hello(
     };
     let mut line = String::new();
 
-    info!("Agent connected for container {}", hs.container_name);
+    log_client_arrival(&hs, true);
 
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
@@ -720,7 +739,7 @@ async fn handle_agent_connection_after_hello(
             }
         }
     }
-    info!("Agent disconnected for container {}", hs.container_name);
+    log_client_arrival(&hs, false);
 
     result
 }
@@ -734,7 +753,6 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
     pub container_ip: Option<&'a str>,
     pub container_name: Option<&'a str>,
-    pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
 
@@ -793,16 +811,21 @@ async fn handle_port_open(
     };
 
     let target_port = proxy_port.unwrap_or(port);
-    let current_container_ip = {
+    // The transport was decided when the container registered. A container
+    // this daemon has no record of has no address to dial either, so its
+    // forwards can only go through the agent that reported them.
+    let (current_container_ip, transport) = {
         let pm = ctx.port_manager.lock().await;
-        pm.container_ip(&cid).map(str::to_string)
+        (
+            pm.container_ip(&cid).map(str::to_string),
+            pm.transport(&cid).unwrap_or(ContainerTransport::Tunnel),
+        )
     };
 
     if let Some(tx) = ctx.proxy_cmd_tx
         && !already_forwarded
     {
-        let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
-        let target = if use_direct_ip {
+        let target = if transport == ContainerTransport::Direct {
             if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
                 ProxyStartTarget::DirectIp {
                     ip: ip.to_string(),
@@ -3189,6 +3212,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3216,6 +3240,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test-a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3225,6 +3250,7 @@ mod tests {
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "test-b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -3248,6 +3274,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3257,6 +3284,7 @@ mod tests {
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -3353,7 +3381,6 @@ mod tests {
             cella_bin: std::path::PathBuf::from("/nonexistent"),
             tunnel_broker: Arc::new(TunnelBroker::new()),
             phantom_registry: Arc::new(Mutex::new(crate::phantom_registry::PhantomRegistry::new())),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -3528,6 +3555,71 @@ mod tests {
             matches!(result, Ok(None)),
             "handshake must reject and return Ok(None) for unknown container"
         );
+    }
+
+    /// Capture what `log_client_arrival` emits at info level.
+    ///
+    /// The gate this pins is one the surrounding handler already applies to
+    /// every state mutation, so a burst of ordinary CLI activity inside a
+    /// container must not read as an agent that cannot stay connected.
+    fn info_output_for(transient: bool) -> String {
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone, Default)]
+        struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let mut hs = handshake_for("cella-demo-1234abcd", false);
+        hs.transient = transient;
+
+        let buf = CaptureWriter::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(buf)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_client_arrival(&hs, true);
+            log_client_arrival(&hs, false);
+        });
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_transient_client_is_not_reported_as_the_agent() {
+        let captured = info_output_for(true);
+        assert!(
+            !captured.contains("Agent connected"),
+            "a one-shot CLI client must not read as the agent arriving: {captured}"
+        );
+        assert!(
+            !captured.contains("Agent disconnected"),
+            "a one-shot CLI client must not read as the agent leaving: {captured}"
+        );
+    }
+
+    #[test]
+    fn the_persistent_agent_is_still_reported() {
+        let captured = info_output_for(false);
+        assert!(captured.contains("Agent connected"), "{captured}");
+        assert!(captured.contains("Agent disconnected"), "{captured}");
     }
 
     fn handshake_for(name: &str, claude_config_sync: bool) -> HandshakeResult {
@@ -4369,7 +4461,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4404,7 +4495,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4433,7 +4523,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4462,7 +4551,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4493,7 +4581,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4518,6 +4605,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4538,7 +4626,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4570,7 +4657,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4616,7 +4702,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4653,6 +4738,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4662,6 +4748,7 @@ branch refs/heads/feat-b
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -4694,6 +4781,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4714,7 +4802,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4747,6 +4834,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4770,7 +4858,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: routes.clone(),
         };
 
@@ -4829,6 +4916,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4853,7 +4941,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: Some("172.20.0.5"),
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4880,6 +4967,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: None,
@@ -4901,7 +4989,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: Some(&proxy_tx),
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4928,6 +5015,7 @@ branch refs/heads/feat-b
         pm.lock()
             .await
             .register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: None,
@@ -4979,7 +5067,6 @@ branch refs/heads/feat-b
             // updated the daemon's container IP state.
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),

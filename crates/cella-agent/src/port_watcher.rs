@@ -93,6 +93,16 @@ async fn maybe_start_localhost_proxy(
     }
 }
 
+/// Whether `port` is a relay this agent opened rather than a service to forward.
+///
+/// `proxy_localhost_to_all` binds `0.0.0.0`, so the next scan finds the relay
+/// itself and would forward it a second time alongside the loopback service it
+/// exists to serve. The service's own report already carries the relay port as
+/// its target, so the relay never needs a forward of its own.
+fn is_own_relay(port: u16, proxy_ports: &HashMap<u16, u16>) -> bool {
+    proxy_ports.values().any(|&relay| relay == port)
+}
+
 /// Record a port mapping received from the daemon.
 async fn record_port_mapping(port_map: &PortMap, container_port: u16, host_port: u16) {
     debug!("Port mapping: container:{container_port} -> host:{host_port}");
@@ -274,6 +284,9 @@ pub async fn run(
         for listener in &current {
             let key = (listener.port, listener.protocol);
             if known.contains_key(&key) {
+                continue;
+            }
+            if is_own_relay(listener.port, &proxy_ports) {
                 continue;
             }
 
@@ -477,5 +490,28 @@ mod tests {
             !handled,
             "unrelated daemon messages should not mark the listener as reported"
         );
+    }
+
+    /// The relay is forwarded once, as the service's target, never on its own.
+    #[test]
+    fn an_agent_relay_is_not_a_service() {
+        let mut proxy_ports = HashMap::new();
+        // A loopback service on 5173 relayed through an OS-assigned 41869.
+        proxy_ports.insert(5173u16, 41869u16);
+
+        assert!(
+            is_own_relay(41869, &proxy_ports),
+            "the relay this agent opened must not be forwarded a second time"
+        );
+        assert!(
+            !is_own_relay(5173, &proxy_ports),
+            "the service the relay serves is still a service"
+        );
+        assert!(!is_own_relay(8787, &proxy_ports));
+    }
+
+    #[test]
+    fn nothing_is_a_relay_before_one_is_started() {
+        assert!(!is_own_relay(41869, &HashMap::new()));
     }
 }
