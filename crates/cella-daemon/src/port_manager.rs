@@ -13,6 +13,22 @@ pub fn is_host_port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+/// How the daemon reaches a container's forwards.
+///
+/// Recorded per container rather than recomputed from the runtime rule at each
+/// call site: the rule says whether container addresses are routable on this
+/// host, which is not the same as this process being allowed to use them. A
+/// host that routes to the container while denying the daemon that path needs
+/// every forward for it on the tunnel, and only a probe of that container's
+/// address can tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerTransport {
+    /// Dialled at the container's own address.
+    Direct,
+    /// Carried by the agent's reverse tunnel.
+    Tunnel,
+}
+
 /// Tracks detected ports and forwarded ports per container.
 pub struct PortManager {
     /// Active containers and their detected ports.
@@ -29,6 +45,8 @@ pub struct PortManager {
 struct ContainerPorts {
     container_name: String,
     container_ip: Option<String>,
+    /// How this container's own forwards are reached, decided at registration.
+    transport: ContainerTransport,
     detected_ports: Vec<DetectedPort>,
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
@@ -57,6 +75,9 @@ pub struct ContainerRegistrationInfo {
     pub container_id: String,
     pub container_name: String,
     pub container_ip: Option<String>,
+    /// How this container's forwards are reached. Decided by the caller before
+    /// registering, so every later read of it is the same answer.
+    pub transport: ContainerTransport,
     pub ports_attributes: Vec<PortAttributes>,
     pub other_ports_attributes: Option<PortAttributes>,
     pub project_name: Option<String>,
@@ -125,6 +146,7 @@ impl PortManager {
             ContainerPorts {
                 container_name: info.container_name,
                 container_ip: info.container_ip,
+                transport: info.transport,
                 detected_ports: Vec::new(),
                 ports_attributes: info.ports_attributes,
                 other_ports_attributes: info.other_ports_attributes,
@@ -170,6 +192,15 @@ impl PortManager {
         } else {
             false
         }
+    }
+
+    /// The transport recorded for a container at registration.
+    ///
+    /// `None` for a container this daemon has no record of, which callers
+    /// answer for themselves: a forward can only be dialled directly at an
+    /// address the port manager knows.
+    pub fn transport(&self, container_id: &str) -> Option<ContainerTransport> {
+        self.containers.get(container_id).map(|c| c.transport)
     }
 
     /// Get the container's IP address.
@@ -388,6 +419,8 @@ impl PortManager {
     /// Whether any of `container_id`'s forwards are reached on the container
     /// itself rather than through a cross-service tunnel.
     ///
+    /// A container recorded as tunnelled has none: its own forwards take the
+    /// agent's tunnel too, so nothing it serves depends on the direct path.
     /// A container with no forwards yet counts as direct: nothing contradicts
     /// it. An unknown container does too, so callers fall through to whatever
     /// they do when the container is not registered.
@@ -395,6 +428,9 @@ impl PortManager {
         let Some(container) = self.containers.get(container_id) else {
             return true;
         };
+        if container.transport == ContainerTransport::Tunnel {
+            return false;
+        }
         let mut forwarded = container
             .detected_ports
             .iter()
@@ -511,6 +547,7 @@ mod tests {
     fn register_and_detect_port() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test-container".to_string(),
             container_ip: None,
@@ -531,6 +568,7 @@ mod tests {
     fn port_remapping_on_conflict() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "container-a".to_string(),
             container_ip: None,
@@ -540,6 +578,7 @@ mod tests {
             branch: None,
         });
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c2".to_string(),
             container_name: "container-b".to_string(),
             container_ip: None,
@@ -569,6 +608,7 @@ mod tests {
             ..PortAttributes::default()
         }];
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -587,6 +627,7 @@ mod tests {
     fn unregister_releases_ports() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -608,6 +649,7 @@ mod tests {
         let mut pm = PortManager::new(false);
         for id in ["direct", "cross", "empty"] {
             pm.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: id.to_string(),
                 container_name: id.to_string(),
                 container_ip: None,
@@ -634,9 +676,53 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnelled_container_has_no_direct_forward() {
+        // Its own forwards take the tunnel too, so nothing it serves is
+        // evidence about reaching the container's address.
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Tunnel,
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: Some("172.20.0.5".to_string()),
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+
+        assert_eq!(pm.transport("c1"), Some(ContainerTransport::Tunnel));
+        assert!(!pm.has_direct_forward("c1"));
+    }
+
+    #[test]
+    fn transport_is_recorded_at_registration() {
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+
+        assert_eq!(pm.transport("c1"), Some(ContainerTransport::Direct));
+        assert_eq!(
+            pm.transport("never-registered"),
+            None,
+            "an unknown container has no recorded transport to read"
+        );
+    }
+
+    #[test]
     fn has_direct_forward_sees_a_mix_as_direct() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -655,6 +741,7 @@ mod tests {
     fn register_stores_container_ip() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: Some("172.20.0.5".to_string()),
@@ -671,6 +758,7 @@ mod tests {
     fn register_without_container_ip() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -749,6 +837,7 @@ mod tests {
     fn duplicate_port_open_returns_existing() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -769,6 +858,7 @@ mod tests {
     fn hostname_route_uses_sanitized_project_branch_and_host_port() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -790,6 +880,7 @@ mod tests {
     fn branch_slug_collision_gets_suffix_for_second_branch() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "one".to_string(),
             container_ip: None,
@@ -799,6 +890,7 @@ mod tests {
             branch: Some("a/b".to_string()),
         });
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c2".to_string(),
             container_name: "two".to_string(),
             container_ip: None,
@@ -821,6 +913,7 @@ mod tests {
     fn port_close_releases_allocation() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -840,6 +933,7 @@ mod tests {
     fn re_register_releases_old_allocations() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -854,6 +948,7 @@ mod tests {
         // Re-register simulates a container restart: old allocations must be
         // released so the agent can reclaim the native port.
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -874,6 +969,7 @@ mod tests {
     fn update_container_ip_preserves_ports() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -906,6 +1002,7 @@ mod tests {
         // dedup guard is keyed on (port, target_host), so each is distinct.
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -932,6 +1029,7 @@ mod tests {
         // The dedup guard still coalesces a re-reported identical forward.
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -953,6 +1051,7 @@ mod tests {
         // other host:port forward) sharing the container port.
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,
@@ -983,6 +1082,7 @@ mod tests {
     fn host_forward_carries_target_host_in_forwarded_info() {
         let mut pm = PortManager::new(false);
         pm.register_container(ContainerRegistrationInfo {
+            transport: ContainerTransport::Direct,
             container_id: "c1".to_string(),
             container_name: "test".to_string(),
             container_ip: None,

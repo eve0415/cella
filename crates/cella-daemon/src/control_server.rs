@@ -3202,7 +3202,7 @@ mod tests {
     use cella_protocol::PortProtocol;
 
     use super::*;
-    use crate::port_manager::ContainerRegistrationInfo;
+    use crate::port_manager::{ContainerRegistrationInfo, ContainerTransport};
 
     /// Helper to set up a port manager with a forwarded port for testing.
     async fn pm_with_forwarded_port(container_port: u16) -> Arc<Mutex<PortManager>> {
@@ -3210,6 +3210,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3237,6 +3238,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test-a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3246,6 +3248,7 @@ mod tests {
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "test-b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -3269,6 +3272,7 @@ mod tests {
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -3278,6 +3282,7 @@ mod tests {
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -4604,6 +4609,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4739,6 +4745,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "a".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4748,6 +4755,7 @@ branch refs/heads/feat-b
                 branch: None,
             });
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c2".to_string(),
                 container_name: "b".to_string(),
                 container_ip: Some("172.20.0.6".to_string()),
@@ -4780,6 +4788,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4833,6 +4842,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4915,6 +4925,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -4966,6 +4977,7 @@ branch refs/heads/feat-b
         {
             let mut guard = pm.lock().await;
             guard.register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: None,
@@ -5014,6 +5026,7 @@ branch refs/heads/feat-b
         pm.lock()
             .await
             .register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test".to_string(),
                 container_ip: None,

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
 use crate::control_server::{AgentConnectionState, ContainerHandle, current_time_secs};
-use crate::port_manager::PortManager;
+use crate::port_manager::{ContainerTransport, PortManager};
 use crate::proxy::ProxyCommand;
 
 /// Shared context for the management server and its connection handlers.
@@ -522,6 +522,7 @@ async fn handle_register(
             .lock()
             .await
             .register_container(ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: reg.container_id,
                 container_name: reg.container_name,
                 container_ip: reg.container_ip,
@@ -1084,6 +1085,7 @@ mod tests {
         {
             let mut guard = ctx.port_manager.lock().await;
             guard.register_container(crate::port_manager::ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test-container".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -1125,6 +1127,7 @@ mod tests {
         let (ctx, _srx) = test_management_context(0);
         ctx.port_manager.lock().await.register_container(
             crate::port_manager::ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test-container".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
@@ -1168,6 +1171,7 @@ mod tests {
         let (ctx, _srx) = test_management_context(0);
         ctx.port_manager.lock().await.register_container(
             crate::port_manager::ContainerRegistrationInfo {
+                transport: ContainerTransport::Direct,
                 container_id: "c1".to_string(),
                 container_name: "test-container".to_string(),
                 container_ip: Some("172.20.0.5".to_string()),
