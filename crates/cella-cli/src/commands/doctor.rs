@@ -95,7 +95,14 @@ fn print_category(category: &CategoryReport) {
     }
 }
 
-fn print_check(check: &CheckResult) {
+/// Width of the name column.
+///
+/// The separating space is written rather than left to the padding, because a
+/// name this wide or wider pads to nothing and would otherwise run straight
+/// into its detail.
+const NAME_WIDTH: usize = 23;
+
+fn format_check(check: &CheckResult) -> String {
     let (symbol, color) = match check.severity {
         Severity::Pass => ("\u{2713}", "\x1b[32m"),    // green ✓
         Severity::Warning => ("\u{26a0}", "\x1b[33m"), // yellow ⚠
@@ -105,10 +112,16 @@ fn print_check(check: &CheckResult) {
 
     let reset = if color.is_empty() { "" } else { "\x1b[0m" };
 
-    eprintln!(
-        "  {color}{symbol}{reset} {:<24}{}",
-        check.name, check.detail
-    );
+    format!(
+        "  {color}{symbol}{reset} {:<width$} {}",
+        check.name,
+        check.detail,
+        width = NAME_WIDTH
+    )
+}
+
+fn print_check(check: &CheckResult) {
+    eprintln!("{}", format_check(check));
 
     if let Some(ref hint) = check.fix_hint {
         eprintln!("    \x1b[2m\u{2192} {hint}\x1b[0m");
@@ -118,6 +131,38 @@ fn print_check(check: &CheckResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name that overflowed the column and glued itself to its detail.
+    #[test]
+    fn a_name_wider_than_the_column_keeps_its_separator() {
+        let rendered = format_check(&CheckResult {
+            name: "container reachable from host".to_string(),
+            detail: "connecting to 192.168.97.2 failed".to_string(),
+            severity: Severity::Error,
+            fix_hint: None,
+        });
+        assert!(
+            rendered.contains("host connecting"),
+            "a name at or past the column width must not absorb the separator: {rendered}"
+        );
+    }
+
+    /// Widening the column must not move the details that already line up.
+    #[test]
+    fn details_start_in_one_column_whatever_the_name() {
+        let offset = |name: &str| {
+            format_check(&CheckResult {
+                name: name.to_string(),
+                detail: "DETAIL".to_string(),
+                severity: Severity::Info,
+                fix_hint: None,
+            })
+            .find("DETAIL")
+        };
+
+        assert_eq!(offset("cella"), offset("devcontainer.json"));
+        assert_eq!(offset("cella"), offset("git"));
+    }
 
     #[test]
     fn print_check_pass_does_not_panic() {
