@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
 use crate::credential::invoke_git_credential;
-use crate::port_manager::PortManager;
+use crate::port_manager::{ContainerTransport, PortManager};
 use crate::proxy::ProxyCommand;
 use crate::tunnel::TunnelBroker;
 
@@ -38,7 +38,6 @@ pub(crate) struct ControlContext {
     pub cella_bin: std::path::PathBuf,
     pub tunnel_broker: Arc<TunnelBroker>,
     pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
-    pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
     /// One merge hub per synced document, each with its own lock so a plugin
     /// manifest write never blocks a `~/.claude.json` write. Keyed by document,
@@ -629,7 +628,6 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
         proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
         container_ip: hs.container_ip.as_deref(),
         container_name: Some(&hs.container_name),
-        is_orbstack: ctx.is_orbstack,
         hostname_route_table: ctx.hostname_route_table.clone(),
     };
     if let Some(resp) = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await {
@@ -755,7 +753,6 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
     pub container_ip: Option<&'a str>,
     pub container_name: Option<&'a str>,
-    pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
 
@@ -814,16 +811,21 @@ async fn handle_port_open(
     };
 
     let target_port = proxy_port.unwrap_or(port);
-    let current_container_ip = {
+    // The transport was decided when the container registered. A container
+    // this daemon has no record of has no address to dial either, so its
+    // forwards can only go through the agent that reported them.
+    let (current_container_ip, transport) = {
         let pm = ctx.port_manager.lock().await;
-        pm.container_ip(&cid).map(str::to_string)
+        (
+            pm.container_ip(&cid).map(str::to_string),
+            pm.transport(&cid).unwrap_or(ContainerTransport::Tunnel),
+        )
     };
 
     if let Some(tx) = ctx.proxy_cmd_tx
         && !already_forwarded
     {
-        let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
-        let target = if use_direct_ip {
+        let target = if transport == ContainerTransport::Direct {
             if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
                 ProxyStartTarget::DirectIp {
                     ip: ip.to_string(),
@@ -3202,7 +3204,7 @@ mod tests {
     use cella_protocol::PortProtocol;
 
     use super::*;
-    use crate::port_manager::{ContainerRegistrationInfo, ContainerTransport};
+    use crate::port_manager::ContainerRegistrationInfo;
 
     /// Helper to set up a port manager with a forwarded port for testing.
     async fn pm_with_forwarded_port(container_port: u16) -> Arc<Mutex<PortManager>> {
@@ -3379,7 +3381,6 @@ mod tests {
             cella_bin: std::path::PathBuf::from("/nonexistent"),
             tunnel_broker: Arc::new(TunnelBroker::new()),
             phantom_registry: Arc::new(Mutex::new(crate::phantom_registry::PhantomRegistry::new())),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4460,7 +4461,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4495,7 +4495,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4524,7 +4523,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4553,7 +4551,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4584,7 +4581,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4630,7 +4626,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4662,7 +4657,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4708,7 +4702,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4809,7 +4802,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: None,
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4866,7 +4858,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: routes.clone(),
         };
 
@@ -4950,7 +4941,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: None,
             container_ip: Some("172.20.0.5"),
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -4999,7 +4989,6 @@ branch refs/heads/feat-b
             proxy_cmd_tx: Some(&proxy_tx),
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
@@ -5078,7 +5067,6 @@ branch refs/heads/feat-b
             // updated the daemon's container IP state.
             container_ip: None,
             container_name: Some("test"),
-            is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),

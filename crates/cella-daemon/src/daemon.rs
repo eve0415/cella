@@ -343,6 +343,7 @@ fn build_management_context(
         tunnel_broker,
         hostname_route_table: hostname_proxy.route_table,
         hostname_proxy: hostname_proxy.status,
+        probe_memo: crate::reachability::new_shared_memo(),
         phantom_registry: {
             let mut reg = crate::phantom_registry::PhantomRegistry::new();
             reg.reclaim_from_state_file();

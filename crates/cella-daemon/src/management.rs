@@ -43,6 +43,10 @@ pub(crate) struct ManagementContext {
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
     pub hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
     pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
+    /// Reachability verdicts already reached, so a host that denies this
+    /// process the container bridge is discovered once rather than per
+    /// container.
+    pub probe_memo: crate::reachability::SharedProbeMemo,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -101,7 +105,6 @@ pub(crate) async fn run_management_server(
             cella_bin: crate::control_server::resolve_cella_binary(),
             tunnel_broker: ctx.tunnel_broker.clone(),
             phantom_registry: ctx.phantom_registry.clone(),
-            is_orbstack: ctx.is_orbstack,
             hostname_route_table: ctx.hostname_route_table.clone(),
             doc_sync: crate::control_server::build_doc_sync_hubs(),
         };
@@ -516,13 +519,25 @@ async fn handle_register(
     let container_id = reg.container_id.clone();
     let container_name = reg.container_name.clone();
     let container_ip_clone = reg.container_ip.clone();
+
+    // Decided here, once, and read everywhere after: a host that routes to
+    // containers does not necessarily let this process dial them, and every
+    // forward for the container has to agree on which path it takes.
+    let transport = crate::reachability::decide_transport(
+        &ctx.probe_memo,
+        crate::orbstack::uses_direct_ip(ctx.is_orbstack),
+        reg.container_ip.as_deref(),
+        async |ip| crate::reachability::probe_ip(ip).await,
+    )
+    .await;
+
     let released = {
         use crate::port_manager::ContainerRegistrationInfo;
         ctx.port_manager
             .lock()
             .await
             .register_container(ContainerRegistrationInfo {
-                transport: ContainerTransport::Direct,
+                transport,
                 container_id: reg.container_id,
                 container_name: reg.container_name,
                 container_ip: reg.container_ip,
@@ -606,17 +621,23 @@ async fn preload_numeric_forward(
     container_ip: Option<&str>,
     port: u16,
 ) {
-    let Some(host_port) = ctx.port_manager.lock().await.handle_port_open(
-        container_id,
-        port,
-        cella_protocol::PortProtocol::Tcp,
-        None,
-    ) else {
+    let (host_port, transport) = {
+        let mut pm = ctx.port_manager.lock().await;
+        let host_port =
+            pm.handle_port_open(container_id, port, cella_protocol::PortProtocol::Tcp, None);
+        // A container that is not registered has no transport of its own, and
+        // no host port either, so this pairing never reaches the fork below.
+        (
+            host_port,
+            pm.transport(container_id)
+                .unwrap_or(ContainerTransport::Tunnel),
+        )
+    };
+    let Some(host_port) = host_port else {
         return;
     };
 
-    let use_direct_ip = crate::orbstack::uses_direct_ip(ctx.is_orbstack);
-    let target = if use_direct_ip {
+    let target = if transport == ContainerTransport::Direct {
         if let Some(ip) = container_ip {
             crate::proxy::ProxyStartTarget::DirectIp {
                 ip: ip.to_string(),
@@ -896,6 +917,7 @@ mod tests {
                 using_fallback_port: false,
             }),
             phantom_registry: Arc::new(Mutex::new(crate::phantom_registry::PhantomRegistry::new())),
+            probe_memo: crate::reachability::new_shared_memo(),
         };
         (ctx, srx)
     }
