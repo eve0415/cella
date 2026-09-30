@@ -20,8 +20,8 @@ mod test_utils;
 
 pub use cache::FeatureCache;
 pub use dockerfile::{
-    FEATURE_CONTENT_SOURCE, generate_builtin_env, generate_dockerfile, generate_entrypoint_script,
-    generate_feature_env, generate_wrapper_script,
+    FEATURE_CONTENT_SOURCE, generate_builtin_env, generate_dockerfile, generate_feature_env,
+    generate_wrapper_script,
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
@@ -403,16 +403,9 @@ fn generate_and_write_build_context(
         resolved,
         use_named_content_source,
     );
-    let entrypoint_script = generate_entrypoint_script(resolved);
     let builtin_env = generate_builtin_env(container_user, remote_user);
 
-    prepare_build_context(
-        build_context,
-        resolved,
-        &dockerfile,
-        entrypoint_script.as_deref(),
-        &builtin_env,
-    )?;
+    prepare_build_context(build_context, resolved, &dockerfile, &builtin_env)?;
 
     Ok(dockerfile)
 }
@@ -928,7 +921,6 @@ fn prepare_build_context(
     build_context: &Path,
     resolved: &[ResolvedFeature],
     dockerfile: &str,
-    entrypoint_script: Option<&str>,
     builtin_env: &str,
 ) -> Result<(), FeatureError> {
     std::fs::create_dir_all(build_context)?;
@@ -963,10 +955,6 @@ fn prepare_build_context(
             build_context.join("devcontainer-features.builtin.env"),
             builtin_env,
         )?;
-    }
-
-    if let Some(script) = entrypoint_script {
-        std::fs::write(build_context.join("docker-init.sh"), script)?;
     }
 
     Ok(())

@@ -55,8 +55,6 @@ pub fn generate_dockerfile(
         write_feature_install_blocks(&mut out, &installable, use_named_content_source);
     }
 
-    write_entrypoint_section(&mut out, features, use_named_content_source);
-
     if !installable.is_empty() {
         write_cleanup_and_user_reset(&mut out);
     }
@@ -191,31 +189,6 @@ fn write_feature_container_env(out: &mut String, feature: &ResolvedFeature) {
     }
 }
 
-/// Write entrypoint init script COPY+RUN if any feature declares an entrypoint.
-fn write_entrypoint_section(
-    out: &mut String,
-    features: &[ResolvedFeature],
-    use_named_content_source: bool,
-) {
-    let has_entrypoints = features.iter().any(|f| f.metadata.entrypoint.is_some());
-
-    if has_entrypoints {
-        let from_clause = if use_named_content_source {
-            format!("--from={FEATURE_CONTENT_SOURCE} ")
-        } else {
-            String::new()
-        };
-        writeln!(out).unwrap();
-        writeln!(out, "# Entrypoint init script").unwrap();
-        writeln!(
-            out,
-            "COPY {from_clause}docker-init.sh /usr/local/share/docker-init.sh"
-        )
-        .unwrap();
-        writeln!(out, "RUN chmod +x /usr/local/share/docker-init.sh").unwrap();
-    }
-}
-
 /// Write final cleanup of /tmp/dev-container-features and USER reset via build arg.
 fn write_cleanup_and_user_reset(out: &mut String) {
     writeln!(out).unwrap();
@@ -232,30 +205,6 @@ fn write_cleanup_and_user_reset(out: &mut String) {
     // here would shadow the global value and force the container to root.
     writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER").unwrap();
     writeln!(out, "USER $_DEV_CONTAINERS_IMAGE_USER").unwrap();
-}
-
-/// Generate the entrypoint init script content for features with entrypoints.
-///
-/// Returns `None` if no features declare entrypoints.
-pub fn generate_entrypoint_script(features: &[ResolvedFeature]) -> Option<String> {
-    let entrypoints: Vec<&str> = features
-        .iter()
-        .filter_map(|f| f.metadata.entrypoint.as_deref())
-        .collect();
-
-    if entrypoints.is_empty() {
-        return None;
-    }
-
-    let mut out = String::new();
-    writeln!(out, "#!/bin/sh").unwrap();
-    writeln!(out, "# Entrypoints from devcontainer features").unwrap();
-    for ep in &entrypoints {
-        writeln!(out, "{ep}").unwrap();
-    }
-    writeln!(out, "exec \"$@\"").unwrap();
-
-    Some(out)
 }
 
 /// Generate `devcontainer-features.builtin.env` content.
@@ -878,62 +827,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Entrypoint init script generation
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn entrypoint_script_generated() {
-        let features = vec![
-            make_feature(
-                "feature-a",
-                "ghcr.io/example/feature-a:1",
-                true,
-                HashMap::new(),
-                FeatureMetadata {
-                    id: "feature-a".to_string(),
-                    entrypoint: Some("/usr/local/share/feature-a-init.sh".to_string()),
-                    ..Default::default()
-                },
-            ),
-            make_feature(
-                "feature-b",
-                "ghcr.io/example/feature-b:1",
-                true,
-                HashMap::new(),
-                FeatureMetadata {
-                    id: "feature-b".to_string(),
-                    entrypoint: Some("/usr/local/share/feature-b-init.sh".to_string()),
-                    ..Default::default()
-                },
-            ),
-        ];
-
-        let script = generate_entrypoint_script(&features).unwrap();
-        insta::assert_snapshot!(script);
-    }
-
-    // ---------------------------------------------------------------
-    // No entrypoint script when no features have entrypoints
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn no_entrypoint_script_when_none_declared() {
-        let features = vec![make_feature(
-            "tool",
-            "ghcr.io/example/tool:1",
-            true,
-            HashMap::new(),
-            FeatureMetadata {
-                id: "tool".to_string(),
-                ..Default::default()
-            },
-        )];
-
-        assert!(generate_entrypoint_script(&features).is_none());
-    }
-
-    // ---------------------------------------------------------------
-    // Dockerfile includes entrypoint COPY when features have entrypoints
+    // Feature entrypoints run from the container command, not the image
     // ---------------------------------------------------------------
 
     #[test]
@@ -954,43 +848,24 @@ mod tests {
         insta::assert_snapshot!(result);
     }
 
-    // ---------------------------------------------------------------
-    // Entrypoint from metadata-only feature still appears in script
-    // ---------------------------------------------------------------
-
+    /// docker-in-docker installs its init script at the path it declares as
+    /// its entrypoint; the features layer must leave that file untouched.
     #[test]
-    fn entrypoint_from_metadata_only_feature() {
-        let features = vec![
-            make_feature(
-                "installer",
-                "ghcr.io/example/installer:1",
-                true,
-                HashMap::new(),
-                FeatureMetadata {
-                    id: "installer".to_string(),
-                    ..Default::default()
-                },
-            ),
-            make_feature(
-                "meta",
-                "ghcr.io/example/meta:1",
-                false,
-                HashMap::new(),
-                FeatureMetadata {
-                    id: "meta".to_string(),
-                    entrypoint: Some("/usr/local/share/meta-init.sh".to_string()),
-                    ..Default::default()
-                },
-            ),
-        ];
+    fn dockerfile_leaves_feature_entrypoint_script_alone() {
+        let features = vec![make_feature(
+            "docker-in-docker",
+            "ghcr.io/devcontainers/features/docker-in-docker:2",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "docker-in-docker".to_string(),
+                entrypoint: Some("/usr/local/share/docker-init.sh".to_string()),
+                ..Default::default()
+            },
+        )];
 
-        let script = generate_entrypoint_script(&features).unwrap();
-        insta::assert_snapshot!(script);
-
-        // Dockerfile should still have COPY for init script
-        let dockerfile =
-            generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
-        insta::assert_snapshot!("dockerfile_with_metadata_only_entrypoint", dockerfile);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
+        assert!(!result.contains("docker-init.sh"), "{result}");
     }
 
     // ---------------------------------------------------------------
