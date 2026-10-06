@@ -15,6 +15,9 @@ pub enum SshAgentTransport {
     Runtime,
 }
 
+/// Warning shown after starting a container that expects a missing host agent.
+pub const MISSING_HOST_AGENT_WARNING: &str = "The host SSH agent socket ($SSH_AUTH_SOCK) is not available, so SSH and commit signing inside the container will fail. Restart the container from a shell with a running agent to restore forwarding.";
+
 /// SSH agent forwarding configuration.
 #[derive(Debug, Clone)]
 pub struct SshAgentForwarding {
