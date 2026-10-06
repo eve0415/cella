@@ -144,7 +144,10 @@ SSH agent forwarding uses an ordered list of strategies per runtime. The orchest
 
 **Linux Native:** The host's `$SSH_AUTH_SOCK` path is bind-mounted into the container at `/tmp/cella-ssh-agent.sock`. The socket file MUST exist on the host. If `SSH_AUTH_SOCK` is unset or the socket does not exist, SSH agent forwarding is skipped.
 
-**Apple Container:** The runtime forwards the SSH agent itself. cella passes `container run --ssh` when the host `$SSH_AUTH_SOCK` is non-empty, its socket path exists, and no user override applies. The runtime relays the socket and sets `SSH_AUTH_SOCK=/var/host-services/ssh-auth.sock` for the container process and every exec process. It re-reads the host socket on each `container start`, so restarting the container picks up a moved agent.
+**Apple Container:** cella creates the container with `container create --ssh` unless the devcontainer config overrides SSH forwarding.
+The runtime re-reads the host `$SSH_AUTH_SOCK` on every `container start` and sets `SSH_AUTH_SOCK=/var/host-services/ssh-auth.sock` for the container process and every exec process.
+It only connects to the host socket when a process in the container uses the agent, so an absent or stale host socket never blocks startup.
+Restarting the container from a shell with a live agent restores forwarding.
 
 **Colima:** Lima's OpenSSH-based `forwardAgent` mechanism degrades with sandboxed SSH agents (1Password, Secretive) -- the magic socket at `/run/host-services/ssh-auth.sock` becomes connectable but returns no keys. Direct bind-mounting the host socket fails because virtiofs rejects `mkdir` for Unix socket paths on the macOS host. cella uses a daemon-managed TCP bridge to work around both issues.
 

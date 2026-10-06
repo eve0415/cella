@@ -198,9 +198,7 @@ fn apply_ssh_agent_forwarding(
 }
 
 fn apply_runtime_ssh_agent(fwd: &mut EnvForwarding, config: &serde_json::Value) {
-    let host_socket = std::env::var("SSH_AUTH_SOCK");
-    fwd.runtime_ssh_agent =
-        ssh_agent::runtime_forwarding_wanted(config, host_socket.as_deref().ok());
+    fwd.runtime_ssh_agent = ssh_agent::runtime_forwarding_wanted(config);
     tracing::debug!(
         requested = fwd.runtime_ssh_agent,
         "Container runtime SSH agent forwarding"
