@@ -246,6 +246,7 @@ impl ContainerBackend for AppleContainerBackend {
         BackendCapabilities {
             compose: false,
             managed_agent: false,
+            ssh_agent: cella_backend::SshAgentTransport::Runtime,
         }
     }
 
@@ -1467,6 +1468,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn apple_backend_uses_runtime_ssh_agent_forwarding() {
+        let backend = AppleContainerBackend::new(ContainerCli::new(
+            std::path::PathBuf::from("/nonexistent/container"),
+            "1.0.0".to_string(),
+        ));
+        assert_eq!(
+            backend.capabilities().ssh_agent,
+            cella_backend::SshAgentTransport::Runtime
+        );
+    }
 
     fn minimal_create_opts() -> CreateContainerOptions {
         CreateContainerOptions {

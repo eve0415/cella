@@ -703,6 +703,7 @@ pub(crate) mod tests {
             BackendCapabilities {
                 compose: false,
                 managed_agent: false,
+                ssh_agent: cella_backend::SshAgentTransport::BindMount,
             }
         }
 

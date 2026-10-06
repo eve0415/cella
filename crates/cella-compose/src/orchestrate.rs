@@ -555,7 +555,7 @@ async fn resolve_user_and_env(
         &remote_user,
         cfg.workspace_root,
         proxy_fwd.as_ref(),
-        cella_env::SshAgentTransport::BindMount,
+        client.capabilities().ssh_agent,
     );
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
         &mut env_fwd,
@@ -941,7 +941,7 @@ async fn handle_compose_running(
         &remote_user,
         cfg.workspace_root,
         None,
-        cella_env::SshAgentTransport::BindMount,
+        client.capabilities().ssh_agent,
     );
     let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     let current_mount_fp = crate::mount_parity::compute_mount_input_fingerprint(

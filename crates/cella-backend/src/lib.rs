@@ -13,6 +13,7 @@ pub mod types;
 pub mod uid_image;
 
 pub use agent::agent_env_vars;
+pub use cella_env::SshAgentTransport;
 pub use error::BackendError;
 pub use lifecycle::{
     EXPECTED_CONTAINER_MISSING, LifecycleContext, LifecycleGate, OutputCallback, ParsedLifecycle,

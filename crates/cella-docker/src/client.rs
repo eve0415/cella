@@ -335,6 +335,7 @@ pub mod mock {
             BackendCapabilities {
                 compose: true,
                 managed_agent: true,
+                ssh_agent: cella_backend::SshAgentTransport::BindMount,
             }
         }
 

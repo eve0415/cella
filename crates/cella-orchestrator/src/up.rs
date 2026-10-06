@@ -324,7 +324,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             None,
-            cella_env::SshAgentTransport::BindMount,
+            self.client.capabilities().ssh_agent,
         );
         if !self.client.capabilities().managed_agent {
             env_fwd
@@ -1156,6 +1156,10 @@ impl EnsureUpContext<'_> {
     /// socket mounts on Docker Desktop / `OrbStack` / Linux) and when the
     /// daemon is unreachable or predates the refresh RPC.
     async fn refresh_ssh_agent_bridge(&self) -> Option<crate::result::SshAgentProxyStatus> {
+        if self.client.capabilities().ssh_agent != cella_env::SshAgentTransport::BindMount {
+            return None;
+        }
+
         let runtime = cella_env::platform::detect_runtime();
         let upstream = cella_env::ssh_agent::ssh_agent_request(&runtime, self.config_json())
             .into_iter()
@@ -1595,7 +1599,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             proxy_fwd.as_ref(),
-            cella_env::SshAgentTransport::BindMount,
+            self.client.capabilities().ssh_agent,
         );
 
         if !managed_agent {

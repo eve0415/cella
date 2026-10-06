@@ -15,7 +15,7 @@ Container and image naming conventions live here so that all backends use consis
 ### Key Types
 
 - `ContainerBackend` — core trait defining async container lifecycle, exec, image, networking, and agent operations. Uses `BoxFuture` for object safety (`dyn ContainerBackend`)
-- `BackendCapabilities` — backend capability flags (`compose`, `managed_agent`)
+- `BackendCapabilities` — backend capability flags (`compose`, `managed_agent`, `ssh_agent`)
 - `BackendKind` — enum (`Docker`, `AppleContainer`) identifying which backend is in use
 - `BackendError` — unified error type with variants for container-not-found, image-not-found, build failures, exec failures, unsupported operations, and runtime-specific errors
 - `ContainerInfo` — full container state including ID, name, state, ports, mounts, labels, image
