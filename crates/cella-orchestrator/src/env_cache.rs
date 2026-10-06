@@ -270,8 +270,9 @@ async fn write_env_cache(
         .await;
 }
 
-/// Ensure `SSH_AUTH_SOCK` is present in the target environment when a
-/// well-known runtime-specific socket exists inside the container.
+/// Ensure `SSH_AUTH_SOCK` is present when a well-known runtime-specific socket exists inside the container.
+///
+/// No-op for backends whose runtime forwards the agent because it already sets `SSH_AUTH_SOCK` for exec processes.
 pub async fn ensure_ssh_auth_sock(
     client: &dyn ContainerBackend,
     container_id: &str,
