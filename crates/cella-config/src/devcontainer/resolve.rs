@@ -213,8 +213,10 @@ pub fn config_with_override(
     config_path_override: Option<&Path>,
     override_config_file: Option<&Path>,
 ) -> Result<ResolvedConfig, CellaConfigError> {
+    // A relative `--config` resolves against the cwd, matching the official
+    // CLI's `path.resolve(process.cwd(), config)`.
     let config_path = if let Some(override_path) = config_path_override {
-        override_path.to_path_buf()
+        lexical_absolute(override_path)
     } else if override_config_file.is_some() {
         discover::config(workspace_root)
             .unwrap_or_else(|_| workspace_root.join(".devcontainer/devcontainer.json"))
@@ -478,6 +480,20 @@ mod tests {
                 .ends_with(".devcontainer/devcontainer.json")
         );
         assert_ne!(resolved.config_path, override_file);
+    }
+
+    #[test]
+    fn relative_config_path_is_stored_absolute() {
+        let tmp = TempDir::new().unwrap();
+        let override_file = tmp.path().join("over.json");
+        std::fs::write(&override_file, r#"{"image": "ubuntu"}"#).unwrap();
+
+        // Content comes from the override file, so the relative `--config`
+        // path never has to exist on disk.
+        let rel = Path::new("sub/../.devcontainer/devcontainer.json");
+        let resolved = config_with_override(tmp.path(), Some(rel), Some(&override_file)).unwrap();
+        assert!(resolved.config_path.is_absolute());
+        assert_eq!(resolved.config_path, lexical_absolute(rel));
     }
 
     #[test]
