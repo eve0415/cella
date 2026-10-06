@@ -150,13 +150,7 @@ fn apply_ssh_agent_forwarding(
     fwd: &mut EnvForwarding,
     runtime: &DockerRuntime,
     config: &serde_json::Value,
-    ssh_agent: SshAgentTransport,
 ) {
-    if ssh_agent == SshAgentTransport::Runtime {
-        tracing::info!("Container runtime forwards the SSH agent");
-        return;
-    }
-
     let mut strategies = ssh_agent::ssh_agent_request(runtime, config);
     if strategies.is_empty() {
         return;
@@ -199,6 +193,11 @@ fn apply_ssh_agent_forwarding(
             });
         }
     }
+}
+
+fn apply_runtime_ssh_agent(fwd: &mut EnvForwarding, config: &serde_json::Value) {
+    let _ = (fwd, config);
+    tracing::debug!("Container runtime forwards the SSH agent");
 }
 
 /// Apply SSH config file uploads to the environment.
@@ -441,12 +440,16 @@ pub fn prepare_env_forwarding(
     network: Option<&ProxyForwardingConfig>,
     ssh_agent: SshAgentTransport,
 ) -> EnvForwarding {
-    let runtime = platform::detect_runtime();
-    tracing::debug!("Detected Docker runtime: {runtime:?}");
-
     let mut fwd = EnvForwarding::default();
 
-    apply_ssh_agent_forwarding(&mut fwd, &runtime, config, ssh_agent);
+    match ssh_agent {
+        SshAgentTransport::BindMount => {
+            let runtime = platform::detect_runtime();
+            tracing::debug!("Detected Docker runtime: {runtime:?}");
+            apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
+        }
+        SshAgentTransport::Runtime => apply_runtime_ssh_agent(&mut fwd, config),
+    }
     apply_ssh_config_files(&mut fwd, remote_user);
     let host_config = git_config::list_host_git_config(workspace_folder);
     let allowed_signers = apply_ssh_signing(&mut fwd, remote_user, workspace_folder);
@@ -516,12 +519,7 @@ mod tests {
     fn runtime_ssh_agent_transport_skips_mount_and_env() {
         let config = serde_json::json!({});
         let mut runtime_fwd = EnvForwarding::default();
-        apply_ssh_agent_forwarding(
-            &mut runtime_fwd,
-            &DockerRuntime::OrbStack,
-            &config,
-            SshAgentTransport::Runtime,
-        );
+        apply_runtime_ssh_agent(&mut runtime_fwd, &config);
         assert!(runtime_fwd.mounts.is_empty());
         assert!(
             runtime_fwd
@@ -535,12 +533,7 @@ mod tests {
         assert!(runtime_fwd.ssh_agent_proxy_request.is_none());
 
         let mut bind_mount_fwd = EnvForwarding::default();
-        apply_ssh_agent_forwarding(
-            &mut bind_mount_fwd,
-            &DockerRuntime::OrbStack,
-            &config,
-            SshAgentTransport::BindMount,
-        );
+        apply_ssh_agent_forwarding(&mut bind_mount_fwd, &DockerRuntime::OrbStack, &config);
         assert_eq!(
             bind_mount_fwd.mounts[0].source,
             "/run/host-services/ssh-auth.sock"
