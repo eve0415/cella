@@ -6,6 +6,15 @@ use tracing::warn;
 
 use crate::platform::DockerRuntime;
 
+/// How the backend gets the host SSH agent into a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAgentTransport {
+    /// cella bind-mounts a socket and sets `SSH_AUTH_SOCK` itself.
+    BindMount,
+    /// The container runtime forwards the agent and sets `SSH_AUTH_SOCK`.
+    Runtime,
+}
+
 /// SSH agent forwarding configuration.
 #[derive(Debug, Clone)]
 pub struct SshAgentForwarding {

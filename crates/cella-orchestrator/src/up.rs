@@ -324,6 +324,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             None,
+            cella_env::SshAgentTransport::BindMount,
         );
         if !self.client.capabilities().managed_agent {
             env_fwd
@@ -1594,6 +1595,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             proxy_fwd.as_ref(),
+            cella_env::SshAgentTransport::BindMount,
         );
 
         if !managed_agent {

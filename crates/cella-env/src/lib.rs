@@ -27,6 +27,7 @@ pub mod user_env_probe;
 pub use error::CellaEnvError;
 pub use git_config::GitConfigEntry;
 pub use platform::DockerRuntime;
+pub use ssh_agent::SshAgentTransport;
 
 /// In-container path of the cella-agent proxy config file.
 ///
@@ -149,7 +150,13 @@ fn apply_ssh_agent_forwarding(
     fwd: &mut EnvForwarding,
     runtime: &DockerRuntime,
     config: &serde_json::Value,
+    ssh_agent: SshAgentTransport,
 ) {
+    if ssh_agent == SshAgentTransport::Runtime {
+        tracing::info!("Container runtime forwards the SSH agent");
+        return;
+    }
+
     let mut strategies = ssh_agent::ssh_agent_request(runtime, config);
     if strategies.is_empty() {
         return;
@@ -432,13 +439,14 @@ pub fn prepare_env_forwarding(
     remote_user: &str,
     workspace_folder: &std::path::Path,
     network: Option<&ProxyForwardingConfig>,
+    ssh_agent: SshAgentTransport,
 ) -> EnvForwarding {
     let runtime = platform::detect_runtime();
     tracing::debug!("Detected Docker runtime: {runtime:?}");
 
     let mut fwd = EnvForwarding::default();
 
-    apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
+    apply_ssh_agent_forwarding(&mut fwd, &runtime, config, ssh_agent);
     apply_ssh_config_files(&mut fwd, remote_user);
     let host_config = git_config::list_host_git_config(workspace_folder);
     let allowed_signers = apply_ssh_signing(&mut fwd, remote_user, workspace_folder);
@@ -503,6 +511,47 @@ pub fn prepare_env_forwarding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_ssh_agent_transport_skips_mount_and_env() {
+        let config = serde_json::json!({});
+        let mut runtime_fwd = EnvForwarding::default();
+        apply_ssh_agent_forwarding(
+            &mut runtime_fwd,
+            &DockerRuntime::OrbStack,
+            &config,
+            SshAgentTransport::Runtime,
+        );
+        assert!(runtime_fwd.mounts.is_empty());
+        assert!(
+            runtime_fwd
+                .env
+                .iter()
+                .all(|entry| entry.key != "SSH_AUTH_SOCK")
+        );
+        assert!(runtime_fwd.ssh_agent_mount_source.is_none());
+        assert!(runtime_fwd.ssh_agent_fallbacks.is_empty());
+        assert!(runtime_fwd.ssh_agent_runtime.is_none());
+        assert!(runtime_fwd.ssh_agent_proxy_request.is_none());
+
+        let mut bind_mount_fwd = EnvForwarding::default();
+        apply_ssh_agent_forwarding(
+            &mut bind_mount_fwd,
+            &DockerRuntime::OrbStack,
+            &config,
+            SshAgentTransport::BindMount,
+        );
+        assert_eq!(
+            bind_mount_fwd.mounts[0].source,
+            "/run/host-services/ssh-auth.sock"
+        );
+        assert!(
+            bind_mount_fwd
+                .env
+                .iter()
+                .any(|entry| entry.key == "SSH_AUTH_SOCK")
+        );
+    }
 
     #[test]
     fn test_apply_credential_forwarding() {
@@ -580,7 +629,13 @@ mod tests {
     fn test_prepare_env_forwarding_minimal() {
         let config: serde_json::Value = serde_json::from_str("{}").unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
-        let fwd = prepare_env_forwarding(&config, "root", workspace.path(), None);
+        let fwd = prepare_env_forwarding(
+            &config,
+            "root",
+            workspace.path(),
+            None,
+            SshAgentTransport::BindMount,
+        );
 
         // Credential forwarding is always added regardless of other config.
         let has_credential_helper = fwd
