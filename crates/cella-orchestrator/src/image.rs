@@ -849,20 +849,10 @@ mod tests {
         assert!(opts.options.contains(&"--pull".to_string()));
     }
 
-    /// `(dockerfile, context_path)` that `parse_build_options` resolves for
-    /// `build_json` with devcontainer.json living in `config_dir`.
-    fn build_paths(build_json: &str, config_dir: &str) -> (String, PathBuf) {
+    fn build_paths(build_json: &str, config_dir: &str) -> (PathBuf, PathBuf) {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(build_json).unwrap();
-        let opts = parse_build_options(
-            &build,
-            "img",
-            Path::new(config_dir),
-            false,
-            None,
-            BuildTuning::default(),
-        );
-        (opts.dockerfile, opts.context_path)
+        resolve_build_paths(&build, Path::new(config_dir))
     }
 
     #[test]
@@ -887,72 +877,84 @@ mod tests {
     }
 
     #[test]
-    fn parse_build_options_custom_dockerfile() {
+    fn resolve_build_paths_custom_dockerfile() {
         let (dockerfile, context) =
             build_paths(r#"{"dockerfile": "Dockerfile.dev"}"#, "/ws/.devcontainer");
-        assert_eq!(dockerfile, "/ws/.devcontainer/Dockerfile.dev");
-        assert_eq!(context, Path::new("/ws/.devcontainer"));
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/Dockerfile.dev")
+        );
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer"));
     }
 
     #[test]
-    fn parse_build_options_absolute_paths_pass_through() {
+    fn resolve_build_paths_absolute_paths_pass_through() {
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "/abs/Dockerfile", "context": "/absolute/path"}"#,
             "/ws/.devcontainer",
         );
-        assert_eq!(dockerfile, "/abs/Dockerfile");
-        assert_eq!(context, Path::new("/absolute/path"));
+        assert_eq!(dockerfile, PathBuf::from("/abs/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/absolute/path"));
     }
 
     #[test]
-    fn parse_build_options_parent_context_keeps_dockerfile_beside_config() {
+    fn resolve_build_paths_parent_context_keeps_dockerfile_beside_config() {
         // The common `"context": ".."` layout: the Dockerfile still sits next
         // to devcontainer.json, only the context widens to the workspace.
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "Dockerfile", "context": ".."}"#,
             "/ws/.devcontainer",
         );
-        assert_eq!(dockerfile, "/ws/.devcontainer/Dockerfile");
-        assert_eq!(context, Path::new("/ws"));
+        assert_eq!(dockerfile, PathBuf::from("/ws/.devcontainer/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/ws"));
     }
 
     #[test]
-    fn parse_build_options_root_level_config() {
+    fn resolve_build_paths_root_level_config() {
         // `.devcontainer.json` at the workspace root resolves against the root.
         let (dockerfile, context) = build_paths(r#"{"dockerfile": "Dockerfile"}"#, "/ws");
-        assert_eq!(dockerfile, "/ws/Dockerfile");
-        assert_eq!(context, Path::new("/ws"));
+        assert_eq!(dockerfile, PathBuf::from("/ws/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/ws"));
     }
 
     #[test]
-    fn parse_build_options_nested_config_dir() {
+    fn resolve_build_paths_nested_config_dir() {
         // `.devcontainer/<sub>/devcontainer.json` resolves against `<sub>`.
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "Dockerfile", "context": "../.."}"#,
             "/ws/.devcontainer/sub",
         );
-        assert_eq!(dockerfile, "/ws/.devcontainer/sub/Dockerfile");
-        assert_eq!(context, Path::new("/ws"));
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/sub/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws"));
     }
 
     #[test]
-    fn parse_build_options_context_defaults_to_dockerfile_dir() {
+    fn resolve_build_paths_context_defaults_to_dockerfile_dir() {
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "docker/Dockerfile"}"#,
             "/ws/.devcontainer",
         );
-        assert_eq!(dockerfile, "/ws/.devcontainer/docker/Dockerfile");
-        assert_eq!(context, Path::new("/ws/.devcontainer/docker"));
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/docker/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer/docker"));
     }
 
     #[test]
-    fn parse_build_options_empty_context_defaults_to_dockerfile_dir() {
+    fn resolve_build_paths_empty_context_defaults_to_dockerfile_dir() {
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "docker/Dockerfile", "context": ""}"#,
             "/ws/.devcontainer",
         );
-        assert_eq!(dockerfile, "/ws/.devcontainer/docker/Dockerfile");
-        assert_eq!(context, Path::new("/ws/.devcontainer/docker"));
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/docker/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer/docker"));
     }
 
     #[test]
