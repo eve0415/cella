@@ -122,8 +122,6 @@ pub struct EnvForwarding {
     pub ssh_agent_fallbacks: Vec<ssh_agent::SshAgentRequest>,
     /// Detected runtime, passed through for warning messages on fallback.
     pub ssh_agent_runtime: Option<DockerRuntime>,
-    /// Whether the runtime should forward the host SSH agent; only set for `Runtime` transport.
-    pub runtime_ssh_agent: bool,
 }
 
 /// Post-start injection commands and files.
@@ -195,14 +193,6 @@ fn apply_ssh_agent_forwarding(
             });
         }
     }
-}
-
-fn apply_runtime_ssh_agent(fwd: &mut EnvForwarding, config: &serde_json::Value) {
-    fwd.runtime_ssh_agent = ssh_agent::runtime_forwarding_wanted(config);
-    tracing::debug!(
-        requested = fwd.runtime_ssh_agent,
-        "Container runtime SSH agent forwarding"
-    );
 }
 
 /// Apply SSH config file uploads to the environment.
@@ -453,7 +443,7 @@ pub fn prepare_env_forwarding(
             tracing::debug!("Detected Docker runtime: {runtime:?}");
             apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
         }
-        SshAgentTransport::Runtime => apply_runtime_ssh_agent(&mut fwd, config),
+        SshAgentTransport::Runtime => {}
     }
     apply_ssh_config_files(&mut fwd, remote_user);
     let host_config = git_config::list_host_git_config(workspace_folder);
@@ -523,8 +513,14 @@ mod tests {
     #[test]
     fn runtime_ssh_agent_transport_skips_mount_and_env() {
         let config = serde_json::json!({});
-        let mut runtime_fwd = EnvForwarding::default();
-        apply_runtime_ssh_agent(&mut runtime_fwd, &config);
+        let workspace = tempfile::TempDir::new().unwrap();
+        let runtime_fwd = prepare_env_forwarding(
+            &config,
+            "root",
+            workspace.path(),
+            None,
+            SshAgentTransport::Runtime,
+        );
         assert!(runtime_fwd.mounts.is_empty());
         assert!(
             runtime_fwd

@@ -1259,7 +1259,12 @@ impl EnsureUpContext<'_> {
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
-        create_opts.forward_ssh_agent = env_fwd.runtime_ssh_agent;
+        create_opts.forward_ssh_agent = match capabilities.ssh_agent {
+            cella_backend::SshAgentTransport::BindMount => false,
+            cella_backend::SshAgentTransport::Runtime => {
+                cella_env::ssh_agent::runtime_forwarding_wanted(self.config_json())
+            }
+        };
 
         for m in &env_fwd.mounts {
             create_opts.mounts.push(MountConfig {
