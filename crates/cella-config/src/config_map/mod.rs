@@ -115,6 +115,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         init: sec.init,
         run_args_overrides,
         gpu_request,
+        forward_ssh_agent: false,
     }
 }
 

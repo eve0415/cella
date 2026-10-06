@@ -169,6 +169,13 @@ pub fn ssh_agent_request(
     ssh_agent_strategies_for_runtime(runtime, host_socket)
 }
 
+/// Whether a runtime should forward the host SSH agent for this configuration.
+pub fn runtime_forwarding_wanted(config: &serde_json::Value, host_socket: Option<&str>) -> bool {
+    !has_user_ssh_override(config)
+        && host_socket
+            .is_some_and(|socket| !socket.is_empty() && std::path::Path::new(socket).exists())
+}
+
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
 /// proxy. **The proxy itself is currently broken on colima — see
 /// `cella_daemon::ssh_proxy` module docs for the empirical evidence.**
@@ -304,6 +311,38 @@ fn extract_mount_target(mount_str: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runtime_forwarding_respects_user_overrides() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket = temp.path().join("agent.sock");
+        std::fs::write(&socket, []).unwrap();
+        let socket = socket.to_str().unwrap();
+
+        assert!(!runtime_forwarding_wanted(
+            &json!({"containerEnv": {"SSH_AUTH_SOCK": "/custom/socket"}}),
+            Some(socket),
+        ));
+        assert!(!runtime_forwarding_wanted(
+            &json!({"mounts": [{"type": "bind", "source": "/host/sock", "target": "/run/ssh_auth_sock"}]}),
+            Some(socket),
+        ));
+    }
+
+    #[test]
+    fn runtime_forwarding_requires_an_existing_host_path() {
+        let config = json!({});
+        assert!(!runtime_forwarding_wanted(&config, None));
+        assert!(!runtime_forwarding_wanted(&config, Some("")));
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket = temp.path().join("agent.sock");
+        let socket_path = socket.to_str().unwrap();
+        assert!(!runtime_forwarding_wanted(&config, Some(socket_path)));
+
+        std::fs::write(&socket, []).unwrap();
+        assert!(runtime_forwarding_wanted(&config, Some(socket_path)));
+    }
 
     #[test]
     fn user_override_container_env() {

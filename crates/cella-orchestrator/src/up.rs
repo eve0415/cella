@@ -1240,6 +1240,7 @@ impl EnsureUpContext<'_> {
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
+        create_opts.forward_ssh_agent = env_fwd.runtime_ssh_agent;
 
         for m in &env_fwd.mounts {
             create_opts.mounts.push(MountConfig {

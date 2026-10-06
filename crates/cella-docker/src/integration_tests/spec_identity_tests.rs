@@ -40,6 +40,7 @@ fn opts_with_spec_labels(name: &str, workspace: &Path, config: &Path) -> CreateC
         init: false,
         run_args_overrides: None,
         gpu_request: None,
+        forward_ssh_agent: false,
     }
 }
 

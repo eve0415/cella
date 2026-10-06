@@ -122,6 +122,8 @@ pub struct EnvForwarding {
     pub ssh_agent_fallbacks: Vec<ssh_agent::SshAgentRequest>,
     /// Detected runtime, passed through for warning messages on fallback.
     pub ssh_agent_runtime: Option<DockerRuntime>,
+    /// Whether the runtime should forward the host SSH agent; only set for `Runtime` transport.
+    pub runtime_ssh_agent: bool,
 }
 
 /// Post-start injection commands and files.
@@ -196,8 +198,13 @@ fn apply_ssh_agent_forwarding(
 }
 
 fn apply_runtime_ssh_agent(fwd: &mut EnvForwarding, config: &serde_json::Value) {
-    let _ = (fwd, config);
-    tracing::debug!("Container runtime forwards the SSH agent");
+    let host_socket = std::env::var("SSH_AUTH_SOCK");
+    fwd.runtime_ssh_agent =
+        ssh_agent::runtime_forwarding_wanted(config, host_socket.as_deref().ok());
+    tracing::debug!(
+        requested = fwd.runtime_ssh_agent,
+        "Container runtime SSH agent forwarding"
+    );
 }
 
 /// Apply SSH config file uploads to the environment.

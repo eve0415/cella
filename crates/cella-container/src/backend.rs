@@ -1110,7 +1110,7 @@ fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<
     }
 
     // SSH agent forwarding
-    if std::env::var("SSH_AUTH_SOCK").is_ok() {
+    if opts.forward_ssh_agent {
         args.push("--ssh".to_string());
     }
 
@@ -1501,7 +1501,17 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         }
+    }
+
+    #[test]
+    fn build_create_args_uses_ssh_forwarding_option() {
+        let mut opts = minimal_create_opts();
+        assert!(!build_create_args(&opts, &[]).contains(&"--ssh".to_string()));
+
+        opts.forward_ssh_agent = true;
+        assert!(build_create_args(&opts, &[]).contains(&"--ssh".to_string()));
     }
 
     #[test]
