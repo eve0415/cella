@@ -174,6 +174,31 @@ pub fn runtime_forwarding_wanted(config: &serde_json::Value) -> bool {
     !has_user_ssh_override(config)
 }
 
+/// Whether the host SSH agent socket is available for runtime forwarding.
+pub fn host_agent_socket_live() -> bool {
+    let host_socket = std::env::var("SSH_AUTH_SOCK").ok();
+    host_agent_path_live(host_socket.as_deref())
+}
+
+fn host_agent_path_live(host_socket: Option<&str>) -> bool {
+    let Some(path) = host_socket.filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
 /// proxy. **The proxy itself is currently broken on colima — see
 /// `cella_daemon::ssh_proxy` module docs for the empirical evidence.**
@@ -335,6 +360,30 @@ mod tests {
         for (config, expected) in cases {
             assert_eq!(runtime_forwarding_wanted(&config), expected, "{config}");
         }
+    }
+
+    #[test]
+    fn host_agent_path_rejects_missing_values_and_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing = temp.path().join("missing.sock");
+
+        assert!(!host_agent_path_live(None));
+        assert!(!host_agent_path_live(Some("")));
+        assert!(!host_agent_path_live(missing.to_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_agent_path_requires_a_unix_socket() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let regular_file = temp.path().join("regular-file");
+        std::fs::write(&regular_file, []).unwrap();
+        assert!(!host_agent_path_live(regular_file.to_str()));
+
+        let socket = temp.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(host_agent_path_live(socket.to_str()));
+        drop(listener);
     }
 
     #[test]
