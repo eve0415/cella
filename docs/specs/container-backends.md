@@ -226,8 +226,8 @@ When a `build` object is present in devcontainer.json, cella builds a Docker ima
 
 | Property | `BuildOptions` Field | Default | Notes |
 |---|---|---|---|
-| `build.dockerfile` | `dockerfile` | `"Dockerfile"` | Relative to context path |
-| `build.context` | `context_path` | `"."` | Resolved relative to `.devcontainer/` directory; absolute paths used as-is |
+| `build.dockerfile` | `dockerfile` | `"Dockerfile"` | Resolved relative to the directory containing `devcontainer.json`; absolute paths used as-is |
+| `build.context` | `context_path` | Resolved Dockerfile's directory | Resolved relative to the directory containing `devcontainer.json`; absolute paths used as-is; empty values use the default |
 | `build.args` | `args` | `{}` | Key-value map forwarded as `--build-arg` flags |
 | `build.target` | `target` | none | Multi-stage build target, forwarded as `--target` |
 | `build.cacheFrom` | `cache_from` | `[]` | Array of image references forwarded as `--cache-from` |
@@ -235,7 +235,7 @@ When a `build` object is present in devcontainer.json, cella builds a Docker ima
 
 All six properties MUST be forwarded to the Docker build command. `context`, `args`, `target`, and `cacheFrom` MUST NOT be silently dropped.
 
-The build context path MUST be resolved relative to the directory containing `devcontainer.json` (the `.devcontainer/` directory), not the workspace root. When `context` is an absolute path, it MUST be used as-is without further resolution.
+The Dockerfile and build context paths MUST be resolved relative to the directory containing `devcontainer.json`. Absolute paths MUST be used as-is. When `context` is absent or empty, it MUST default to the resolved Dockerfile's directory.
 
 **Build secrets:**
 
