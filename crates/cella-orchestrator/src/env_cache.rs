@@ -278,6 +278,10 @@ pub async fn ensure_ssh_auth_sock(
     user: &str,
     env: &mut Vec<String>,
 ) {
+    if client.capabilities().ssh_agent == cella_backend::SshAgentTransport::Runtime {
+        return;
+    }
+
     if env.iter().any(|e| e.starts_with("SSH_AUTH_SOCK=")) {
         return;
     }
@@ -319,6 +323,19 @@ pub async fn ensure_ssh_auth_sock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_ssh_agent_skips_socket_probe() {
+        let (backend, recorded) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let backend = backend.with_ssh_agent_transport(cella_backend::SshAgentTransport::Runtime);
+        let mut env = vec!["EXAMPLE=value".to_string()];
+
+        ensure_ssh_auth_sock(&backend, "container", "user", &mut env).await;
+
+        assert_eq!(env, vec!["EXAMPLE=value"]);
+        assert!(recorded.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn cache_path_includes_probe_type() {
