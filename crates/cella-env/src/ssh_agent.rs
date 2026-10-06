@@ -162,11 +162,13 @@ pub fn ssh_agent_request(
         return Vec::new();
     }
 
-    let host_socket = std::env::var("SSH_AUTH_SOCK")
-        .ok()
-        .filter(|s| !s.is_empty());
+    ssh_agent_strategies_for_runtime(runtime, host_ssh_auth_sock())
+}
 
-    ssh_agent_strategies_for_runtime(runtime, host_socket)
+fn host_ssh_auth_sock() -> Option<String> {
+    std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Whether a runtime should forward the host SSH agent for this configuration.
@@ -176,27 +178,26 @@ pub fn runtime_forwarding_wanted(config: &serde_json::Value) -> bool {
 
 /// Whether the host SSH agent socket is available for runtime forwarding.
 pub fn host_agent_socket_live() -> bool {
-    let host_socket = std::env::var("SSH_AUTH_SOCK").ok();
+    let host_socket = host_ssh_auth_sock();
     host_agent_path_live(host_socket.as_deref())
 }
 
 fn host_agent_path_live(host_socket: Option<&str>) -> bool {
-    let Some(path) = host_socket.filter(|path| !path.is_empty()) else {
+    let Some(path) = host_socket else {
         return false;
     };
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
+    std::fs::metadata(path).is_ok_and(|metadata| is_agent_socket(&metadata))
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        metadata.file_type().is_socket()
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+#[cfg(unix)]
+fn is_agent_socket(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    metadata.file_type().is_socket()
+}
+
+#[cfg(not(unix))]
+const fn is_agent_socket(_: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
