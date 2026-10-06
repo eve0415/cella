@@ -604,7 +604,7 @@ fn effective_build_config(
 
     // Not a Dockerfile-based config: no top-level `dockerFile`, no `build` object, and no
     // `build.dockerfile`. A `build` object without an explicit `dockerfile` is valid — it
-    // defaults to "Dockerfile" in `parse_build_options`.
+    // defaults to "Dockerfile" in `resolve_build_paths`.
     if top_dockerfile.is_none() && build.is_none() && build_dockerfile.is_none() {
         return None;
     }
@@ -633,8 +633,8 @@ fn effective_build_config(
 
 /// Resolve `build.dockerfile` and `build.context` to absolute paths.
 ///
-/// Both are relative to the directory holding devcontainer.json, and an absent
-/// context defaults to the Dockerfile's own directory, matching the official
+/// Both are relative to the directory holding devcontainer.json. An absent or
+/// empty context defaults to the Dockerfile's own directory, matching the official
 /// CLI (`getConfigFilePath` / `getDockerContextPath`).
 fn resolve_build_paths(
     build: &serde_json::Map<String, serde_json::Value>,
@@ -646,10 +646,14 @@ fn resolve_build_paths(
         .unwrap_or("Dockerfile");
     let dockerfile = lexical_absolute(&config_dir.join(dockerfile));
 
-    let context = build.get("context").and_then(|v| v.as_str()).map_or_else(
-        || dockerfile.parent().unwrap_or(config_dir).to_path_buf(),
-        |context| lexical_absolute(&config_dir.join(context)),
-    );
+    let context = build
+        .get("context")
+        .and_then(|v| v.as_str())
+        .filter(|context| !context.is_empty())
+        .map_or_else(
+            || dockerfile.parent().unwrap_or(config_dir).to_path_buf(),
+            |context| lexical_absolute(&config_dir.join(context)),
+        );
     (dockerfile, context)
 }
 
@@ -901,6 +905,16 @@ mod tests {
     fn parse_build_options_context_defaults_to_dockerfile_dir() {
         let (dockerfile, context) = build_paths(
             r#"{"dockerfile": "docker/Dockerfile"}"#,
+            "/ws/.devcontainer",
+        );
+        assert_eq!(dockerfile, "/ws/.devcontainer/docker/Dockerfile");
+        assert_eq!(context, Path::new("/ws/.devcontainer/docker"));
+    }
+
+    #[test]
+    fn parse_build_options_empty_context_defaults_to_dockerfile_dir() {
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "docker/Dockerfile", "context": ""}"#,
             "/ws/.devcontainer",
         );
         assert_eq!(dockerfile, "/ws/.devcontainer/docker/Dockerfile");
