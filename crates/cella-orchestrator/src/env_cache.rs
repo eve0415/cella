@@ -279,8 +279,9 @@ pub async fn ensure_ssh_auth_sock(
     user: &str,
     env: &mut Vec<String>,
 ) {
-    if client.capabilities().ssh_agent == cella_backend::SshAgentTransport::Runtime {
-        return;
+    match client.capabilities().ssh_agent {
+        cella_backend::SshAgentTransport::BindMount => {}
+        cella_backend::SshAgentTransport::Runtime => return,
     }
 
     if env.iter().any(|e| e.starts_with("SSH_AUTH_SOCK=")) {

@@ -1172,8 +1172,9 @@ impl EnsureUpContext<'_> {
     /// socket mounts on Docker Desktop / `OrbStack` / Linux) and when the
     /// daemon is unreachable or predates the refresh RPC.
     async fn refresh_ssh_agent_bridge(&self) -> Option<crate::result::SshAgentProxyStatus> {
-        if self.client.capabilities().ssh_agent != cella_backend::SshAgentTransport::BindMount {
-            return None;
+        match self.client.capabilities().ssh_agent {
+            cella_backend::SshAgentTransport::BindMount => {}
+            cella_backend::SshAgentTransport::Runtime => return None,
         }
 
         let runtime = cella_env::platform::detect_runtime();
