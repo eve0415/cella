@@ -45,7 +45,7 @@ rust-version = "1.98.1"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "=1.53.1", features = [
+tokio = { version = "=1.53.2", features = [
     "fs",
     "io-std",
     "io-util",
@@ -68,7 +68,7 @@ toml = "=1.1.6"
 base64 = "=0.23.1"
 
 # Error handling
-thiserror = "=2.0.20"
+thiserror = "=2.0.21"
 
 # Logging
 tracing = "=0.1.44"
@@ -140,18 +140,18 @@ semver = "=1.0.28"
 glob = "=0.3.4"
 
 # JSONC editing
-jsonc-parser = { version = "=0.33.2", features = ["cst"] }
+jsonc-parser = { version = "=0.34.0", features = ["cst"] }
 
 # Certificate management
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-native-certs = "=0.8.4"
-tokio-rustls = "=0.26.5"
+tokio-rustls = "=0.26.6"
 tokio-stream = "=0.1.19"
 
 # HTTP proxy (MITM relay)
 hyper = { version = "=1.11.1", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
+hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "=0.1.5"
 
 # File watching
@@ -169,7 +169,7 @@ quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.26.1", features = ["v4"] }
+uuid = { version = "=1.27.0", features = ["v4"] }
 
 # Credential cache memory safety
 zeroize = "=1.9.0"
@@ -186,13 +186,13 @@ wayland-protocols-wlr = "=0.3.12"
 # Testing
 tempfile = "=3.27.0"
 wayland-client = "=0.31.15"
-wl-clipboard-rs = "=0.9.3"
+wl-clipboard-rs = "=0.9.4"
 # `image-data` arrives via default features and is required for get_image().
 # `wayland-data-control` is NOT default — without it arboard has no Wayland
 # backend compiled in and silently falls through to X11.
 arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
 filetime = "=0.2.29"
-insta = { version = "=1.48.0", features = ["json", "yaml", "redactions"] }
+insta = { version = "=1.49.0", features = ["json", "yaml", "redactions"] }
 trybuild = "=1.0.121"
 divan = "=0.1.21"
 
