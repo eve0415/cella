@@ -229,20 +229,7 @@ impl ContainerCli {
         args: &[(String, String)],
         extra_args: &[String],
     ) -> Result<String, BackendError> {
-        let mut cli_args = vec![
-            "build".to_string(),
-            "-f".to_string(),
-            dockerfile.to_string(),
-            "-t".to_string(),
-            tag.to_string(),
-        ];
-        cli_args.extend_from_slice(extra_args);
-        for (key, value) in args {
-            cli_args.push("--build-arg".to_string());
-            cli_args.push(format!("{key}={value}"));
-        }
-        cli_args.push(context.to_string_lossy().into_owned());
-
+        let cli_args = build_cli_args(context, dockerfile, tag, args, extra_args);
         let output = run_cli_owned(&self.binary_path, &cli_args).await?;
         if output.exit_code != 0 {
             return Err(BackendError::ImageBuildFailed {
@@ -369,6 +356,34 @@ impl ContainerCli {
             .map(drop)
             .map_err(|e| BackendError::Runtime(format!("network delete {name} failed: {e}").into()))
     }
+}
+
+/// Argument vector for `container build`.
+///
+/// `container build` resolves `-f` against the process cwd rather than the
+/// build context, so a relative `dockerfile` is joined onto `context` first
+/// (an absolute one passes through unchanged), matching the Docker backend.
+fn build_cli_args(
+    context: &Path,
+    dockerfile: &str,
+    tag: &str,
+    args: &[(String, String)],
+    extra_args: &[String],
+) -> Vec<String> {
+    let mut cli_args = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        context.join(dockerfile).to_string_lossy().into_owned(),
+        "-t".to_string(),
+        tag.to_string(),
+    ];
+    cli_args.extend_from_slice(extra_args);
+    for (key, value) in args {
+        cli_args.push("--build-arg".to_string());
+        cli_args.push(format!("{key}={value}"));
+    }
+    cli_args.push(context.to_string_lossy().into_owned());
+    cli_args
 }
 
 #[cfg(test)]
@@ -670,6 +685,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "myimage:latest");
+    }
+
+    #[test]
+    fn build_cli_args_joins_relative_dockerfile_onto_context() {
+        let args = build_cli_args(
+            Path::new("/tmp/ctx"),
+            "Dockerfile.features",
+            "img:v1",
+            &[],
+            &[],
+        );
+        assert_eq!(
+            args,
+            [
+                "build",
+                "-f",
+                "/tmp/ctx/Dockerfile.features",
+                "-t",
+                "img:v1",
+                "/tmp/ctx"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_cli_args_passes_absolute_dockerfile_through() {
+        let args = build_cli_args(
+            Path::new("/tmp/ctx"),
+            "/ws/.devcontainer/Dockerfile",
+            "img:v1",
+            &[],
+            &[],
+        );
+        assert_eq!(args[1], "-f");
+        assert_eq!(args[2], "/ws/.devcontainer/Dockerfile");
     }
 
     #[tokio::test]

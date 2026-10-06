@@ -454,7 +454,7 @@ pub fn metadata_user_env_probe(metadata: Option<&str>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -640,7 +640,7 @@ mod tests {
     // controls the `oncreate_done` and `content_hash` responses and records
     // every exec'd command so assertions can verify which phases ran.
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use cella_backend::traits::Platform;
@@ -657,7 +657,7 @@ mod tests {
     /// - Calls that look like `cat /tmp/.cella/content_hash` return `stored_hash`.
     /// - All other `exec_command` calls succeed (exit 0, empty output) and their
     ///   third `cmd` element (the sh `-c` argument) is pushed into `recorded`.
-    struct LifecycleMockBackend {
+    pub struct LifecycleMockBackend {
         oncreate_done: bool,
         stored_hash: String,
         /// Returned for `cat /tmp/.cella/lifecycle_status.json`. Empty = absent
@@ -669,10 +669,11 @@ mod tests {
         /// restart-skip path.
         recorded_started_at: Option<String>,
         recorded: Arc<Mutex<Vec<String>>>,
+        recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
     }
 
     impl LifecycleMockBackend {
-        fn new(
+        pub fn new(
             oncreate_done: bool,
             stored_hash: impl Into<String>,
         ) -> (Self, Arc<Mutex<Vec<String>>>) {
@@ -683,8 +684,13 @@ mod tests {
                 lifecycle_status: String::new(),
                 recorded_started_at: None,
                 recorded: Arc::clone(&recorded),
+                recorded_build_paths: Mutex::new(None),
             };
             (backend, recorded)
+        }
+
+        pub fn recorded_build_paths(&self) -> Option<(String, PathBuf)> {
+            self.recorded_build_paths.lock().expect("mutex").clone()
         }
     }
 
@@ -848,9 +854,13 @@ mod tests {
 
         fn build_image<'a>(
             &'a self,
-            _: &'a BuildOptions,
+            opts: &'a BuildOptions,
         ) -> BoxFuture<'a, Result<String, BackendError>> {
-            unimplemented!()
+            self.recorded_build_paths
+                .lock()
+                .expect("mutex")
+                .replace((opts.dockerfile.clone(), opts.context_path.clone()));
+            Box::pin(async { Ok("built-image".to_string()) })
         }
 
         fn image_exists<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool, BackendError>> {
@@ -869,7 +879,7 @@ mod tests {
             &'a self,
             _: &'a str,
         ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
-            unimplemented!()
+            Box::pin(async { Ok(ImageDetails::default()) })
         }
 
         fn inspect_image_env<'a>(

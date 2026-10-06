@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
+use cella_backend::names::lexical_absolute;
 use cella_backend::{
     BuildOptions, BuildSecret, ContainerBackend, ImageDetails, compute_features_digest, image_name,
     image_name_for_worktree, image_name_with_features,
@@ -395,7 +396,7 @@ async fn resolve_base_image(
         let mut build_opts = parse_build_options(
             &build,
             &img_name,
-            input.workspace_root,
+            input.config_path.parent().unwrap_or(input.workspace_root),
             input.no_cache,
             input.pull_policy,
             input.build_tuning,
@@ -603,7 +604,7 @@ fn effective_build_config(
 
     // Not a Dockerfile-based config: no top-level `dockerFile`, no `build` object, and no
     // `build.dockerfile`. A `build` object without an explicit `dockerfile` is valid — it
-    // defaults to "Dockerfile" in `parse_build_options`.
+    // defaults to "Dockerfile" in `resolve_build_paths`.
     if top_dockerfile.is_none() && build.is_none() && build_dockerfile.is_none() {
         return None;
     }
@@ -630,27 +631,44 @@ fn effective_build_config(
     Some(map)
 }
 
+/// Resolve `build.dockerfile` and `build.context` to absolute paths.
+///
+/// Both are relative to the directory holding devcontainer.json. An absent or
+/// empty context defaults to the Dockerfile's own directory, matching the official
+/// CLI (`getConfigFilePath` / `getDockerContextPath`).
+fn resolve_build_paths(
+    build: &serde_json::Map<String, serde_json::Value>,
+    config_dir: &Path,
+) -> (PathBuf, PathBuf) {
+    let dockerfile = build
+        .get("dockerfile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Dockerfile");
+    let dockerfile = lexical_absolute(&config_dir.join(dockerfile));
+
+    let context = build
+        .get("context")
+        .and_then(|v| v.as_str())
+        .filter(|context| !context.is_empty())
+        .map_or_else(
+            || dockerfile.parent().unwrap_or(config_dir).to_path_buf(),
+            |context| lexical_absolute(&config_dir.join(context)),
+        );
+    (dockerfile, context)
+}
+
+/// Build options for the base Dockerfile build. `config_dir` is the directory
+/// holding devcontainer.json; see [`resolve_build_paths`].
 pub fn parse_build_options(
     build: &serde_json::Map<String, serde_json::Value>,
     img_name: &str,
-    workspace_root: &Path,
+    config_dir: &Path,
     no_cache: bool,
     pull_policy: Option<&str>,
     build_tuning: crate::config::BuildTuning<'_>,
 ) -> BuildOptions {
-    let dockerfile = build
-        .get("dockerfile")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Dockerfile")
-        .to_string();
-
-    let context = build.get("context").and_then(|v| v.as_str()).unwrap_or(".");
-
-    let context_path = if Path::new(context).is_absolute() {
-        PathBuf::from(context)
-    } else {
-        workspace_root.join(".devcontainer").join(context)
-    };
+    let (dockerfile, context_path) = resolve_build_paths(build, config_dir);
+    let dockerfile = dockerfile.to_string_lossy().into_owned();
 
     let args: HashMap<String, String> = build
         .get("args")
@@ -742,7 +760,41 @@ pub fn parse_build_options(
 mod tests {
     use super::*;
     use crate::config::BuildTuning;
+    use crate::run_user_commands::tests::LifecycleMockBackend;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn ensure_image_build_uses_config_directory() {
+        let backend = LifecycleMockBackend::new(false, "").0;
+        let config = json!({"build": {"dockerfile": "Dockerfile", "context": ".."}});
+        let progress = ProgressSender::new(tokio::sync::mpsc::channel(8).0, false);
+        let input = EnsureImageInput {
+            client: &backend,
+            config: &config,
+            workspace_root: Path::new("/ws"),
+            config_name: None,
+            config_path: Path::new("/ws/.devcontainer/devcontainer.json"),
+            no_cache: false,
+            pull_policy: None,
+            secrets: &[],
+            build_tuning: BuildTuning::default(),
+            output: None,
+            labels: &[],
+            omit_remote_env_from_metadata: false,
+            omit_feature_customizations_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::NoLockfile,
+            progress: &progress,
+        };
+
+        ensure_image(&input).await.expect("image build succeeds");
+        assert_eq!(
+            backend.recorded_build_paths(),
+            Some((
+                "/ws/.devcontainer/Dockerfile".to_string(),
+                PathBuf::from("/ws"),
+            ))
+        );
+    }
 
     // ── parse_build_options ──────────────────────────────────────────────
 
@@ -797,6 +849,12 @@ mod tests {
         assert!(opts.options.contains(&"--pull".to_string()));
     }
 
+    fn build_paths(build_json: &str, config_dir: &str) -> (PathBuf, PathBuf) {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(build_json).unwrap();
+        resolve_build_paths(&build, Path::new(config_dir))
+    }
+
     #[test]
     fn parse_build_options_defaults() {
         let build: serde_json::Map<String, serde_json::Value> =
@@ -804,14 +862,14 @@ mod tests {
         let opts = parse_build_options(
             &build,
             "img:tag",
-            Path::new("/ws"),
+            Path::new("/ws/.devcontainer"),
             false,
             None,
             BuildTuning::default(),
         );
         assert_eq!(opts.image_name, "img:tag");
-        assert_eq!(opts.dockerfile, "Dockerfile");
-        assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/."));
+        assert_eq!(opts.dockerfile, "/ws/.devcontainer/Dockerfile");
+        assert_eq!(opts.context_path, Path::new("/ws/.devcontainer"));
         assert!(opts.args.is_empty());
         assert!(opts.target.is_none());
         assert!(opts.cache_from.is_empty());
@@ -819,48 +877,84 @@ mod tests {
     }
 
     #[test]
-    fn parse_build_options_custom_dockerfile() {
-        let build: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"dockerfile": "Dockerfile.dev"}"#).unwrap();
-        let opts = parse_build_options(
-            &build,
-            "img",
-            Path::new("/ws"),
-            false,
-            None,
-            BuildTuning::default(),
+    fn resolve_build_paths_custom_dockerfile() {
+        let (dockerfile, context) =
+            build_paths(r#"{"dockerfile": "Dockerfile.dev"}"#, "/ws/.devcontainer");
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/Dockerfile.dev")
         );
-        assert_eq!(opts.dockerfile, "Dockerfile.dev");
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer"));
     }
 
     #[test]
-    fn parse_build_options_absolute_context() {
-        let build: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"context": "/absolute/path"}"#).unwrap();
-        let opts = parse_build_options(
-            &build,
-            "img",
-            Path::new("/ws"),
-            false,
-            None,
-            BuildTuning::default(),
+    fn resolve_build_paths_absolute_paths_pass_through() {
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "/abs/Dockerfile", "context": "/absolute/path"}"#,
+            "/ws/.devcontainer",
         );
-        assert_eq!(opts.context_path, Path::new("/absolute/path"));
+        assert_eq!(dockerfile, PathBuf::from("/abs/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/absolute/path"));
     }
 
     #[test]
-    fn parse_build_options_relative_context() {
-        let build: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"context": "../"}"#).unwrap();
-        let opts = parse_build_options(
-            &build,
-            "img",
-            Path::new("/ws"),
-            false,
-            None,
-            BuildTuning::default(),
+    fn resolve_build_paths_parent_context_keeps_dockerfile_beside_config() {
+        // The common `"context": ".."` layout: the Dockerfile still sits next
+        // to devcontainer.json, only the context widens to the workspace.
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "Dockerfile", "context": ".."}"#,
+            "/ws/.devcontainer",
         );
-        assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/../"));
+        assert_eq!(dockerfile, PathBuf::from("/ws/.devcontainer/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/ws"));
+    }
+
+    #[test]
+    fn resolve_build_paths_root_level_config() {
+        // `.devcontainer.json` at the workspace root resolves against the root.
+        let (dockerfile, context) = build_paths(r#"{"dockerfile": "Dockerfile"}"#, "/ws");
+        assert_eq!(dockerfile, PathBuf::from("/ws/Dockerfile"));
+        assert_eq!(context, PathBuf::from("/ws"));
+    }
+
+    #[test]
+    fn resolve_build_paths_nested_config_dir() {
+        // `.devcontainer/<sub>/devcontainer.json` resolves against `<sub>`.
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "Dockerfile", "context": "../.."}"#,
+            "/ws/.devcontainer/sub",
+        );
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/sub/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws"));
+    }
+
+    #[test]
+    fn resolve_build_paths_context_defaults_to_dockerfile_dir() {
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "docker/Dockerfile"}"#,
+            "/ws/.devcontainer",
+        );
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/docker/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer/docker"));
+    }
+
+    #[test]
+    fn resolve_build_paths_empty_context_defaults_to_dockerfile_dir() {
+        let (dockerfile, context) = build_paths(
+            r#"{"dockerfile": "docker/Dockerfile", "context": ""}"#,
+            "/ws/.devcontainer",
+        );
+        assert_eq!(
+            dockerfile,
+            PathBuf::from("/ws/.devcontainer/docker/Dockerfile")
+        );
+        assert_eq!(context, PathBuf::from("/ws/.devcontainer/docker"));
     }
 
     #[test]

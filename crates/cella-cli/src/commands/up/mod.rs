@@ -313,8 +313,8 @@ pub struct UpCompatArgs {
     // `# syntax=` directive (a moby/buildkit#4556 workaround), and (B) it
     // suppresses the `# syntax=` line it would otherwise prepend to its
     // generated feature-extension Dockerfile. cella does NEITHER: it never
-    // parses Dockerfile content (`BuildOptions.dockerfile` is a filename passed
-    // verbatim as `-f`; the docker engine reads any `# syntax=` natively), and
+    // parses Dockerfile content (`BuildOptions.dockerfile` is only a path handed
+    // to the engine as `-f`; the docker engine reads any `# syntax=` natively), and
     // its generated feature Dockerfile emits no `# syntax=` line at all. So
     // cella already behaves as if this flag is permanently on — there is
     // nothing to suppress. Accepted-and-ignored for drop-in parity.

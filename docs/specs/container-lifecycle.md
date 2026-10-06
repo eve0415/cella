@@ -143,8 +143,8 @@ The `--build-no-cache` flag forces a re-pull regardless of policy.
 
 When `build` is specified, the pipeline builds a Docker image from a Dockerfile. The build configuration supports:
 
-- `dockerfile` -- Dockerfile path relative to context (default: `Dockerfile`)
-- `context` -- Build context path, absolute or relative to `.devcontainer/`
+- `dockerfile` -- Dockerfile path resolved relative to the directory containing `devcontainer.json`; absolute paths are used as-is (default: `Dockerfile`)
+- `context` -- Build context path resolved relative to the directory containing `devcontainer.json`; absolute paths are used as-is; absent or empty values default to the resolved Dockerfile's directory
 - `args` -- Build arguments passed as `--build-arg`
 - `target` -- Multi-stage build target
 - `cacheFrom` -- Cache source images
