@@ -760,7 +760,41 @@ pub fn parse_build_options(
 mod tests {
     use super::*;
     use crate::config::BuildTuning;
+    use crate::run_user_commands::tests::LifecycleMockBackend;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn ensure_image_build_uses_config_directory() {
+        let backend = LifecycleMockBackend::new(false, "").0;
+        let config = json!({"build": {"dockerfile": "Dockerfile", "context": ".."}});
+        let progress = ProgressSender::new(tokio::sync::mpsc::channel(8).0, false);
+        let input = EnsureImageInput {
+            client: &backend,
+            config: &config,
+            workspace_root: Path::new("/ws"),
+            config_name: None,
+            config_path: Path::new("/ws/.devcontainer/devcontainer.json"),
+            no_cache: false,
+            pull_policy: None,
+            secrets: &[],
+            build_tuning: BuildTuning::default(),
+            output: None,
+            labels: &[],
+            omit_remote_env_from_metadata: false,
+            omit_feature_customizations_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::NoLockfile,
+            progress: &progress,
+        };
+
+        ensure_image(&input).await.expect("image build succeeds");
+        assert_eq!(
+            backend.recorded_build_paths(),
+            Some((
+                "/ws/.devcontainer/Dockerfile".to_string(),
+                PathBuf::from("/ws"),
+            ))
+        );
+    }
 
     // ── parse_build_options ──────────────────────────────────────────────
 
