@@ -270,14 +270,20 @@ async fn write_env_cache(
         .await;
 }
 
-/// Ensure `SSH_AUTH_SOCK` is present in the target environment when a
-/// well-known runtime-specific socket exists inside the container.
+/// Ensure `SSH_AUTH_SOCK` is present when a well-known runtime-specific socket exists inside the container.
+///
+/// No-op for backends whose runtime forwards the agent because it already sets `SSH_AUTH_SOCK` for exec processes.
 pub async fn ensure_ssh_auth_sock(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     env: &mut Vec<String>,
 ) {
+    match client.capabilities().ssh_agent {
+        cella_backend::SshAgentTransport::BindMount => {}
+        cella_backend::SshAgentTransport::Runtime => return,
+    }
+
     if env.iter().any(|e| e.starts_with("SSH_AUTH_SOCK=")) {
         return;
     }
@@ -319,6 +325,19 @@ pub async fn ensure_ssh_auth_sock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_ssh_agent_skips_socket_probe() {
+        let (backend, recorded) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let backend = backend.with_ssh_agent_transport(cella_backend::SshAgentTransport::Runtime);
+        let mut env = vec!["EXAMPLE=value".to_string()];
+
+        ensure_ssh_auth_sock(&backend, "container", "user", &mut env).await;
+
+        assert_eq!(env, vec!["EXAMPLE=value"]);
+        assert!(recorded.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn cache_path_includes_probe_type() {

@@ -1749,6 +1749,7 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         }
     }
 

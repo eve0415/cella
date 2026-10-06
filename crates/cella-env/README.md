@@ -39,6 +39,7 @@ pub fn prepare_env_forwarding(
     remote_user: &str,
     workspace_folder: &Path,
     network: Option<&ProxyForwardingConfig>,
+    ssh_agent: SshAgentTransport,
 ) -> EnvForwarding
 ```
 

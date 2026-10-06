@@ -27,6 +27,8 @@ pub struct Platform {
 pub struct BackendCapabilities {
     pub compose: bool,
     pub managed_agent: bool,
+    /// How this backend forwards the host SSH agent.
+    pub ssh_agent: cella_env::SshAgentTransport,
 }
 
 /// Boxed future type alias for async trait methods (object-safe).

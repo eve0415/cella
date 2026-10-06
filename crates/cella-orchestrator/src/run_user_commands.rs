@@ -670,6 +670,7 @@ pub(crate) mod tests {
         recorded_started_at: Option<String>,
         recorded: Arc<Mutex<Vec<String>>>,
         recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
+        ssh_agent: cella_backend::SshAgentTransport,
     }
 
     impl LifecycleMockBackend {
@@ -685,8 +686,17 @@ pub(crate) mod tests {
                 recorded_started_at: None,
                 recorded: Arc::clone(&recorded),
                 recorded_build_paths: Mutex::new(None),
+                ssh_agent: cella_backend::SshAgentTransport::BindMount,
             };
             (backend, recorded)
+        }
+
+        pub fn with_ssh_agent_transport(
+            mut self,
+            ssh_agent: cella_backend::SshAgentTransport,
+        ) -> Self {
+            self.ssh_agent = ssh_agent;
+            self
         }
 
         pub fn recorded_build_paths(&self) -> Option<(String, PathBuf)> {
@@ -703,6 +713,7 @@ pub(crate) mod tests {
             BackendCapabilities {
                 compose: false,
                 managed_agent: false,
+                ssh_agent: self.ssh_agent,
             }
         }
 

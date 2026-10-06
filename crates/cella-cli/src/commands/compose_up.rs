@@ -171,6 +171,7 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
                 remote_user,
                 workspace_root,
                 proxy_fwd.as_ref(),
+                client.capabilities().ssh_agent,
             );
             // Trait method can't return Result; fall back to defaults on config error.
             let settings =

@@ -84,6 +84,7 @@ fn minimal_create_opts(name: &str) -> CreateContainerOptions {
         init: false,
         run_args_overrides: None,
         gpu_request: None,
+        forward_ssh_agent: false,
     }
 }
 

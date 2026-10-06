@@ -568,6 +568,8 @@ pub struct CreateContainerOptions {
     pub run_args_overrides: Option<RunArgsOverrides>,
     /// GPU request from `hostRequirements.gpu` (lower precedence than runArgs `--gpus`).
     pub gpu_request: Option<GpuRequest>,
+    /// Ask the runtime to forward the host SSH agent; only read by `Runtime` transport backends.
+    pub forward_ssh_agent: bool,
 }
 
 // ---------------------------------------------------------------------------

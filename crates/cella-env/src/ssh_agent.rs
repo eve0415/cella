@@ -6,6 +6,18 @@ use tracing::warn;
 
 use crate::platform::DockerRuntime;
 
+/// How the backend gets the host SSH agent into a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAgentTransport {
+    /// cella bind-mounts a socket and sets `SSH_AUTH_SOCK` itself.
+    BindMount,
+    /// The container runtime forwards the agent and sets `SSH_AUTH_SOCK`.
+    Runtime,
+}
+
+/// Warning shown after starting a container that expects a missing host agent.
+pub const MISSING_HOST_AGENT_WARNING: &str = "The host SSH agent socket ($SSH_AUTH_SOCK) is not available, so SSH and commit signing inside the container will fail. Restart the container from a shell with a running agent to restore forwarding.";
+
 /// SSH agent forwarding configuration.
 #[derive(Debug, Clone)]
 pub struct SshAgentForwarding {
@@ -153,11 +165,42 @@ pub fn ssh_agent_request(
         return Vec::new();
     }
 
-    let host_socket = std::env::var("SSH_AUTH_SOCK")
-        .ok()
-        .filter(|s| !s.is_empty());
+    ssh_agent_strategies_for_runtime(runtime, host_ssh_auth_sock())
+}
 
-    ssh_agent_strategies_for_runtime(runtime, host_socket)
+fn host_ssh_auth_sock() -> Option<String> {
+    std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a runtime should forward the host SSH agent for this configuration.
+pub fn runtime_forwarding_wanted(config: &serde_json::Value) -> bool {
+    !has_user_ssh_override(config)
+}
+
+/// Whether the host SSH agent socket is available for runtime forwarding.
+pub fn host_agent_socket_live() -> bool {
+    let host_socket = host_ssh_auth_sock();
+    host_agent_path_live(host_socket.as_deref())
+}
+
+fn host_agent_path_live(host_socket: Option<&str>) -> bool {
+    let Some(path) = host_socket else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|metadata| is_agent_socket(&metadata))
+}
+
+#[cfg(unix)]
+fn is_agent_socket(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    metadata.file_type().is_socket()
+}
+
+#[cfg(not(unix))]
+const fn is_agent_socket(_: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
@@ -295,6 +338,57 @@ fn extract_mount_target(mount_str: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runtime_forwarding_depends_only_on_config() {
+        let cases = [
+            (json!({}), true),
+            (
+                json!({"containerEnv": {"SSH_AUTH_SOCK": "/custom/socket"}}),
+                false,
+            ),
+            (
+                json!({"remoteEnv": {"SSH_AUTH_SOCK": "/custom/socket"}}),
+                false,
+            ),
+            (
+                json!({"mounts": [{"type": "bind", "source": "/host/sock", "target": "/run/ssh_auth_sock"}]}),
+                false,
+            ),
+            (
+                json!({"mounts": ["type=bind,source=/h,target=/run/ssh-auth.sock"]}),
+                false,
+            ),
+        ];
+
+        for (config, expected) in cases {
+            assert_eq!(runtime_forwarding_wanted(&config), expected, "{config}");
+        }
+    }
+
+    #[test]
+    fn host_agent_path_rejects_missing_values_and_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing = temp.path().join("missing.sock");
+
+        assert!(!host_agent_path_live(None));
+        assert!(!host_agent_path_live(Some("")));
+        assert!(!host_agent_path_live(missing.to_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_agent_path_requires_a_unix_socket() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let regular_file = temp.path().join("regular-file");
+        std::fs::write(&regular_file, []).unwrap();
+        assert!(!host_agent_path_live(regular_file.to_str()));
+
+        let socket = temp.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(host_agent_path_live(socket.to_str()));
+        drop(listener);
+    }
 
     #[test]
     fn user_override_container_env() {

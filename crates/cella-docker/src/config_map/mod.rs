@@ -504,6 +504,7 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         };
 
         let bollard_config = to_bollard_config(&opts);
@@ -549,6 +550,7 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         };
 
         let bollard_config = to_bollard_config(&opts);
@@ -580,6 +582,7 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         };
         let bollard_config = to_bollard_config(&opts);
         let extra_hosts = bollard_config.host_config.unwrap().extra_hosts.unwrap();
@@ -607,6 +610,7 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         }
     }
 

@@ -22,7 +22,7 @@ The backend discovers the `container` binary via `CELLA_CONTAINER_PATH` or `PATH
 - **File injection** — native `container cp` plus an exec to normalize ownership/mode
 - **Networks** — the shared `cella` network and per-workspace `cella-net-*` networks are created with the same labels and names as the Docker backend. vmnet fixes attachments at creation, so they are requested on `container create`; post-create `network connect` does not exist. Requires macOS 26 (on macOS 15 the backend degrades to the default network).
 - **runArgs** — `--cap-add`, memory/cpus (whole vCPUs), `--shm-size`, `--init`, DNS options, ulimits, tmpfs, labels and `--runtime` map natively; unsupported flags (`--privileged`, `--security-opt`, devices, GPUs, namespaces, restart policies, ...) emit one consolidated warning
-- **SSH agent** — native `--ssh` forwarding when `SSH_AUTH_SOCK` is set
+- **SSH agent** — native `--ssh` forwarding unless the devcontainer config sets its own SSH forwarding; the runtime picks up the host `$SSH_AUTH_SOCK` on every start
 
 ### Known Limitations
 

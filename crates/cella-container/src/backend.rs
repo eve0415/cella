@@ -246,6 +246,7 @@ impl ContainerBackend for AppleContainerBackend {
         BackendCapabilities {
             compose: false,
             managed_agent: false,
+            ssh_agent: cella_backend::SshAgentTransport::Runtime,
         }
     }
 
@@ -1109,7 +1110,7 @@ fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<
     }
 
     // SSH agent forwarding
-    if std::env::var("SSH_AUTH_SOCK").is_ok() {
+    if opts.forward_ssh_agent {
         args.push("--ssh".to_string());
     }
 
@@ -1468,6 +1469,18 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn apple_backend_uses_runtime_ssh_agent_forwarding() {
+        let backend = AppleContainerBackend::new(ContainerCli::new(
+            std::path::PathBuf::from("/nonexistent/container"),
+            "1.0.0".to_string(),
+        ));
+        assert_eq!(
+            backend.capabilities().ssh_agent,
+            cella_backend::SshAgentTransport::Runtime
+        );
+    }
+
     fn minimal_create_opts() -> CreateContainerOptions {
         CreateContainerOptions {
             name: "test-container".to_string(),
@@ -1488,7 +1501,17 @@ mod tests {
             init: false,
             run_args_overrides: None,
             gpu_request: None,
+            forward_ssh_agent: false,
         }
+    }
+
+    #[test]
+    fn build_create_args_uses_ssh_forwarding_option() {
+        let mut opts = minimal_create_opts();
+        assert!(!build_create_args(&opts, &[]).contains(&"--ssh".to_string()));
+
+        opts.forward_ssh_agent = true;
+        assert!(build_create_args(&opts, &[]).contains(&"--ssh".to_string()));
     }
 
     #[test]

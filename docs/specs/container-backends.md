@@ -112,6 +112,7 @@ Each backend reports its supported capabilities through `BackendCapabilities`:
 pub struct BackendCapabilities {
     pub compose: bool,
     pub managed_agent: bool,
+    pub ssh_agent: SshAgentTransport,
 }
 ```
 
@@ -121,6 +122,7 @@ Callers MUST check capabilities before invoking capability-gated operations:
 |---|---|---|---|
 | `compose` | true | false | Docker Compose integration (compose project creation, service discovery, override YAML generation) |
 | `managed_agent` | true | false | In-container agent provisioning via shared Docker volume, agent restart, daemon address injection |
+| `ssh_agent` | `BindMount` | `Runtime` | How the host SSH agent enters the container and how `SSH_AUTH_SOCK` is set |
 
 Beyond the `BackendCapabilities` struct, backends express their feature surface through several other mechanisms:
 

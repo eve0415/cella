@@ -129,6 +129,18 @@ struct CreateResult {
     ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
 }
 
+fn has_runtime_ssh_agent_label(labels: &std::collections::HashMap<String, String>) -> bool {
+    labels
+        .get(cella_backend::names::SSH_AGENT_LABEL)
+        .is_some_and(|value| value == cella_backend::names::SSH_AGENT_RUNTIME)
+}
+
+fn warn_if_missing_host_agent(progress: &ProgressSender, runtime_ssh_agent: bool) {
+    if runtime_ssh_agent && !cella_env::ssh_agent::host_agent_socket_live() {
+        progress.warn(cella_env::ssh_agent::MISSING_HOST_AGENT_WARNING);
+    }
+}
+
 /// Remove the current SSH agent mount, env var, and label entry from
 /// container create options. Also clears `env_fwd` so downstream label
 /// readers (`cella exec`, `cella shell`) don't inject a stale socket path.
@@ -324,6 +336,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             None,
+            self.client.capabilities().ssh_agent,
         );
         if !self.client.capabilities().managed_agent {
             env_fwd
@@ -797,6 +810,10 @@ impl EnsureUpContext<'_> {
 
         match start_result {
             Ok(()) => {
+                warn_if_missing_host_agent(
+                    &self.progress,
+                    has_runtime_ssh_agent_label(&container.labels),
+                );
                 if let Err(e) =
                     crate::container_setup::verify_container_running(self.client, &container.id)
                         .await
@@ -1155,6 +1172,11 @@ impl EnsureUpContext<'_> {
     /// socket mounts on Docker Desktop / `OrbStack` / Linux) and when the
     /// daemon is unreachable or predates the refresh RPC.
     async fn refresh_ssh_agent_bridge(&self) -> Option<crate::result::SshAgentProxyStatus> {
+        match self.client.capabilities().ssh_agent {
+            cella_backend::SshAgentTransport::BindMount => {}
+            cella_backend::SshAgentTransport::Runtime => return None,
+        }
+
         let runtime = cella_env::platform::detect_runtime();
         let upstream = cella_env::ssh_agent::ssh_agent_request(&runtime, self.config_json())
             .into_iter()
@@ -1235,6 +1257,22 @@ impl EnsureUpContext<'_> {
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
+        create_opts.forward_ssh_agent = match capabilities.ssh_agent {
+            cella_backend::SshAgentTransport::BindMount => false,
+            cella_backend::SshAgentTransport::Runtime => {
+                cella_env::ssh_agent::runtime_forwarding_wanted(self.config_json())
+            }
+        };
+        if create_opts.forward_ssh_agent {
+            create_opts.labels.insert(
+                cella_backend::names::SSH_AGENT_LABEL.to_string(),
+                cella_backend::names::SSH_AGENT_RUNTIME.to_string(),
+            );
+        } else {
+            create_opts
+                .labels
+                .remove(cella_backend::names::SSH_AGENT_LABEL);
+        }
 
         for m in &env_fwd.mounts {
             create_opts.mounts.push(MountConfig {
@@ -1340,6 +1378,7 @@ impl EnsureUpContext<'_> {
     async fn start_and_notify(
         &self,
         container_id: &str,
+        forward_ssh_agent: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let label = if self.progress.is_verbose() {
             let short_id = &container_id[..12.min(container_id.len())];
@@ -1353,6 +1392,7 @@ impl EnsureUpContext<'_> {
             self.client.start_container(container_id),
         )
         .await?;
+        warn_if_missing_host_agent(&self.progress, forward_ssh_agent);
         crate::container_setup::verify_container_running(self.client, container_id).await?;
 
         if let Err(e) = self
@@ -1594,6 +1634,7 @@ impl EnsureUpContext<'_> {
             remote_user,
             &self.config.resolved.workspace_root,
             proxy_fwd.as_ref(),
+            self.client.capabilities().ssh_agent,
         );
 
         if !managed_agent {
@@ -2120,7 +2161,8 @@ impl EnsureUpContext<'_> {
             .create_container_with_ssh_fallback(&mut create_opts, &mut env_fwd)
             .await?;
 
-        self.start_and_notify(&container_id).await?;
+        self.start_and_notify(&container_id, create_opts.forward_ssh_agent)
+            .await?;
 
         let (_probed_env, lifecycle_env) = self
             .post_create_setup(&container_id, &remote_user, &env_fwd, &settings)
@@ -2690,6 +2732,24 @@ fn retain_undefined_env(tool_env: Vec<String>, existing: &[String]) -> Vec<Strin
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn runtime_ssh_agent_label_requires_runtime_value() {
+        let mut labels = std::collections::HashMap::new();
+        assert!(!has_runtime_ssh_agent_label(&labels));
+
+        labels.insert(
+            cella_backend::names::SSH_AGENT_LABEL.to_string(),
+            "other".to_string(),
+        );
+        assert!(!has_runtime_ssh_agent_label(&labels));
+
+        labels.insert(
+            cella_backend::names::SSH_AGENT_LABEL.to_string(),
+            cella_backend::names::SSH_AGENT_RUNTIME.to_string(),
+        );
+        assert!(has_runtime_ssh_agent_label(&labels));
+    }
 
     #[test]
     fn tool_env_yields_to_a_user_supplied_container_env() {
