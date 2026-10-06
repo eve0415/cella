@@ -200,6 +200,7 @@ pub struct BuildSecret {
 pub struct BuildOptions {
     pub image_name: String,
     pub context_path: PathBuf,
+    /// Dockerfile path, either absolute or relative to `context_path`.
     pub dockerfile: String,
     pub args: HashMap<String, String>,
     pub target: Option<String>,

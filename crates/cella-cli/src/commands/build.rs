@@ -174,8 +174,8 @@ struct BuildCompatArgs {
     // and strips any `# syntax=` directive (a moby/buildkit#4556 workaround),
     // and (B) it suppresses the `# syntax=` line it would otherwise prepend to
     // its generated feature-extension Dockerfile. cella does NEITHER: it never
-    // parses Dockerfile content (`BuildOptions.dockerfile` is a filename passed
-    // verbatim as `-f`; the engine reads any `# syntax=` natively), and
+    // parses Dockerfile content (`BuildOptions.dockerfile` is only a path handed
+    // to the engine as `-f`; the engine reads any `# syntax=` natively), and
     // `cella_features::generate_dockerfile` emits no `# syntax=` line at all (it
     // opens with `ARG`/`FROM`). So cella already behaves as if this flag is
     // permanently on — there is nothing to suppress. Accepted-and-ignored for
