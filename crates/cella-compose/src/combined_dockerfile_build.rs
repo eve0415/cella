@@ -350,9 +350,10 @@ fn assemble_features_build(
         cella_features::FEATURE_CONTENT_SOURCE.to_string(),
         resolved.build_context.clone(),
     );
-    if let Some(dir) = combined_dockerfile.parent() {
-        additional_contexts.insert(COMBINED_DOCKERFILE_CONTEXT.to_string(), dir.to_path_buf());
-    }
+    additional_contexts.insert(
+        COMBINED_DOCKERFILE_CONTEXT.to_string(),
+        compose_dockerfile_dir(&project.project_name),
+    );
 
     let (build_context, image_name_override) = match service_info {
         ServiceBuildInfo::Image { .. } => {
@@ -387,15 +388,19 @@ fn has_features(config: &serde_json::Value) -> bool {
         .is_some_and(|v| v.is_object() && !v.as_object().unwrap().is_empty())
 }
 
-/// Compute the path for the combined Dockerfile.
+/// Compute the directory that holds only the combined Dockerfile.
 ///
-/// The file gets a directory of its own so that granting the build read access to that directory exposes nothing else.
-fn compose_dockerfile_path(project_name: &str) -> PathBuf {
+/// The build is granted read access to this directory, so nothing else may be written here.
+fn compose_dockerfile_dir(project_name: &str) -> PathBuf {
     cella_data_dir()
         .join("compose")
         .join(project_name)
         .join("dockerfile")
-        .join("Dockerfile.combined")
+}
+
+/// Compute the path for the combined Dockerfile.
+fn compose_dockerfile_path(project_name: &str) -> PathBuf {
+    compose_dockerfile_dir(project_name).join("Dockerfile.combined")
 }
 
 /// Compute the path for the empty build context directory (image-only services).
@@ -641,7 +646,7 @@ RUN echo hi
     // ---------------------------------------------------------------
 
     #[test]
-    fn combined_dockerfile_is_under_a_granted_context() {
+    fn combined_dockerfile_grant_covers_only_its_own_directory() {
         let project = crate::ComposeProject {
             project_name: "cella-test".to_string(),
             compose_files: vec![],
@@ -685,18 +690,18 @@ RUN echo hi
         )
         .unwrap();
 
-        let granted: Vec<&std::path::Path> = build
-            .build_context
-            .iter()
-            .chain(build.additional_contexts.values())
-            .map(std::path::PathBuf::as_path)
-            .collect();
+        let granted = &build.additional_contexts[super::COMBINED_DOCKERFILE_CONTEXT];
         assert!(
-            granted
-                .iter()
-                .any(|dir| build.combined_dockerfile.starts_with(dir)),
-            "{} is outside every granted context: {granted:?}",
-            build.combined_dockerfile.display()
+            build.combined_dockerfile.starts_with(granted),
+            "{} is outside its granted context {}",
+            build.combined_dockerfile.display(),
+            granted.display()
+        );
+        let override_file = crate::project::compose_override_path(&project.project_name);
+        assert!(
+            !override_file.starts_with(granted),
+            "granted context {} also exposes the override file",
+            granted.display()
         );
     }
 }

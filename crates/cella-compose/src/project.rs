@@ -301,7 +301,7 @@ fn sanitize_name(s: &str) -> String {
 }
 
 /// Compute the path for the cella override compose file.
-fn compose_override_path(project_name: &str) -> PathBuf {
+pub(crate) fn compose_override_path(project_name: &str) -> PathBuf {
     let data_dir = cella_data_dir().join("compose").join(project_name);
     data_dir.join("docker-compose.cella.yml")
 }
