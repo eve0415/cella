@@ -103,8 +103,16 @@ pub struct BaseImageContext<'a> {
     pub image_user: &'a str,
     /// `devcontainer.metadata` label from the base image, if available.
     pub metadata: Option<&'a str>,
+    /// `remoteUser`/`containerUser` from `metadata`, parsed by the caller from
+    /// a substituted copy of the label. The raw `metadata` itself is merged
+    /// (and substituted downstream) and persisted as is.
+    pub metadata_user: Option<ImageMetadataUserInfo>,
     /// Which keys to omit from the generated `devcontainer.metadata` label.
     pub omit: MetadataOmit,
+    /// The config recorded as the user entry of the generated
+    /// `devcontainer.metadata` label: the pre-substitution config, so host
+    /// values substituted into `config` stay out of the image.
+    pub label_config: &'a serde_json::Value,
 }
 
 /// OCI digest metadata captured for a feature so it can be pinned in the
@@ -181,12 +189,7 @@ pub async fn resolve_features(
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
         Some(obj) if !obj.is_empty() => obj,
         _ => {
-            return resolve_empty_features(
-                config,
-                cache,
-                base_image_ctx.metadata,
-                base_image_ctx.omit,
-            );
+            return resolve_empty_features(config, cache, base_image_ctx);
         }
     };
 
@@ -248,7 +251,7 @@ pub async fn resolve_features(
         config,
         base_image_ctx.base_image,
         base_image_ctx.image_user,
-        base_image_ctx.metadata,
+        base_image_ctx.metadata_user.as_ref(),
         use_named_content_source,
     )?;
 
@@ -256,7 +259,7 @@ pub async fn resolve_features(
     let container_config = merge_all_metadata(&resolved, config, base_image_ctx.metadata);
     let metadata_label = generate_metadata_label(
         &resolved,
-        config,
+        base_image_ctx.label_config,
         base_image_ctx.metadata,
         base_image_ctx.omit,
     );
@@ -348,9 +351,9 @@ pub fn generate_metadata_label(
 fn resolve_empty_features(
     config: &serde_json::Value,
     cache: &FeatureCache,
-    base_image_metadata: Option<&str>,
-    omit: MetadataOmit,
+    base_image_ctx: &BaseImageContext<'_>,
 ) -> Result<ResolvedFeatures, FeatureError> {
+    let base_image_metadata = base_image_ctx.metadata;
     debug!("no features declared in devcontainer.json");
     let build_context = cache.build_context_path("empty");
     std::fs::create_dir_all(&build_context)?;
@@ -365,7 +368,12 @@ fn resolve_empty_features(
         dockerfile: String::new(),
         build_context,
         container_config,
-        metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit),
+        metadata_label: generate_metadata_label(
+            &[],
+            base_image_ctx.label_config,
+            base_image_metadata,
+            base_image_ctx.omit,
+        ),
         lockfile: None,
     })
 }
@@ -379,11 +387,10 @@ fn generate_and_write_build_context(
     config: &serde_json::Value,
     base_image: &str,
     image_user: &str,
-    base_image_metadata: Option<&str>,
+    meta_user: Option<&ImageMetadataUserInfo>,
     use_named_content_source: bool,
 ) -> Result<String, FeatureError> {
     // User resolution per spec: devcontainer.json > image metadata > Config.User > "root"
-    let meta_user = base_image_metadata.map(|m| parse_image_metadata(m).1);
     let container_user = config
         .get("containerUser")
         .and_then(|v| v.as_str())
@@ -1503,7 +1510,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1513,6 +1522,110 @@ mod tests {
 
         assert!(result.features.is_empty());
         assert!(result.dockerfile.is_empty());
+    }
+
+    /// The generated label records `label_config`, not the substituted config.
+    #[tokio::test]
+    async fn metadata_label_records_label_config_without_features() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let raw_token = concat!("${localEnv", ":SECRET}");
+        let config = json!({"image": "ubuntu:22.04", "containerEnv": {"S": "xyz"}});
+        let raw = json!({"image": "ubuntu:22.04", "containerEnv": {"S": raw_token}});
+
+        let result = resolve_features(
+            &config,
+            Path::new("/workspace/devcontainer.json"),
+            &Platform {
+                os: "linux".to_string(),
+                architecture: "amd64".to_string(),
+            },
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                metadata_user: None,
+                omit: MetadataOmit::default(),
+                label_config: &raw,
+            },
+            false,
+            LockfilePolicy::NoLockfile,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.metadata_label.contains(raw_token),
+            "{}",
+            result.metadata_label
+        );
+        assert!(
+            !result.metadata_label.contains("xyz"),
+            "{}",
+            result.metadata_label
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_label_records_label_config_with_features() {
+        let feature_dir = tempfile::tempdir().unwrap();
+        let feature_path = feature_dir.path().join("my-feature");
+        std::fs::create_dir_all(&feature_path).unwrap();
+        std::fs::write(
+            feature_path.join("devcontainer-feature.json"),
+            r#"{"id": "my-feature", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(feature_path.join("install.sh"), "#!/bin/sh\necho installed").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let raw_token = concat!("${localEnv", ":SECRET}");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": {"./my-feature": {}},
+            "build": {"args": {"TOKEN": "xyz"}},
+        });
+        let raw = json!({
+            "image": "ubuntu:22.04",
+            "features": {"./my-feature": {}},
+            "build": {"args": {"TOKEN": raw_token}},
+        });
+
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &Platform {
+                os: "linux".to_string(),
+                architecture: "amd64".to_string(),
+            },
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                metadata_user: None,
+                omit: MetadataOmit::default(),
+                label_config: &raw,
+            },
+            false,
+            LockfilePolicy::NoLockfile,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.features.len(), 1);
+        assert!(
+            result.metadata_label.contains(raw_token),
+            "{}",
+            result.metadata_label
+        );
+        assert!(
+            !result.metadata_label.contains("xyz"),
+            "{}",
+            result.metadata_label
+        );
     }
 
     #[tokio::test]
@@ -1533,7 +1646,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1587,7 +1702,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1704,7 +1821,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1770,7 +1889,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1815,7 +1936,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1860,7 +1983,9 @@ mod tests {
                 base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1994,7 +2119,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2083,7 +2210,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2150,7 +2279,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2214,7 +2345,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2291,7 +2424,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2355,7 +2490,9 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                metadata_user: None,
                 omit: MetadataOmit::default(),
+                label_config: &config,
             },
             false,
             LockfilePolicy::NoLockfile,

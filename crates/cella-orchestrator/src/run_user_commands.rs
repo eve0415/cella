@@ -697,6 +697,7 @@ pub(crate) mod tests {
         recorded_started_at: Option<String>,
         recorded: Arc<Mutex<Vec<String>>>,
         recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
+        recorded_build_options: Mutex<Option<Vec<String>>>,
         ssh_agent: cella_backend::SshAgentTransport,
     }
 
@@ -713,6 +714,7 @@ pub(crate) mod tests {
                 recorded_started_at: None,
                 recorded: Arc::clone(&recorded),
                 recorded_build_paths: Mutex::new(None),
+                recorded_build_options: Mutex::new(None),
                 ssh_agent: cella_backend::SshAgentTransport::BindMount,
             };
             (backend, recorded)
@@ -728,6 +730,10 @@ pub(crate) mod tests {
 
         pub fn recorded_build_paths(&self) -> Option<(String, PathBuf)> {
             self.recorded_build_paths.lock().expect("mutex").clone()
+        }
+
+        pub fn recorded_build_options(&self) -> Option<Vec<String>> {
+            self.recorded_build_options.lock().expect("mutex").clone()
         }
     }
 
@@ -898,6 +904,10 @@ pub(crate) mod tests {
                 .lock()
                 .expect("mutex")
                 .replace((opts.dockerfile.clone(), opts.context_path.clone()));
+            self.recorded_build_options
+                .lock()
+                .expect("mutex")
+                .replace(opts.options.clone());
             Box::pin(async { Ok("built-image".to_string()) })
         }
 

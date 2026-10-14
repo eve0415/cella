@@ -13,6 +13,7 @@ use cella_backend::{
     BuildOptions, BuildSecret, ContainerBackend, ImageDetails, compute_features_digest, image_name,
     image_name_for_worktree, image_name_with_features,
 };
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_features::ResolvedFeatures;
 
 use crate::progress::{ProgressSender, format_elapsed};
@@ -133,6 +134,12 @@ pub async fn build_features_layer(
 pub struct EnsureImageInput<'a> {
     pub client: &'a dyn ContainerBackend,
     pub config: &'a serde_json::Value,
+    /// The context the build's base-image metadata label is substituted with
+    /// before its `remoteUser`/`containerUser` are read.
+    pub subst_ctx: &'a SubstitutionContext,
+    /// The config recorded as the user entry of the `devcontainer.metadata`
+    /// label: the pre-substitution config.
+    pub label_config: &'a serde_json::Value,
     pub workspace_root: &'a Path,
     pub config_name: Option<&'a str>,
     pub config_path: &'a Path,
@@ -283,6 +290,8 @@ pub async fn ensure_image(
     let features_input = FeaturesBuildInput {
         client: input.client,
         config: input.config,
+        subst_ctx: input.subst_ctx,
+        label_config: input.label_config,
         config_path: input.config_path,
         workspace_root: input.workspace_root,
         config_name: input.config_name,
@@ -417,7 +426,7 @@ async fn resolve_base_image(
         if !will_build_features {
             let metadata_label = cella_features::generate_metadata_label(
                 &[],
-                input.config,
+                input.label_config,
                 None,
                 cella_features::MetadataOmit {
                     remote_env: input.omit_remote_env_from_metadata,
@@ -461,6 +470,12 @@ async fn resolve_base_image(
 struct FeaturesBuildInput<'a> {
     client: &'a dyn ContainerBackend,
     config: &'a serde_json::Value,
+    /// The context the build's base-image metadata label is substituted with
+    /// before its `remoteUser`/`containerUser` are read.
+    subst_ctx: &'a SubstitutionContext,
+    /// The config recorded as the user entry of the `devcontainer.metadata`
+    /// label: the pre-substitution config.
+    label_config: &'a serde_json::Value,
     config_path: &'a Path,
     workspace_root: &'a Path,
     config_name: Option<&'a str>,
@@ -494,6 +509,30 @@ fn parse_platform_str(platform: &str) -> Option<(&str, &str)> {
     Some((os, arch))
 }
 
+/// The base-image context for feature resolution.
+///
+/// `remoteUser`/`containerUser` are read from a copy of the base image's
+/// metadata label substituted with `subst_ctx`; the raw label is handed over
+/// for merging (substituted downstream) and for the persisted label.
+fn features_base_ctx<'a>(
+    base_image_tag: &'a str,
+    details: &'a ImageDetails,
+    omit: cella_features::MetadataOmit,
+    label_config: &'a serde_json::Value,
+    subst_ctx: &SubstitutionContext,
+) -> cella_features::BaseImageContext<'a> {
+    cella_features::BaseImageContext {
+        base_image: base_image_tag,
+        image_user: &details.user,
+        metadata: details.metadata.as_deref(),
+        metadata_user: details.metadata.as_deref().map(|m| {
+            cella_config::config_map::metadata_label::parse_substituted_metadata(m, subst_ctx).1
+        }),
+        omit,
+        label_config,
+    }
+}
+
 /// Resolve features and build the features layer image.
 async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
@@ -523,15 +562,16 @@ async fn resolve_and_build_features(
         input.config_path,
         &platform,
         &cache,
-        &cella_features::BaseImageContext {
-            base_image: input.base_image_tag,
-            image_user: &input.base_image_details.user,
-            metadata: input.base_image_details.metadata.as_deref(),
-            omit: cella_features::MetadataOmit {
+        &features_base_ctx(
+            input.base_image_tag,
+            input.base_image_details,
+            cella_features::MetadataOmit {
                 remote_env: input.omit_remote_env_from_metadata,
                 feature_customizations: input.omit_feature_customizations_from_metadata,
             },
-        },
+            input.label_config,
+            input.subst_ctx,
+        ),
         false, // non-compose: build context IS the features dir, bare COPY works
         input.lockfile_policy,
     )
@@ -771,6 +811,8 @@ mod tests {
         let input = EnsureImageInput {
             client: &backend,
             config: &config,
+            label_config: &config,
+            subst_ctx: &no_subst(),
             workspace_root: Path::new("/ws"),
             config_name: None,
             config_path: Path::new("/ws/.devcontainer/devcontainer.json"),
@@ -793,6 +835,112 @@ mod tests {
                 "/ws/.devcontainer/Dockerfile".to_string(),
                 PathBuf::from("/ws"),
             ))
+        );
+    }
+
+    /// The image label records the pre-substitution config: a host value
+    /// substituted into `build.args` / `containerEnv` stays out of it.
+    #[tokio::test]
+    async fn ensure_image_metadata_label_records_raw_config() {
+        let backend = LifecycleMockBackend::new(false, "").0;
+        let raw_token = concat!("${localEnv", ":SECRET}");
+        let config = json!({
+            "build": {"dockerfile": "Dockerfile", "args": {"TOKEN": "xyz"}},
+            "containerEnv": {"TOKEN": "xyz"},
+        });
+        let raw = json!({
+            "build": {"dockerfile": "Dockerfile", "args": {"TOKEN": raw_token}},
+            "containerEnv": {"TOKEN": raw_token},
+        });
+        let progress = ProgressSender::new(tokio::sync::mpsc::channel(8).0, false);
+        let input = EnsureImageInput {
+            client: &backend,
+            config: &config,
+            label_config: &raw,
+            subst_ctx: &no_subst(),
+            workspace_root: Path::new("/ws"),
+            config_name: None,
+            config_path: Path::new("/ws/.devcontainer/devcontainer.json"),
+            no_cache: false,
+            pull_policy: None,
+            secrets: &[],
+            build_tuning: BuildTuning::default(),
+            output: None,
+            labels: &[],
+            omit_remote_env_from_metadata: false,
+            omit_feature_customizations_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::NoLockfile,
+            progress: &progress,
+        };
+
+        ensure_image(&input).await.expect("image build succeeds");
+        let options = backend.recorded_build_options().expect("a build ran");
+        let label = options
+            .iter()
+            .find(|o| o.starts_with("--label=devcontainer.metadata="))
+            .expect("metadata label passed to the build");
+        assert!(label.contains(raw_token), "{label}");
+        assert!(!label.contains("xyz"), "{label}");
+    }
+
+    fn no_subst() -> SubstitutionContext {
+        SubstitutionContext::local_env_only(HashMap::new())
+    }
+
+    /// The features build reads the base image's `remoteUser` from a
+    /// substituted copy of its label, while the persisted label stays raw.
+    #[tokio::test]
+    async fn features_build_sees_substituted_base_image_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let feature = dir.path().join("my-feature");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(
+            feature.join("devcontainer-feature.json"),
+            r#"{"id": "my-feature", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\n").unwrap();
+        let config = json!({"image": "base", "features": {"./my-feature": {}}});
+        let raw_user = concat!("${localEnv", ":X}");
+        let details = ImageDetails {
+            user: "root".to_string(),
+            metadata: Some(json!([{"remoteUser": raw_user}]).to_string()),
+            ..ImageDetails::default()
+        };
+        let ctx = SubstitutionContext::local_env_only(HashMap::from([(
+            "X".to_string(),
+            "alice".to_string(),
+        )]));
+        let cache_dir = tempfile::tempdir().unwrap();
+        let resolved = cella_features::resolve_features(
+            &config,
+            &dir.path().join("devcontainer.json"),
+            &cella_features::oci::detect_platform("linux", "x86_64"),
+            &cella_features::FeatureCache::with_root(cache_dir.path().join("features")),
+            &features_base_ctx(
+                "base",
+                &details,
+                cella_features::MetadataOmit::default(),
+                &config,
+                &ctx,
+            ),
+            false,
+            cella_features::LockfilePolicy::NoLockfile,
+        )
+        .await
+        .unwrap();
+
+        let builtin = std::fs::read_to_string(
+            resolved
+                .build_context
+                .join("devcontainer-features.builtin.env"),
+        )
+        .unwrap();
+        assert!(builtin.contains("_REMOTE_USER=alice"), "{builtin}");
+        assert!(
+            resolved.metadata_label.contains(raw_user),
+            "{}",
+            resolved.metadata_label
         );
     }
 

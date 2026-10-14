@@ -629,7 +629,9 @@ impl Command {
             Self::List(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Logs(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Doctor(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Branch(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Branch(args) => Box::pin(args.execute(progress))
+                .await
+                .map_err(boxed_err_to_report),
             Self::Switch(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Prune(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::ReadConfiguration(args) => args.execute().await.map_err(boxed_err_to_report),
@@ -639,7 +641,9 @@ impl Command {
             Self::SetUp(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
             Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Features(args) => Box::pin(args.execute(progress))
+                .await
+                .map_err(boxed_err_to_report),
             Self::Image(args) => args.execute(progress).await,
             Self::Upgrade(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),

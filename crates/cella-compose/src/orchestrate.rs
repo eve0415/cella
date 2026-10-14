@@ -547,7 +547,7 @@ async fn resolve_user_and_env(
     // `build_labels`).
     let metadata_label = compose_metadata_label(
         features_build.map(|fb| fb.resolved_features.metadata_label.as_str()),
-        cfg.config,
+        &cfg.resolved.raw_config,
         base_metadata.as_deref(),
         cfg.omit_remote_env_from_metadata,
     );
@@ -604,6 +604,8 @@ async fn prepare_and_start(
         client,
         &crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
             config,
+            subst_ctx: &cella_config::config_map::subst_ctx(cfg.resolved),
+            label_config: &cfg.resolved.raw_config,
             config_path: cfg.config_path,
             project,
             omit_remote_env_from_metadata: cfg.omit_remote_env_from_metadata,

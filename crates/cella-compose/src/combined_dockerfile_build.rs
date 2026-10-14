@@ -43,6 +43,12 @@ pub struct ComposeFeaturesBuild {
 pub struct ResolveComposeFeaturesInput<'a> {
     /// Parsed devcontainer JSON config.
     pub config: &'a serde_json::Value,
+    /// The context the build's base-image metadata label is substituted with
+    /// before its `remoteUser`/`containerUser` are read.
+    pub subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
+    /// The config recorded as the user entry of the `devcontainer.metadata`
+    /// label: the pre-substitution config.
+    pub label_config: &'a serde_json::Value,
     /// Path to `devcontainer.json`.
     pub config_path: &'a Path,
     /// Compose project (primary service name, project name, paths).
@@ -55,6 +61,34 @@ pub struct ResolveComposeFeaturesInput<'a> {
     pub omit_feature_customizations_from_metadata: bool,
     /// Lockfile policy for feature resolution.
     pub lockfile_policy: cella_features::LockfilePolicy,
+}
+
+/// The base-image context for compose feature resolution.
+///
+/// `remoteUser`/`containerUser` are read from a copy of the base image's
+/// metadata label substituted with the build's context; the raw label is
+/// handed over for merging (substituted downstream) and for the persisted
+/// label.
+fn compose_base_ctx<'a>(
+    input: &'a ResolveComposeFeaturesInput<'_>,
+    stage_name: &'a str,
+    image_user: &'a str,
+    base_image_metadata: Option<&'a str>,
+) -> cella_features::BaseImageContext<'a> {
+    cella_features::BaseImageContext {
+        base_image: stage_name,
+        image_user,
+        metadata: base_image_metadata,
+        metadata_user: base_image_metadata.map(|m| {
+            cella_config::config_map::metadata_label::parse_substituted_metadata(m, input.subst_ctx)
+                .1
+        }),
+        omit: cella_features::MetadataOmit {
+            remote_env: input.omit_remote_env_from_metadata,
+            feature_customizations: input.omit_feature_customizations_from_metadata,
+        },
+        label_config: input.label_config,
+    }
 }
 
 /// Resolve features for a compose service and generate the combined Dockerfile.
@@ -169,15 +203,12 @@ pub async fn resolve_compose_features(
             config_path,
             &platform,
             &cache,
-            &cella_features::BaseImageContext {
-                base_image: &stage_name,
-                image_user: &image_user,
-                metadata: base_image_metadata.as_deref(),
-                omit: cella_features::MetadataOmit {
-                    remote_env: input.omit_remote_env_from_metadata,
-                    feature_customizations: input.omit_feature_customizations_from_metadata,
-                },
-            },
+            &compose_base_ctx(
+                input,
+                &stage_name,
+                &image_user,
+                base_image_metadata.as_deref(),
+            ),
             true, // compose builds use named content source via additional_contexts
             input.lockfile_policy,
         )

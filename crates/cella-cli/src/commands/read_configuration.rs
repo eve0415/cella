@@ -315,8 +315,10 @@ pub async fn resolve_config_features(
         base_image,
         image_user: "root",
         metadata: None,
+        metadata_user: None,
         // read-configuration only merges config; no label is persisted.
         omit: cella_features::MetadataOmit::default(),
+        label_config: config,
     };
     let rf = cella_features::resolve_features(
         config,

@@ -1076,7 +1076,7 @@ impl EnsureUpContext<'_> {
                 "devcontainer.metadata".to_string(),
                 cella_features::generate_metadata_label(
                     &[],
-                    config,
+                    &self.config.resolved.raw_config,
                     None,
                     cella_features::MetadataOmit {
                         remote_env: self.config.metadata_options.omit_remote_env,
@@ -2079,11 +2079,14 @@ impl EnsureUpContext<'_> {
         build_no_cache: bool,
     ) -> Result<CreateResult, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
+        let subst_ctx = crate::subst_ctx(self.config.resolved);
 
         let (img_name, resolved_features, base_image_details) =
             crate::image::ensure_image(&crate::image::EnsureImageInput {
                 client: self.client,
                 config,
+                subst_ctx: &subst_ctx,
+                label_config: &self.config.resolved.raw_config,
                 workspace_root: &self.config.resolved.workspace_root,
                 config_name: self.config.resolved.name(),
                 config_path: &self.config.resolved.config_path,

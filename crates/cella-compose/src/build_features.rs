@@ -25,6 +25,12 @@ pub struct ComposeBuildResult {
 pub struct ComposeBuildConfig<'a> {
     /// Parsed devcontainer JSON.
     pub config: &'a serde_json::Value,
+    /// The context the build's base-image metadata label is substituted with
+    /// before its `remoteUser`/`containerUser` are read.
+    pub subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
+    /// The config recorded as the user entry of the `devcontainer.metadata`
+    /// label: the pre-substitution config.
+    pub label_config: &'a serde_json::Value,
     /// Path to devcontainer.json.
     pub config_path: &'a Path,
     /// Workspace root on the host.
@@ -89,6 +95,8 @@ pub async fn compose_build(
         client,
         &crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
             config,
+            subst_ctx: cfg.subst_ctx,
+            label_config: cfg.label_config,
             config_path,
             project: &project,
             // --omit-config-remote-env-from-metadata is an `up`-only flag; `cella
