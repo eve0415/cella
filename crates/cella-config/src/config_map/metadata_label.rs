@@ -48,13 +48,20 @@ fn substitute_entry(entry: &mut serde_json::Value, ctx: &SubstitutionContext) {
 /// Parse a `devcontainer.metadata` label after substituting its entries with
 /// [`substitute_metadata_label`].
 ///
-/// For readers whose result is not substituted again downstream.
+/// For readers whose result is not substituted again downstream. A
+/// single-object label is read as a one-entry array, as the official CLI does.
 #[must_use]
 pub fn parse_substituted_metadata(
     label: &str,
     ctx: &SubstitutionContext,
 ) -> (FeatureContainerConfig, ImageMetadataUserInfo) {
-    cella_features::parse_image_metadata(&substitute_metadata_label(label, ctx))
+    let substituted = substitute_metadata_label(label, ctx);
+    match serde_json::from_str::<serde_json::Value>(&substituted) {
+        Ok(entry @ serde_json::Value::Object(_)) => {
+            cella_features::parse_image_metadata(&serde_json::Value::Array(vec![entry]).to_string())
+        }
+        _ => cella_features::parse_image_metadata(&substituted),
+    }
 }
 
 /// Build the [`SubstitutionContext`] for a container when no devcontainer
@@ -174,6 +181,14 @@ mod tests {
             json!([{"mounts": [concat!("source=${localEnv", ":X},target=/x")]}]).to_string();
         let (config, _) = parse_substituted_metadata(&label, &ctx);
         assert_eq!(config.mounts, vec![format!("source={literal},target=/x")]);
+    }
+
+    /// A single-object label (not an array) still yields its users.
+    #[test]
+    fn parse_substituted_metadata_accepts_single_object_label() {
+        let label = json!({"remoteUser": concat!("${localEnv", ":X}")}).to_string();
+        let (_, user) = parse_substituted_metadata(&label, &ctx());
+        assert_eq!(user.remote_user.as_deref(), Some("hello"));
     }
 
     #[test]
