@@ -19,6 +19,13 @@ use crate::{
     extract_service_build_info,
 };
 
+/// Named build context covering the combined Dockerfile's directory.
+///
+/// Compose up to v5.6.0 grants bake `fs.read` only for the build context and `additional_contexts`, so a Dockerfile outside both is rejected with "additional privileges requested" (<https://github.com/docker/compose/issues/14285>).
+/// Listing the directory here makes compose grant it; the Dockerfile never references this context.
+/// Drop it once the minimum supported Compose grants the Dockerfile path itself.
+const COMBINED_DOCKERFILE_CONTEXT: &str = "cella_combined_dockerfile";
+
 /// Result of resolving features for a compose service.
 pub struct ComposeFeaturesBuild {
     /// Path to the combined Dockerfile (original + feature layers).
@@ -202,7 +209,7 @@ pub async fn resolve_compose_features(
     .await?;
 
     // 6. Generate combined Dockerfile and write to disk.
-    let combined_path = write_combined_dockerfile(
+    write_combined_dockerfile(
         &project.project_name,
         &original_dockerfile,
         &resolved.dockerfile,
@@ -215,7 +222,6 @@ pub async fn resolve_compose_features(
         config,
         &service_info,
         project,
-        combined_path,
         resolved,
         image_user,
         base_image_metadata,
@@ -310,23 +316,21 @@ fn write_combined_dockerfile(
     features_dockerfile: &str,
     stage_name: &str,
     image_user: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let combined = crate::generate_combined_dockerfile(
         original_dockerfile,
         features_dockerfile,
         stage_name,
         image_user,
     );
+    std::fs::create_dir_all(compose_dockerfile_dir(project_name))?;
     let combined_path = compose_dockerfile_path(project_name);
-    if let Some(parent) = combined_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     std::fs::write(&combined_path, &combined)?;
     info!(
         "Combined Dockerfile written to: {}",
         combined_path.display()
     );
-    Ok(combined_path)
+    Ok(())
 }
 
 /// Assemble the `ComposeFeaturesBuild` with build context overrides.
@@ -334,7 +338,6 @@ fn assemble_features_build(
     config: &serde_json::Value,
     service_info: &ServiceBuildInfo,
     project: &ComposeProject,
-    combined_dockerfile: PathBuf,
     resolved: ResolvedFeatures,
     image_user: String,
     base_image_metadata: Option<String>,
@@ -343,6 +346,10 @@ fn assemble_features_build(
     additional_contexts.insert(
         cella_features::FEATURE_CONTENT_SOURCE.to_string(),
         resolved.build_context.clone(),
+    );
+    additional_contexts.insert(
+        COMBINED_DOCKERFILE_CONTEXT.to_string(),
+        compose_dockerfile_dir(&project.project_name),
     );
 
     let (build_context, image_name_override) = match service_info {
@@ -360,7 +367,7 @@ fn assemble_features_build(
     };
 
     Ok(ComposeFeaturesBuild {
-        combined_dockerfile,
+        combined_dockerfile: compose_dockerfile_path(&project.project_name),
         build_target: FEATURES_TARGET_STAGE.to_string(),
         build_context,
         additional_contexts,
@@ -378,12 +385,19 @@ fn has_features(config: &serde_json::Value) -> bool {
         .is_some_and(|v| v.is_object() && !v.as_object().unwrap().is_empty())
 }
 
-/// Compute the path for the combined Dockerfile.
-fn compose_dockerfile_path(project_name: &str) -> PathBuf {
+/// Compute the directory that holds only the combined Dockerfile.
+///
+/// The build is granted read access to this directory, so nothing else may be written here.
+fn compose_dockerfile_dir(project_name: &str) -> PathBuf {
     cella_data_dir()
         .join("compose")
         .join(project_name)
-        .join("Dockerfile.combined")
+        .join("dockerfile")
+}
+
+/// Compute the path for the combined Dockerfile.
+fn compose_dockerfile_path(project_name: &str) -> PathBuf {
+    compose_dockerfile_dir(project_name).join("Dockerfile.combined")
 }
 
 /// Compute the path for the empty build context directory (image-only services).
@@ -621,5 +635,69 @@ RUN echo hi
         );
         assert_eq!(user, "root");
         assert_eq!(metadata.as_deref(), Some("{\"containerUser\":\"node\"}"));
+    }
+
+    // ---------------------------------------------------------------
+    // Bake reads only paths compose grants via `--allow fs.read=`: the build context and each local `additional_contexts` entry.
+    // The combined Dockerfile must sit under one of them or the build is rejected with "additional privileges requested".
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn combined_dockerfile_grant_covers_only_its_own_directory() {
+        let project = crate::ComposeProject {
+            project_name: "cella-test".to_string(),
+            compose_files: vec![],
+            override_file: std::path::PathBuf::from("/tmp/override.yaml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspace".to_string(),
+            config_dir: std::path::PathBuf::from("/workspace/.devcontainer"),
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            config_hash: "hash123".to_string(),
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        };
+        let service_info = crate::ServiceBuildInfo::Build {
+            context: std::path::PathBuf::from("/workspace"),
+            dockerfile: "Dockerfile".to_string(),
+            target: None,
+            args: std::collections::HashMap::new(),
+            image: None,
+        };
+        let resolved = cella_features::ResolvedFeatures {
+            features: Vec::new(),
+            dockerfile: String::new(),
+            build_context: std::path::PathBuf::from("/cache/builds/hash123"),
+            container_config: cella_features::FeatureContainerConfig::default(),
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let build = super::assemble_features_build(
+            &serde_json::json!({}),
+            &service_info,
+            &project,
+            resolved,
+            "root".to_string(),
+            None,
+        )
+        .unwrap();
+
+        let granted = &build.additional_contexts[super::COMBINED_DOCKERFILE_CONTEXT];
+        assert!(
+            build.combined_dockerfile.starts_with(granted),
+            "{} is outside its granted context {}",
+            build.combined_dockerfile.display(),
+            granted.display()
+        );
+        let override_file = crate::project::compose_override_path(&project.project_name);
+        assert!(
+            !override_file.starts_with(granted),
+            "granted context {} also exposes the override file",
+            granted.display()
+        );
     }
 }
