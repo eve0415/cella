@@ -114,6 +114,7 @@ mod tests {
         );
         let options = cella_config::devcontainer::resolve::ResolveOptions {
             default_container_workspace_folder: Some(layout.container_workspace_folder),
+            ..cella_config::devcontainer::resolve::ResolveOptions::default()
         };
         let resolved =
             cella_config::devcontainer::resolve::config_with_override(&app, None, None, &options)

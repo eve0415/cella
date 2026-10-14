@@ -124,6 +124,10 @@ impl ResolvedConfig {
 /// itself cannot provide.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
+    /// The `--id-label` labels identifying the container, when given; they
+    /// replace the default workspace/config labels as the `${devcontainerId}`
+    /// input.
+    pub id_labels: Option<BTreeMap<String, String>>,
     /// The in-container workspace folder cella mounts the workspace at, used
     /// as `${containerWorkspaceFolder}` when `workspaceFolder` is unset.
     pub default_container_workspace_folder: Option<String>,
@@ -152,6 +156,20 @@ pub fn devcontainer_id(workspace_root: &Path, config_path: &Path) -> String {
         lexical_absolute(config_path).to_string_lossy().to_string(),
     );
     spec_devcontainer_id(&labels)
+}
+
+/// The `devcontainerId` for a resolution: from the caller's `--id-label`
+/// labels when given (matching the official CLI, which hashes the provided id
+/// labels), else from the default workspace/config labels.
+fn resolved_devcontainer_id(
+    workspace_root: &Path,
+    config_path: &Path,
+    options: &ResolveOptions,
+) -> String {
+    options.id_labels.as_ref().map_or_else(
+        || devcontainer_id(workspace_root, config_path),
+        spec_devcontainer_id,
+    )
 }
 
 fn spec_devcontainer_id(labels: &BTreeMap<String, String>) -> String {
@@ -223,7 +241,8 @@ pub fn config(
 /// workspace-local layer merges are bypassed for single-document parity with
 /// the official CLI.
 ///
-/// `options` carries the caller's default container workspace folder.
+/// `options` carries the caller's `--id-label` labels and default container
+/// workspace folder.
 ///
 /// # Errors
 ///
@@ -289,7 +308,7 @@ pub fn config_with_override(
         }
     }
 
-    let devcontainer_id = devcontainer_id(workspace_root, &config_path);
+    let devcontainer_id = resolved_devcontainer_id(workspace_root, &config_path, options);
     let default_wf = default_container_workspace_folder(&config, options);
     let ctx = substitution_context(
         &config,
@@ -364,7 +383,7 @@ pub fn from_config_value(
     config_path: PathBuf,
     options: &ResolveOptions,
 ) -> ResolvedConfig {
-    let devcontainer_id = devcontainer_id(workspace_root, &config_path);
+    let devcontainer_id = resolved_devcontainer_id(workspace_root, &config_path, options);
     let default_wf = default_container_workspace_folder(&config, options);
     let canonical = serde_json::to_string(&config).unwrap_or_default();
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
@@ -850,7 +869,53 @@ mod tests {
     fn default_folder_options(folder: &str) -> ResolveOptions {
         ResolveOptions {
             default_container_workspace_folder: Some(folder.to_string()),
+            ..ResolveOptions::default()
         }
+    }
+
+    fn id_label_options() -> ResolveOptions {
+        let mut labels = BTreeMap::new();
+        labels.insert("my.label".to_string(), "one".to_string());
+        ResolveOptions {
+            id_labels: Some(labels),
+            ..ResolveOptions::default()
+        }
+    }
+
+    #[test]
+    fn id_labels_drive_devcontainer_id() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            concat!(
+                r#"{"image": "ubuntu", "containerEnv": {"ID": "${devcontainerId"#,
+                r#"}"}}"#
+            ),
+        );
+        let options = id_label_options();
+        let resolved = config_with_override(tmp.path(), None, None, &options).unwrap();
+        let expected = spec_devcontainer_id(options.id_labels.as_ref().unwrap());
+        assert_eq!(resolved.devcontainer_id, expected);
+        assert_eq!(resolved.config["containerEnv"]["ID"], expected.as_str());
+        assert_ne!(
+            resolved.devcontainer_id,
+            devcontainer_id(tmp.path(), &resolved.config_path)
+        );
+    }
+
+    #[test]
+    fn from_config_value_uses_id_labels_for_devcontainer_id() {
+        let options = id_label_options();
+        let resolved = from_config_value(
+            serde_json::json!({"image": "ubuntu"}),
+            Path::new("/cwd"),
+            PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            &options,
+        );
+        assert_eq!(
+            resolved.devcontainer_id,
+            spec_devcontainer_id(options.id_labels.as_ref().unwrap())
+        );
     }
 
     #[test]

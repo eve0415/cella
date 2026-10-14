@@ -117,6 +117,7 @@ impl ReadConfigurationArgs {
         let default_workspace =
             DefaultWorkspace::detect(&cwd, self.compat.mount_workspace_git_root);
         let resolve_options = resolve::ResolveOptions {
+            id_labels: super::id_label_map(&self.id_label),
             default_container_workspace_folder: Some(
                 default_workspace.container_workspace_folder.clone(),
             ),

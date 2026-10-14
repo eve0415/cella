@@ -382,6 +382,7 @@ impl RunUserCommandsArgs {
             .ok_or("could not determine workspace folder for --config")?;
         let default_workspace = DefaultWorkspace::detect(&ws, self.compat.mount_workspace_git_root);
         let options = resolve::ResolveOptions {
+            id_labels: super::id_label_map(&self.target.id_label),
             default_container_workspace_folder: Some(default_workspace.container_workspace_folder),
         };
         Ok(Some(resolve::config_with_override(

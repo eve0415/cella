@@ -811,6 +811,7 @@ fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
 fn resolved_from_container(
     container: &cella_backend::ContainerInfo,
     nominal_root: &Path,
+    options: &resolve::ResolveOptions,
 ) -> ResolvedConfig {
     let mut config = container
         .labels
@@ -823,21 +824,18 @@ fn resolved_from_container(
         PathBuf::from,
     );
 
-    resolve::from_config_value(
-        config,
-        nominal_root,
-        config_path,
-        &resolve::ResolveOptions::default(),
-    )
+    resolve::from_config_value(config, nominal_root, config_path, options)
 }
 
 /// The resolve-time inputs for an `up` invocation. With no workspace there is
 /// no workspace mount, so no default container workspace folder applies.
 fn up_resolve_options(
+    args: &UpArgs,
     no_workspace: bool,
     default_workspace: &DefaultWorkspace,
 ) -> resolve::ResolveOptions {
     resolve::ResolveOptions {
+        id_labels: crate::commands::id_label_map(&args.config_inputs.id_label),
         default_container_workspace_folder: (!no_workspace)
             .then(|| default_workspace.container_workspace_folder.clone()),
     }
@@ -852,7 +850,7 @@ impl UpContext {
         let no_workspace = no_workspace_requested(args);
         let default_workspace =
             DefaultWorkspace::detect(&cwd, args.mounts.mount_workspace_git_root);
-        let resolve_options = up_resolve_options(no_workspace, &default_workspace);
+        let resolve_options = up_resolve_options(args, no_workspace, &default_workspace);
 
         // 1. Resolve config and connect to the backend. The no-workspace path
         // (official `dcspec.ts:155`) does not discover a devcontainer.json from
@@ -1011,7 +1009,7 @@ impl UpContext {
             let Some(container) = found else {
                 return Err("No dev container config and no workspace found.".into());
             };
-            return Ok((resolved_from_container(&container, cwd), client));
+            return Ok((resolved_from_container(&container, cwd, options), client));
         }
 
         // Override-config and normal paths both go through `config_with_override`.
@@ -1051,6 +1049,7 @@ impl UpContext {
             default_container_workspace_folder: Some(
                 default_workspace.container_workspace_folder.clone(),
             ),
+            ..resolve::ResolveOptions::default()
         };
 
         let resolved = progress
@@ -2497,7 +2496,11 @@ mod tests {
             mounts: Vec::new(),
             backend: cella_backend::BackendKind::Docker,
         };
-        let resolved = resolved_from_container(&container, Path::new("/cwd"));
+        let resolved = resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        );
         assert_eq!(
             resolved
                 .config
