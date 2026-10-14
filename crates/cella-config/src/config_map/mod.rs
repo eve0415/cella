@@ -333,16 +333,21 @@ pub fn subst_ctx(
 /// Substitute devcontainer variables in feature-provided config fields.
 ///
 /// Per spec, feature metadata supports `${devcontainerId}` in `entrypoint`,
-/// `mounts`, and `customizations`.
+/// `mounts`, and `customizations`. `capAdd` and `securityOpt` are substituted
+/// too: the merged config also carries the base image's raw metadata entries,
+/// which reach runtime security from here. `containerEnv` is left as is.
 pub fn substitute_feature_config(
     mut config: FeatureContainerConfig,
     ctx: &crate::devcontainer::subst::SubstitutionContext,
 ) -> FeatureContainerConfig {
-    for mount in &mut config.mounts {
-        *mount = ctx.substitute_str(mount);
-    }
-    for ep in &mut config.entrypoints {
-        *ep = ctx.substitute_str(ep);
+    for value in config
+        .mounts
+        .iter_mut()
+        .chain(config.entrypoints.iter_mut())
+        .chain(config.cap_add.iter_mut())
+        .chain(config.security_opt.iter_mut())
+    {
+        *value = ctx.substitute_str(value);
     }
     ctx.substitute_value(&mut config.customizations);
     config
@@ -777,6 +782,46 @@ mod tests {
             substituted.customizations["vscode"]["settings"]["id"],
             "abc123"
         );
+    }
+
+    /// With a feature, a base image's raw `capAdd`/`securityOpt` reach runtime
+    /// security substituted.
+    #[test]
+    fn feature_merge_substitutes_base_image_cap_add_and_security_opt() {
+        let base = json!([{
+            "capAdd": [concat!("${localEnv", ":CAP}")],
+            "securityOpt": [concat!("seccomp=${localEnv", ":PROFILE}")],
+        }])
+        .to_string();
+        let feature = cella_features::ResolvedFeature {
+            id: "feat".to_string(),
+            original_ref: "feat".to_string(),
+            metadata: cella_features::FeatureMetadata::default(),
+            user_options: HashMap::new(),
+            artifact_dir: std::path::PathBuf::new(),
+            has_install_script: false,
+            oci: None,
+        };
+        let merged = cella_features::merge_with_devcontainer(
+            &cella_features::merge_features(
+                &[feature],
+                Some(cella_features::parse_image_metadata(&base).0),
+            ),
+            &json!({"image": "base"}),
+        );
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/ws"),
+            None,
+            "id",
+            HashMap::from([
+                ("CAP".to_string(), "SYS_PTRACE".to_string()),
+                ("PROFILE".to_string(), "p.json".to_string()),
+            ]),
+        );
+        let substituted = substitute_feature_config(merged, &ctx);
+        let security = merge_security_config(&json!({}), Some(&substituted));
+        assert_eq!(security.cap_add, vec!["SYS_PTRACE"]);
+        assert_eq!(security.security_opt, vec!["seccomp=p.json"]);
     }
 
     #[test]

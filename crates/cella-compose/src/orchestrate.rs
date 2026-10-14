@@ -517,11 +517,17 @@ async fn resolve_user_and_env(
             &subst_ctx,
         )
         .await;
-    // Runtime security props: prefer the resolved-features config; fall back to
-    // the base image's metadata when no features are configured (mirrors the
+    // Runtime security props: prefer the (substituted) resolved-features
+    // config; fall back to the base image's metadata, parsed from an
+    // already-substituted label, when no features are configured (mirrors the
     // single-container effective_feature_config fallback in up.rs).
     let effective_feature_config = features_build
-        .map(|fb| fb.resolved_features.container_config.clone())
+        .map(|fb| {
+            cella_config::config_map::substitute_feature_config(
+                fb.resolved_features.container_config.clone(),
+                &subst_ctx,
+            )
+        })
         .or(base_image_security);
     let security = cella_config::config_map::merge_security_config(
         cfg.config,
@@ -530,18 +536,10 @@ async fn resolve_user_and_env(
     // Feature entrypoints (install order), `${devcontainerId}`-substituted, from
     // the same merged config the security props use. Empty when no feature (or
     // base-image-metadata feature) declares an entrypoint, in which case the
-    // wrapped entrypoint is skipped unless `overrideCommand` is set. The
-    // base-image fallback was parsed from an already-substituted label.
+    // wrapped entrypoint is skipped unless `overrideCommand` is set.
     let feature_entrypoints = effective_feature_config
         .as_ref()
-        .map(|fc| {
-            if features_build.is_some() {
-                cella_config::config_map::substitute_feature_config(fc.clone(), &subst_ctx)
-                    .entrypoints
-            } else {
-                fc.entrypoints.clone()
-            }
-        })
+        .map(|fc| fc.entrypoints.clone())
         .unwrap_or_default();
     // Merged `devcontainer.metadata` label: the features path reuses the label
     // computed during feature resolution; otherwise merge the base image's
