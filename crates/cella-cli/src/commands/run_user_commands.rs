@@ -431,10 +431,7 @@ impl RunUserCommandsArgs {
         secrets: &[String],
     ) -> Vec<String> {
         let LifecycleConfigSources {
-            config,
-            resolved,
-            metadata,
-            label_ctx,
+            config, metadata, ..
         } = *sources;
         // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
         // --config wins (it's in pickUpdateableConfigProperties, appended last in
@@ -450,17 +447,7 @@ impl RunUserCommandsArgs {
         let probed =
             probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
 
-        // Order the vec for merge_env's later-wins insert: probed first
-        // (provided by merge_env), then CLI --remote-env, then metadata, then
-        // the on-disk config `remoteEnv` last so it wins. Both `remoteEnv`
-        // portions are resolved AFTER the probe so `${containerEnv:VAR}`
-        // resolves against the live container env.
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(
-            metadata,
-            &with_probed_env(label_ctx, probed.as_ref()),
-        ));
-        remote_env.extend(resolve_config_remote_env(config, resolved, probed.as_ref()));
+        let remote_env = lifecycle_remote_env(&self.remote_env, sources, probed.as_ref());
 
         let mut lifecycle_env = probed.as_ref().map_or_else(
             || remote_env.clone(),
@@ -507,8 +494,28 @@ pub(super) struct LifecycleConfigSources<'a> {
     pub(super) label_ctx: &'a SubstitutionContext,
 }
 
+/// The `remoteEnv` layered over the probed env, ordered for `merge_env`'s later-wins insert: `--remote-env`, then the metadata label's, then the on-disk config's last so it wins.
+/// Both `remoteEnv` portions are resolved after the probe so `${containerEnv:VAR}` resolves against the live container env.
+pub(super) fn lifecycle_remote_env(
+    cli_remote_env: &[String],
+    sources: &LifecycleConfigSources<'_>,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let mut remote_env = cli_remote_env.to_vec();
+    remote_env.extend(orchestrator::metadata_remote_env(
+        sources.metadata,
+        &with_probed_env(sources.label_ctx, probed),
+    ));
+    remote_env.extend(resolve_config_remote_env(
+        sources.config,
+        sources.resolved,
+        probed,
+    ));
+    remote_env
+}
+
 /// `ctx` with the probed container env attached, when the probe succeeded.
-pub(super) fn with_probed_env(
+fn with_probed_env(
     ctx: &SubstitutionContext,
     probed: Option<&std::collections::HashMap<String, String>>,
 ) -> SubstitutionContext {
@@ -523,7 +530,7 @@ pub(super) fn with_probed_env(
 /// (pre-substitution) snapshot and a probe are both available. Falls back to
 /// the already-substituted config value otherwise (byte-identical to the
 /// prior behavior).
-pub(super) fn resolve_config_remote_env(
+fn resolve_config_remote_env(
     config: &Value,
     resolved: Option<&resolve::ResolvedConfig>,
     probed: Option<&std::collections::HashMap<String, String>>,
@@ -676,6 +683,34 @@ mod tests {
             resolve_config_remote_env(&resolved.config, Some(&resolved), None),
             map_env_object(resolved.config.get("remoteEnv"))
         );
+    }
+
+    /// The `--config` `remoteEnv` is resolved against the probed container env.
+    #[test]
+    fn lifecycle_remote_env_resolves_config_container_env_after_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            concat!(
+                r#"{"image": "ubuntu", "remoteEnv": {"PATH": "${containerEnv"#,
+                r#":PATH}:/x"}}"#
+            ),
+        )
+        .unwrap();
+        let resolved = resolve::config(tmp.path(), None).unwrap();
+        let label_ctx = cella_config::config_map::subst_ctx(&resolved);
+        let sources = LifecycleConfigSources {
+            config: &resolved.config,
+            resolved: Some(&resolved),
+            metadata: None,
+            label_ctx: &label_ctx,
+        };
+        let probed =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let env = lifecycle_remote_env(&[], &sources, Some(&probed));
+        assert_eq!(env, vec!["PATH=/usr/bin:/x".to_string()]);
     }
 
     // ── devcontainer-CLI flag parity ───────────────────────────────
