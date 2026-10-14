@@ -8,6 +8,7 @@ use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve;
 use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
 
+use super::default_workspace::DefaultWorkspace;
 use crate::backend::BackendArgs;
 
 /// Read and output the resolved devcontainer configuration.
@@ -68,7 +69,7 @@ impl ReadConfigurationArgs {
         // When targeting a running container, capture its `devcontainer.metadata` label so
         // `mergedConfiguration` can be built from the already-baked label (no OCI access),
         // matching the official CLI's behaviour.
-        let (mut resolved, cwd, container_metadata_label) = if has_container_target {
+        let (cwd, container_metadata_label) = if has_container_target {
             let client = self.backend.resolve_client().await?;
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
@@ -99,30 +100,33 @@ impl ReadConfigurationArgs {
                 .labels
                 .get("dev.cella.workspace_path")
                 .ok_or("container has no dev.cella.workspace_path label")?;
-            let ws = PathBuf::from(workspace_path);
-            let res = resolve::config(&ws, config_path)?;
-            (res, ws, Some((metadata_label, has_id_labels)))
+            (
+                PathBuf::from(workspace_path),
+                Some((metadata_label, has_id_labels)),
+            )
         } else {
-            let ws = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let res = resolve::config(&ws, config_path)?;
-            (res, ws, None)
+            (
+                super::resolve_workspace_folder(self.workspace_folder.as_deref())?,
+                None,
+            )
         };
+
+        // Report the default single-container mount `up` would create: it
+        // bind-mounts the git-root folder unless `--mount-workspace-git-root`
+        // is false. Compose configs ignore this (no bind mount).
+        let default_workspace =
+            DefaultWorkspace::detect(&cwd, self.compat.mount_workspace_git_root);
+        let mut resolved = resolve::config(&cwd, config_path)?;
 
         if let Some(ref additional) = self.additional_features {
             super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
-        // Report the default single-container mount `up` would create: it
-        // bind-mounts the git-root folder (mountWorkspaceGitRoot defaults to
-        // true). read-configuration exposes no flag to override this, so the
-        // default is reported. Compose configs ignore this (no bind mount).
-        let host_mount_folder =
-            cella_git::find_git_root_folder(&cwd, self.compat.mount_workspace_git_root);
         let mut output = build_base_output(
             &resolved.config,
             &resolved.config_path,
             &cwd,
-            &host_mount_folder,
+            &default_workspace.host_mount_folder,
         );
 
         // `featuresConfiguration` is emitted when explicitly requested, or when
@@ -205,7 +209,12 @@ fn build_base_output(
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map_or_else(
-                || super::up::compute_default_workspace_folder(workspace_root, host_mount_folder),
+                || {
+                    super::default_workspace::compute_default_workspace_folder(
+                        workspace_root,
+                        host_mount_folder,
+                    )
+                },
                 String::from,
             );
 

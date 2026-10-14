@@ -6,6 +6,7 @@ mod compose_up;
 mod config;
 mod credential;
 mod daemon;
+mod default_workspace;
 mod doctor;
 mod down;
 mod exec;

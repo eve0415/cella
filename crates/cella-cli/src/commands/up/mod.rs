@@ -6,6 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
+use super::default_workspace::DefaultWorkspace;
 use super::exec::spec_identity_labels;
 use super::{
     BuildKitMode, ComposePullPolicy, GpuAvailability, ImagePullPolicy, LogFormat, LogLevel,
@@ -544,24 +545,6 @@ pub fn parse_secrets_file(
     Ok(secrets)
 }
 
-pub fn compute_default_workspace_folder(workspace_root: &Path, host_mount_folder: &Path) -> String {
-    let mount_basename = host_mount_folder.file_name().map_or_else(
-        || "workspace".to_string(),
-        |n| n.to_string_lossy().to_string(),
-    );
-    let container_mount_folder = format!("/workspaces/{mount_basename}");
-    if host_mount_folder == workspace_root {
-        return container_mount_folder;
-    }
-    if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
-        let rel_posix = rel.to_string_lossy().replace('\\', "/");
-        if !rel_posix.is_empty() {
-            return format!("{container_mount_folder}/{rel_posix}");
-        }
-    }
-    container_mount_folder
-}
-
 use cella_orchestrator::NetworkRulePolicy;
 
 /// Resolved mount configuration for an `up` invocation.
@@ -850,6 +833,8 @@ impl UpContext {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
         let no_workspace = no_workspace_requested(args);
+        let default_workspace =
+            DefaultWorkspace::detect(&cwd, args.mounts.mount_workspace_git_root);
 
         // 1. Resolve config and connect to the backend. The no-workspace path
         // (official `dcspec.ts:155`) does not discover a devcontainer.json from
@@ -891,12 +876,7 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let host_mount_folder = cella_git::find_git_root_folder(
-            &resolved.workspace_root,
-            args.mounts.mount_workspace_git_root,
-        );
-        let default_workspace_folder =
-            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
+        let default_workspace_folder = default_workspace.container_workspace_folder;
 
         let lifecycle_secrets = resolve_lifecycle_secrets(args)?;
 
@@ -1046,6 +1026,7 @@ impl UpContext {
         let cwd = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
+        let default_workspace = DefaultWorkspace::detect(&cwd, true);
 
         let resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
@@ -1069,9 +1050,7 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let host_mount_folder = cella_git::find_git_root_folder(&resolved.workspace_root, true);
-        let default_workspace_folder =
-            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
+        let default_workspace_folder = default_workspace.container_workspace_folder;
 
         Ok(Self {
             resolved,
