@@ -408,6 +408,47 @@ mod tests {
         );
     }
 
+    #[derive(clap::Parser)]
+    struct SetUpHarness {
+        #[command(flatten)]
+        args: SetUpArgs,
+    }
+
+    /// A host value that itself looks like a variable stays literal in set-up's `mergedConfiguration`: the label is substituted exactly once.
+    #[test]
+    fn merged_configuration_substitutes_the_label_once() {
+        use clap::Parser;
+        let SetUpHarness { args } = SetUpHarness::try_parse_from([
+            "set-up",
+            "--container-id",
+            "abc",
+            "--include-merged-configuration",
+        ])
+        .unwrap();
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let ctx = SubstitutionContext::new(
+            Path::new("/ws"),
+            Some("/workspaces/ws"),
+            "the-id",
+            std::collections::HashMap::from([("X".to_string(), literal.to_string())]),
+        );
+        let raw =
+            json!([{"id": "feat", "postCreateCommand": concat!("${localEnv", ":X}")}]).to_string();
+        let config = json!({});
+        let (metadata, _) = super::super::run_user_commands::substitute_label_metadata(
+            Some(&raw),
+            &ctx,
+            &config,
+            true,
+        );
+        let envelope: Value =
+            serde_json::from_str(&args.success_envelope(&config, metadata.as_deref())).unwrap();
+        assert_eq!(
+            envelope["mergedConfiguration"]["postCreateCommands"],
+            json!([literal])
+        );
+    }
+
     #[test]
     fn skip_post_create_parses() {
         use clap::Parser;
