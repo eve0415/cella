@@ -462,9 +462,9 @@ pub fn from_config_value(
         devcontainer_id,
         warnings: Vec::new(),
         typed,
-        // The caller substituted `config` before handing it over, so no raw
-        // snapshot is available for a second-pass containerEnv resolution.
-        raw_remote_env: None,
+        // Taken from the caller's raw snapshot so the post-probe pass can
+        // resolve `${containerEnv:VAR}`.
+        raw_remote_env: raw_config.get("remoteEnv").cloned(),
         raw_config,
         container_identity,
         default_container_workspace_folder: default_wf,

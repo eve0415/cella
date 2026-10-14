@@ -2610,6 +2610,41 @@ mod tests {
         );
     }
 
+    /// The label's raw `remoteEnv` survives for the post-probe pass, so
+    /// `${containerEnv:PATH}` resolves against the live container.
+    #[test]
+    fn resolved_from_container_resolves_container_env_after_probe() {
+        let labels = std::collections::HashMap::from([(
+            "devcontainer.metadata".to_string(),
+            serde_json::json!([{"remoteEnv": {"PATH": concat!("${containerEnv", ":PATH}:/x")}}])
+                .to_string(),
+        )]);
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        let resolved = resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        );
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/usr/bin".to_string())].into();
+        let env = build_lifecycle_env(&resolved, &[], &[], Some(&probed));
+        assert!(env.contains(&"PATH=/usr/bin:/x".to_string()), "{env:?}");
+    }
+
     #[test]
     fn resolved_from_container_skips_mount_and_reads_workspace_folder() {
         let labels = [
