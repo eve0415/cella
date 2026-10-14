@@ -845,13 +845,19 @@ fn resolved_from_container(
         PathBuf::from,
     );
 
+    // Carry the container's workspace folder so later substitution (the
+    // lifecycle context) agrees with the config.
+    let options = resolve::ResolveOptions {
+        default_container_workspace_folder: container_workspace_folder,
+        ..options.clone()
+    };
     resolve::from_config_value(
         config,
         raw_config,
         nominal_root,
         config_path,
         resolve::ContainerIdentity::from_labels(&container.labels),
-        options,
+        &options,
     )
 }
 
@@ -2550,6 +2556,58 @@ mod tests {
             "/home/me/app"
         );
         assert_eq!(resolved.workspace_root, Path::new("/cwd"));
+    }
+
+    /// Without `workspaceFolder` in the label, the container's recorded
+    /// workspace folder drives `${containerWorkspaceFolder}` for both the config
+    /// and the lifecycle context.
+    #[test]
+    fn resolved_from_container_uses_recorded_workspace_folder() {
+        let wf = concat!("${containerWorkspaceFolder", "}");
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{"postCreateCommand": wf}]).to_string(),
+            ),
+            (
+                "devcontainer.local_folder".to_string(),
+                "/home/me/repo/packages/app".to_string(),
+            ),
+            (
+                "dev.cella.workspace_folder".to_string(),
+                "/workspaces/repo/packages/app".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        let resolved = resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        );
+        assert_eq!(
+            resolved.config["postCreateCommand"],
+            "/workspaces/repo/packages/app"
+        );
+        assert_eq!(
+            cella_config::config_map::subst_ctx(&resolved).substitute_str(wf),
+            "/workspaces/repo/packages/app"
+        );
     }
 
     #[test]
