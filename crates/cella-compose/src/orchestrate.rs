@@ -2255,29 +2255,7 @@ mod tests {
             container_identity: None,
             default_container_workspace_folder: None,
         };
-        let cfg = ComposeUpConfig {
-            resolved: &resolved,
-            config: &config,
-            config_path: &config_path,
-            workspace_root: &workspace_root,
-            container_name: "test-container",
-            remote_env: &[],
-            cli_remote_env: &[],
-            resolution: ContainerResolution::default(),
-            skip_checksum: false,
-            profiles: vec![],
-            env_files: vec![],
-            pull_policy: None,
-            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
-            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
-            lifecycle_gate: cella_backend::LifecycleGate::default(),
-            build_tuning: ComposeBuildTuning::default(),
-            gpu_availability: cella_backend::GpuAvailability::default(),
-            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
-            omit_remote_env_from_metadata: false,
-            lockfile_policy: cella_features::LockfilePolicy::default(),
-            dotfiles: DotfilesConfig::default(),
-        };
+        let cfg = compose_up_config(&resolved, &config, &config_path, &workspace_root);
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
             compose_files: vec![],
@@ -2326,29 +2304,7 @@ mod tests {
             container_identity: None,
             default_container_workspace_folder: None,
         };
-        let cfg = ComposeUpConfig {
-            resolved: &resolved,
-            config: &config,
-            config_path: &config_path,
-            workspace_root: workspace_dir.path(),
-            container_name: "test-container",
-            remote_env: &[],
-            cli_remote_env: &[],
-            resolution: ContainerResolution::default(),
-            skip_checksum: false,
-            profiles: vec![],
-            env_files: vec![],
-            pull_policy: None,
-            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
-            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
-            lifecycle_gate: cella_backend::LifecycleGate::default(),
-            build_tuning: ComposeBuildTuning::default(),
-            gpu_availability: cella_backend::GpuAvailability::default(),
-            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
-            omit_remote_env_from_metadata: false,
-            lockfile_policy: cella_features::LockfilePolicy::default(),
-            dotfiles: DotfilesConfig::default(),
-        };
+        let cfg = compose_up_config(&resolved, &config, &config_path, workspace_dir.path());
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),
             compose_files: vec![config_dir.path().join("docker-compose.yml")],
@@ -2395,6 +2351,38 @@ mod tests {
         assert!(labels.contains_key("dev.cella.docker_runtime"));
     }
 
+    /// A `ComposeUpConfig` with default flags for the given config and paths.
+    fn compose_up_config<'a>(
+        resolved: &'a ResolvedConfig,
+        config: &'a serde_json::Value,
+        config_path: &'a Path,
+        workspace_root: &'a Path,
+    ) -> ComposeUpConfig<'a> {
+        ComposeUpConfig {
+            resolved,
+            config,
+            config_path,
+            workspace_root,
+            container_name: "test-container",
+            remote_env: &[],
+            cli_remote_env: &[],
+            resolution: ContainerResolution::default(),
+            skip_checksum: false,
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
+            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::default(),
+            dotfiles: DotfilesConfig::default(),
+        }
+    }
+
     fn resolved_with(config: serde_json::Value, raw_config: serde_json::Value) -> ResolvedConfig {
         ResolvedConfig {
             config,
@@ -2434,29 +2422,7 @@ mod tests {
         let resolved = resolved_with(config.clone(), raw.clone());
         let config_path = PathBuf::from("/tmp/devcontainer.json");
         let workspace_root = PathBuf::from("/tmp/workspace");
-        let cfg = ComposeUpConfig {
-            resolved: &resolved,
-            config: &config,
-            config_path: &config_path,
-            workspace_root: &workspace_root,
-            container_name: "test-container",
-            remote_env: &[],
-            cli_remote_env: &[],
-            resolution: ContainerResolution::default(),
-            skip_checksum: false,
-            profiles: vec![],
-            env_files: vec![],
-            pull_policy: None,
-            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
-            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
-            lifecycle_gate: cella_backend::LifecycleGate::default(),
-            build_tuning: ComposeBuildTuning::default(),
-            gpu_availability: cella_backend::GpuAvailability::default(),
-            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
-            omit_remote_env_from_metadata: false,
-            lockfile_policy: cella_features::LockfilePolicy::default(),
-            dotfiles: DotfilesConfig::default(),
-        };
+        let cfg = compose_up_config(&resolved, &config, &config_path, &workspace_root);
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
             compose_files: vec![],
