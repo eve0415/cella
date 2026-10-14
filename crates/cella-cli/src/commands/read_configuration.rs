@@ -163,7 +163,11 @@ impl ReadConfigurationArgs {
                         &cella_config::config_map::subst_ctx(&resolved),
                     )
                 } else {
-                    build_merged_output(&resolved.config, resolved_features.as_ref())
+                    build_substituted_merged_output(
+                        &resolved.config,
+                        resolved_features.as_ref(),
+                        &cella_config::config_map::subst_ctx(&resolved),
+                    )
                 };
         }
 
@@ -423,6 +427,71 @@ fn pick_properties(config: &serde_json::Value, keys: &[&str]) -> serde_json::Val
         }
     }
     serde_json::Value::Object(out)
+}
+
+/// [`build_merged_output`] with each feature's contributions (mounts,
+/// entrypoint, containerEnv, lifecycle, customizations) substituted with
+/// `ctx`, the context the `configuration` section was substituted with.
+///
+/// Output-only: the merged container config is rebuilt from the substituted
+/// feature metadata and the already-substituted `config`, so neither is
+/// substituted twice. `rf` itself (shared with `featuresConfiguration`) is
+/// left raw.
+fn build_substituted_merged_output(
+    config: &serde_json::Value,
+    rf: Option<&ResolvedFeatures>,
+    ctx: &SubstitutionContext,
+) -> serde_json::Value {
+    let Some(rf) = rf else {
+        return build_merged_output(config, None);
+    };
+    let mut features = rf.features.clone();
+    for feature in &mut features {
+        substitute_feature_metadata(&mut feature.metadata, ctx);
+    }
+    let container_config = cella_features::merge_with_devcontainer(
+        &cella_features::merge_features(&features, None),
+        config,
+    );
+    // Only `features` and `container_config` feed the merged output.
+    let substituted = ResolvedFeatures {
+        features,
+        dockerfile: String::new(),
+        build_context: PathBuf::new(),
+        container_config,
+        metadata_label: String::new(),
+        lockfile: None,
+    };
+    build_merged_output(config, Some(&substituted))
+}
+
+/// Substitute the `mergedConfiguration`-visible fields of one feature's metadata.
+fn substitute_feature_metadata(
+    meta: &mut cella_features::types::FeatureMetadata,
+    ctx: &SubstitutionContext,
+) {
+    for mount in &mut meta.mounts {
+        *mount = ctx.substitute_str(mount);
+    }
+    if let Some(ep) = meta.entrypoint.as_mut() {
+        *ep = ctx.substitute_str(ep);
+    }
+    for value in meta.container_env.values_mut() {
+        *value = ctx.substitute_str(value);
+    }
+    for command in [
+        &mut meta.on_create_command,
+        &mut meta.update_content_command,
+        &mut meta.post_create_command,
+        &mut meta.post_start_command,
+        &mut meta.post_attach_command,
+        &mut meta.customizations,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ctx.substitute_value(command);
+    }
 }
 
 /// Assemble the official `mergeConfiguration` output shape.
@@ -1705,6 +1774,68 @@ mod tests {
     // -------------------------------------------------------------------------
     // build_merged_from_label — container-path mergedConfiguration (no OCI)
     // -------------------------------------------------------------------------
+
+    /// Feature contributions in `mergedConfiguration` are substituted with the
+    /// `configuration` context; the already-substituted config is not.
+    #[test]
+    fn merged_output_substitutes_feature_contributions() {
+        let id = concat!("${devcontainerId", "}");
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let feature = cella_features::types::ResolvedFeature {
+            id: "feat-a".to_string(),
+            original_ref: "feat-a".to_string(),
+            metadata: cella_features::types::FeatureMetadata {
+                id: "feat-a".to_string(),
+                mounts: vec![format!("source=vol-{id},target=/data,type=volume")],
+                entrypoint: Some(format!("/run/{id}.sh")),
+                container_env: HashMap::from([("ID".to_string(), id.to_string())]),
+                post_create_command: Some(json!(format!("echo {id}"))),
+                customizations: Some(json!({"vscode": {"settings": {"id": id}}})),
+                ..Default::default()
+            },
+            user_options: HashMap::new(),
+            artifact_dir: PathBuf::from("/tmp"),
+            has_install_script: false,
+            oci: None,
+        };
+        let config = json!({"image": "ubuntu", "postCreateCommand": literal});
+        let features = vec![feature];
+        let container_config = cella_features::merge_with_devcontainer(
+            &cella_features::merge_features(&features, None),
+            &config,
+        );
+        let rf = ResolvedFeatures {
+            features,
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let ctx = SubstitutionContext::new(
+            Path::new("/projects/app"),
+            Some("/workspaces/app"),
+            "the-id",
+            HashMap::new(),
+        );
+        let out = build_substituted_merged_output(&config, Some(&rf), &ctx);
+        assert_eq!(out["postCreateCommands"], json!(["echo the-id", literal]));
+        assert_eq!(out["entrypoints"], json!(["/run/the-id.sh"]));
+        assert_eq!(out["containerEnv"]["ID"], "the-id");
+        assert_eq!(
+            out["mounts"],
+            json!(["source=vol-the-id,target=/data,type=volume"])
+        );
+        assert_eq!(
+            out["customizations"]["vscode"][0]["settings"]["id"],
+            "the-id"
+        );
+        // The shared resolution stays raw for `featuresConfiguration`.
+        assert_eq!(
+            rf.features[0].metadata.entrypoint.as_deref(),
+            Some(format!("/run/{id}.sh").as_str())
+        );
+    }
 
     /// A context that expands nothing these tests use.
     fn no_subst() -> SubstitutionContext {
