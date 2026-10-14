@@ -1635,14 +1635,14 @@ impl EnsureUpContext<'_> {
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
         agent_arch: &str,
+        subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
     ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
         let image_env = base_image_details.env;
-        let subst_ctx = crate::subst_ctx(self.config.resolved);
         let (image_meta_config, image_meta_user) = base_image_details
             .metadata
             .as_deref()
-            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx))
+            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, subst_ctx))
             .unzip();
         let remote_user = crate::container_setup::resolve_remote_user(
             config,
@@ -1677,7 +1677,7 @@ impl EnsureUpContext<'_> {
         }
 
         let substituted_feature_config = resolved_features.map(|r| {
-            crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
+            crate::config_map::substitute_feature_config(r.container_config.clone(), subst_ctx)
         });
         let effective_feature_config = substituted_feature_config
             .as_ref()
@@ -2106,6 +2106,7 @@ impl EnsureUpContext<'_> {
             base_image_details,
             resolved_features.as_ref(),
             &agent_arch,
+            &subst_ctx,
         )?;
 
         let ssh_agent_proxy = self.resolve_ssh_agent_proxy(&mut env_fwd).await;
