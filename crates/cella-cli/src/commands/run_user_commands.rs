@@ -523,7 +523,7 @@ pub(super) fn with_probed_env(
 /// (pre-substitution) snapshot and a probe are both available. Falls back to
 /// the already-substituted config value otherwise (byte-identical to the
 /// prior behavior).
-fn resolve_config_remote_env(
+pub(super) fn resolve_config_remote_env(
     config: &Value,
     resolved: Option<&resolve::ResolvedConfig>,
     probed: Option<&std::collections::HashMap<String, String>>,

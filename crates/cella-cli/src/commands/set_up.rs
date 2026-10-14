@@ -33,8 +33,10 @@ use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
-use super::run_user_commands::{AttachArgs, CompatArgs, LifecycleConfigSources, with_probed_env};
-use super::up::{map_env_object, parse_secrets_file};
+use super::run_user_commands::{
+    AttachArgs, CompatArgs, LifecycleConfigSources, resolve_config_remote_env, with_probed_env,
+};
+use super::up::parse_secrets_file;
 use crate::backend::BackendArgs;
 
 /// Gating flags for `set-up`. Subset of `run-user-commands` gating: official
@@ -322,10 +324,7 @@ impl SetUpArgs {
         secrets: &[String],
     ) -> Vec<String> {
         let LifecycleConfigSources {
-            config,
-            metadata,
-            label_ctx,
-            ..
+            config, metadata, ..
         } = *sources;
         let probe_type = config
             .get("userEnvProbe")
@@ -338,14 +337,7 @@ impl SetUpArgs {
         let probed =
             probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
 
-        // The metadata `remoteEnv` is resolved after the probe so
-        // `${containerEnv:VAR}` resolves against the live container env.
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(
-            metadata,
-            &with_probed_env(label_ctx, probed.as_ref()),
-        ));
-        remote_env.extend(map_env_object(config.get("remoteEnv")));
+        let remote_env = lifecycle_remote_env(&self.remote_env, sources, probed.as_ref());
 
         let mut lifecycle_env = probed.as_ref().map_or_else(
             || remote_env.clone(),
@@ -354,6 +346,28 @@ impl SetUpArgs {
         lifecycle_env.extend_from_slice(secrets);
         lifecycle_env
     }
+}
+
+/// The `remoteEnv` layered over the probed env: `--remote-env`, then the
+/// metadata label's, then the config's (later wins). Both `remoteEnv` portions
+/// are resolved after the probe so `${containerEnv:VAR}` resolves against the
+/// live container env.
+fn lifecycle_remote_env(
+    cli_remote_env: &[String],
+    sources: &LifecycleConfigSources<'_>,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let mut remote_env = cli_remote_env.to_vec();
+    remote_env.extend(orchestrator::metadata_remote_env(
+        sources.metadata,
+        &with_probed_env(sources.label_ctx, probed),
+    ));
+    remote_env.extend(resolve_config_remote_env(
+        sources.config,
+        sources.resolved,
+        probed,
+    ));
+    remote_env
 }
 
 /// Warn early if the label is present but not valid JSON, regardless of which
@@ -410,6 +424,34 @@ mod tests {
     use clap::CommandFactory;
     use serde_json::json;
     use std::collections::HashSet;
+
+    /// The `--config` `remoteEnv` is resolved against the probed container env.
+    #[test]
+    fn config_remote_env_resolves_container_env_after_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            concat!(
+                r#"{"image": "ubuntu", "remoteEnv": {"PATH": "${containerEnv"#,
+                r#":PATH}:/x"}}"#
+            ),
+        )
+        .unwrap();
+        let resolved = cella_config::devcontainer::resolve::config(tmp.path(), None).unwrap();
+        let label_ctx = cella_config::config_map::subst_ctx(&resolved);
+        let sources = LifecycleConfigSources {
+            config: &resolved.config,
+            resolved: Some(&resolved),
+            metadata: None,
+            label_ctx: &label_ctx,
+        };
+        let probed =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let env = lifecycle_remote_env(&[], &sources, Some(&probed));
+        assert_eq!(env, vec!["PATH=/usr/bin:/x".to_string()]);
+    }
 
     // Official setUpOptions flags (devContainersSpecCLI.ts) — the complete
     // list. `set-up` has no workspace/id-label targeting and no prebuild or
