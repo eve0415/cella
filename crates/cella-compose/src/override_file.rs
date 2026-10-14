@@ -658,11 +658,19 @@ mod tests {
             .insert("devcontainer.metadata".to_string(), raw.to_string());
         config.extra_env.push(format!("TOKEN={raw}"));
         let yaml = generate_override_yaml(&config);
-        assert!(
-            yaml.contains(&format!("devcontainer.metadata: \"${raw}\"")),
-            "{yaml}"
+
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("generated override must be valid YAML");
+        let service = &parsed["services"]["app"];
+        let escaped = format!("${raw}");
+        assert_eq!(
+            service["labels"]["devcontainer.metadata"].as_str(),
+            Some(escaped.as_str())
         );
-        assert!(yaml.contains(&format!("- \"TOKEN=${raw}\"")), "{yaml}");
+        assert_eq!(
+            service["environment"][0].as_str(),
+            Some(format!("TOKEN={escaped}").as_str())
+        );
     }
 
     #[test]
