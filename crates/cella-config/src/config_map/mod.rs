@@ -308,11 +308,18 @@ fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverr
 ///
 /// `${containerWorkspaceFolder}` is the config's `workspaceFolder`, else the
 /// default the config was resolved with, matching the resolve-time context.
+/// A config read from a container uses that container's local folder for
+/// `${localWorkspaceFolder}`.
 pub fn subst_ctx(
     resolved: &crate::devcontainer::resolve::ResolvedConfig,
 ) -> crate::devcontainer::subst::SubstitutionContext {
     crate::devcontainer::subst::SubstitutionContext::new(
-        &resolved.workspace_root,
+        resolved
+            .container_identity
+            .as_ref()
+            .map_or(resolved.workspace_root.as_path(), |identity| {
+                identity.local_folder.as_path()
+            }),
         resolved
             .config
             .get("workspaceFolder")

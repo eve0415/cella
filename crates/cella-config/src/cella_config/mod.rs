@@ -145,6 +145,7 @@ mod tests {
             typed,
             raw_remote_env: None,
             raw_config: Value::Null,
+            container_identity: None,
             default_container_workspace_folder: None,
         }
     }

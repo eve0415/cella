@@ -647,6 +647,7 @@ mod tests {
             typed: None,
             raw_remote_env: raw,
             raw_config: json!({}),
+            container_identity: None,
             default_container_workspace_folder: None,
         }
     }

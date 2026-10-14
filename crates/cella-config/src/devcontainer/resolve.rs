@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cella_backend::names::lexical_absolute;
+use cella_backend::names::{CONFIG_FILE_LABEL, LOCAL_FOLDER_LABEL, lexical_absolute};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -44,6 +44,11 @@ pub struct ResolvedConfig {
     /// variables rather than host values substituted into them (matching the
     /// official CLI, which stores the raw config).
     pub raw_config: serde_json::Value,
+    /// The identity of the container this config was read from, when it was
+    /// sourced from a container label rather than a devcontainer.json.
+    /// Variable substitution uses it for the local workspace in place of the
+    /// nominal `workspace_root`.
+    pub container_identity: Option<ContainerIdentity>,
     /// The caller's default `${containerWorkspaceFolder}` for a config with no
     /// `workspaceFolder` (see [`ResolveOptions`]). Always `None` for Compose
     /// configs, which must set `workspaceFolder` themselves.
@@ -123,6 +128,42 @@ impl ResolvedConfig {
                 })
                 .collect(),
         )
+    }
+}
+
+/// The identity a devcontainer-managed container records in its labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerIdentity {
+    /// The host workspace folder: `devcontainer.local_folder`, else
+    /// `dev.cella.workspace_path`.
+    pub local_folder: PathBuf,
+    /// The spec identity labels present on the container
+    /// (`devcontainer.local_folder` / `devcontainer.config_file`).
+    pub labels: BTreeMap<String, String>,
+}
+
+impl ContainerIdentity {
+    /// Read the identity from a container's labels, or `None` when the
+    /// container carries no workspace label.
+    pub fn from_labels<S: std::hash::BuildHasher>(
+        labels: &std::collections::HashMap<String, String, S>,
+    ) -> Option<Self> {
+        let local_folder = labels
+            .get(LOCAL_FOLDER_LABEL)
+            .or_else(|| labels.get("dev.cella.workspace_path"))?;
+        Some(Self {
+            local_folder: PathBuf::from(local_folder),
+            labels: [LOCAL_FOLDER_LABEL, CONFIG_FILE_LABEL]
+                .into_iter()
+                .filter_map(|key| labels.get(key).map(|v| (key.to_string(), v.clone())))
+                .collect(),
+        })
+    }
+
+    /// The `devcontainerId` hashed from the identity labels.
+    #[must_use]
+    pub fn devcontainer_id(&self) -> String {
+        spec_devcontainer_id(&self.labels)
     }
 }
 
@@ -378,6 +419,7 @@ pub fn config_with_override(
         typed,
         raw_remote_env,
         raw_config,
+        container_identity: None,
         default_container_workspace_folder: default_wf,
     })
 }
@@ -392,16 +434,21 @@ pub fn config_with_override(
 /// [`config_with_override`]; `workspace_root` is the nominal cwd and
 /// `config_path` the recorded (not-necessarily-existing) path. `config` is
 /// taken as already substituted: the caller substitutes it with a context
-/// matching where it came from, and passes the pre-substitution `raw_config`.
+/// matching where it came from, and passes the pre-substitution `raw_config`
+/// and the `container_identity` the config was read from.
 #[must_use]
 pub fn from_config_value(
     config: serde_json::Value,
     raw_config: serde_json::Value,
     workspace_root: &Path,
     config_path: PathBuf,
+    container_identity: Option<ContainerIdentity>,
     options: &ResolveOptions,
 ) -> ResolvedConfig {
-    let devcontainer_id = resolved_devcontainer_id(workspace_root, &config_path, options);
+    let devcontainer_id = match (&options.id_labels, &container_identity) {
+        (None, Some(identity)) => identity.devcontainer_id(),
+        _ => resolved_devcontainer_id(workspace_root, &config_path, options),
+    };
     let default_wf = default_container_workspace_folder(&config, options);
     let canonical = serde_json::to_string(&config).unwrap_or_default();
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
@@ -419,6 +466,7 @@ pub fn from_config_value(
         // snapshot is available for a second-pass containerEnv resolution.
         raw_remote_env: None,
         raw_config,
+        container_identity,
         default_container_workspace_folder: default_wf,
     }
 }
@@ -516,6 +564,7 @@ mod tests {
             cfg,
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            None,
             &ResolveOptions::default(),
         );
         assert_eq!(resolved.config["image"], "ubuntu");
@@ -542,6 +591,7 @@ mod tests {
             serde_json::json!({"image": "ubuntu"}),
             tmp.path(),
             from_file.config_path.clone(),
+            None,
             &ResolveOptions::default(),
         );
         assert_eq!(from_file.config_hash, from_value.config_hash);
@@ -932,6 +982,7 @@ mod tests {
             serde_json::json!({"image": "ubuntu"}),
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            None,
             &options,
         );
         assert_eq!(
@@ -1032,6 +1083,7 @@ mod tests {
             serde_json::json!({"image": "ubuntu"}),
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            None,
             &default_folder_options("/workspaces/repo/cwd"),
         );
         let ctx = crate::config_map::subst_ctx(&resolved);

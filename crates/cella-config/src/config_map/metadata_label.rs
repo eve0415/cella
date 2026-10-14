@@ -2,9 +2,8 @@
 //! image or container.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
-use cella_backend::names::{CONFIG_FILE_LABEL, LOCAL_FOLDER_LABEL};
+use crate::devcontainer::resolve::ContainerIdentity;
 use cella_features::{FeatureContainerConfig, ImageMetadataUserInfo};
 
 use crate::devcontainer::subst::SubstitutionContext;
@@ -73,24 +72,15 @@ pub fn container_subst_ctx<S: std::hash::BuildHasher>(
     container_workspace_folder: Option<&str>,
     env: impl IntoIterator<Item = (String, String)>,
 ) -> SubstitutionContext {
-    let Some(local_folder) = labels
-        .get(LOCAL_FOLDER_LABEL)
-        .or_else(|| labels.get("dev.cella.workspace_path"))
-    else {
+    let Some(identity) = ContainerIdentity::from_labels(labels) else {
         return SubstitutionContext::local_env_only(env.into_iter().collect());
     };
     let devcontainer_id = id_labels.map_or_else(
-        || {
-            let identity: BTreeMap<String, String> = [LOCAL_FOLDER_LABEL, CONFIG_FILE_LABEL]
-                .into_iter()
-                .filter_map(|key| labels.get(key).map(|v| (key.to_string(), v.clone())))
-                .collect();
-            crate::devcontainer::resolve::spec_devcontainer_id(&identity)
-        },
+        || identity.devcontainer_id(),
         crate::devcontainer::resolve::spec_devcontainer_id,
     );
     SubstitutionContext::new(
-        Path::new(local_folder),
+        &identity.local_folder,
         container_workspace_folder,
         &devcontainer_id,
         env.into_iter().collect(),
@@ -100,7 +90,9 @@ pub fn container_subst_ctx<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_backend::names::{CONFIG_FILE_LABEL, LOCAL_FOLDER_LABEL};
     use serde_json::{Value, json};
+    use std::path::Path;
 
     fn ctx() -> SubstitutionContext {
         let env = HashMap::from([("X".to_string(), "hello".to_string())]);

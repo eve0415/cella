@@ -845,7 +845,14 @@ fn resolved_from_container(
         PathBuf::from,
     );
 
-    resolve::from_config_value(config, raw_config, nominal_root, config_path, options)
+    resolve::from_config_value(
+        config,
+        raw_config,
+        nominal_root,
+        config_path,
+        resolve::ContainerIdentity::from_labels(&container.labels),
+        options,
+    )
 }
 
 /// The resolve-time inputs for an `up` invocation. With no workspace there is
@@ -2535,6 +2542,14 @@ mod tests {
         );
         assert_eq!(resolved.config["postCreateCommand"], "echo /home/me/app");
         assert_eq!(resolved.config["containerEnv"]["WS"], "/workspaces/app");
+        // The orchestrator substitutes the container label's lifecycle with
+        // this context; it must use the container's folder, not the cwd.
+        let ctx = cella_config::config_map::subst_ctx(&resolved);
+        assert_eq!(
+            ctx.substitute_str(concat!("${localWorkspaceFolder", "}")),
+            "/home/me/app"
+        );
+        assert_eq!(resolved.workspace_root, Path::new("/cwd"));
     }
 
     #[test]
@@ -3366,6 +3381,7 @@ mod tests {
             typed: None,
             raw_remote_env,
             raw_config: serde_json::json!({}),
+            container_identity: None,
             default_container_workspace_folder: None,
         }
     }
