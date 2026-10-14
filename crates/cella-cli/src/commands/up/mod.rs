@@ -2501,6 +2501,30 @@ mod tests {
         assert_eq!(config_from_metadata_label("[]"), serde_json::json!({}));
     }
 
+    /// Resolve a config from a container carrying `labels`, with the nominal cwd `/cwd`.
+    fn resolved_from_labels(labels: std::collections::HashMap<String, String>) -> ResolvedConfig {
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        )
+    }
+
     /// The label config is substituted with the found container's identity
     /// (its `devcontainer.local_folder`), not the nominal cwd.
     #[test]
@@ -2526,26 +2550,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let container = cella_backend::ContainerInfo {
-            id: "abc".to_string(),
-            name: "abc".to_string(),
-            state: cella_backend::ContainerState::Running,
-            exit_code: None,
-            labels,
-            config_hash: None,
-            ports: Vec::new(),
-            created_at: None,
-            started_at: None,
-            container_user: None,
-            image: None,
-            mounts: Vec::new(),
-            backend: cella_backend::BackendKind::Docker,
-        };
-        let resolved = resolved_from_container(
-            &container,
-            Path::new("/cwd"),
-            &resolve::ResolveOptions::default(),
-        );
+        let resolved = resolved_from_labels(labels);
         assert_eq!(resolved.config["postCreateCommand"], "echo /home/me/app");
         assert_eq!(resolved.config["containerEnv"]["WS"], "/workspaces/app");
         // The orchestrator substitutes the container label's lifecycle with
@@ -2580,26 +2585,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let container = cella_backend::ContainerInfo {
-            id: "abc".to_string(),
-            name: "abc".to_string(),
-            state: cella_backend::ContainerState::Running,
-            exit_code: None,
-            labels,
-            config_hash: None,
-            ports: Vec::new(),
-            created_at: None,
-            started_at: None,
-            container_user: None,
-            image: None,
-            mounts: Vec::new(),
-            backend: cella_backend::BackendKind::Docker,
-        };
-        let resolved = resolved_from_container(
-            &container,
-            Path::new("/cwd"),
-            &resolve::ResolveOptions::default(),
-        );
+        let resolved = resolved_from_labels(labels);
         assert_eq!(
             resolved.config["postCreateCommand"],
             "/workspaces/repo/packages/app"
@@ -2619,26 +2605,7 @@ mod tests {
             serde_json::json!([{"remoteEnv": {"PATH": concat!("${containerEnv", ":PATH}:/x")}}])
                 .to_string(),
         )]);
-        let container = cella_backend::ContainerInfo {
-            id: "abc".to_string(),
-            name: "abc".to_string(),
-            state: cella_backend::ContainerState::Running,
-            exit_code: None,
-            labels,
-            config_hash: None,
-            ports: Vec::new(),
-            created_at: None,
-            started_at: None,
-            container_user: None,
-            image: None,
-            mounts: Vec::new(),
-            backend: cella_backend::BackendKind::Docker,
-        };
-        let resolved = resolved_from_container(
-            &container,
-            Path::new("/cwd"),
-            &resolve::ResolveOptions::default(),
-        );
+        let resolved = resolved_from_labels(labels);
         let probed: std::collections::HashMap<String, String> =
             [("PATH".to_string(), "/usr/bin".to_string())].into();
         let env = build_lifecycle_env(&resolved, &[], &[], Some(&probed));
@@ -2656,26 +2623,7 @@ mod tests {
         .to_string();
         let labels =
             std::collections::HashMap::from([("devcontainer.metadata".to_string(), label.clone())]);
-        let container = cella_backend::ContainerInfo {
-            id: "abc".to_string(),
-            name: "abc".to_string(),
-            state: cella_backend::ContainerState::Running,
-            exit_code: None,
-            labels,
-            config_hash: None,
-            ports: Vec::new(),
-            created_at: None,
-            started_at: None,
-            container_user: None,
-            image: None,
-            mounts: Vec::new(),
-            backend: cella_backend::BackendKind::Docker,
-        };
-        let resolved = resolved_from_container(
-            &container,
-            Path::new("/cwd"),
-            &resolve::ResolveOptions::default(),
-        );
+        let resolved = resolved_from_labels(labels);
         assert_eq!(resolved.config["remoteEnv"]["FOO"], "bar");
         let entries = cella_backend::lifecycle::lifecycle_entries_for_phase(
             Some(&label),
@@ -2701,26 +2649,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let container = cella_backend::ContainerInfo {
-            id: "abc".to_string(),
-            name: "abc".to_string(),
-            state: cella_backend::ContainerState::Running,
-            exit_code: None,
-            labels,
-            config_hash: None,
-            ports: Vec::new(),
-            created_at: None,
-            started_at: None,
-            container_user: None,
-            image: None,
-            mounts: Vec::new(),
-            backend: cella_backend::BackendKind::Docker,
-        };
-        let resolved = resolved_from_container(
-            &container,
-            Path::new("/cwd"),
-            &resolve::ResolveOptions::default(),
-        );
+        let resolved = resolved_from_labels(labels);
         assert_eq!(
             resolved
                 .config
