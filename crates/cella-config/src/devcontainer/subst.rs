@@ -26,7 +26,8 @@ pub struct SubstitutionContext {
     local_workspace_folder: String,
     local_workspace_folder_basename: String,
     container_workspace_folder: String,
-    devcontainer_id: String,
+    /// `None` for a local-env-only context that was given no id.
+    devcontainer_id: Option<String>,
     /// Live container environment for `${containerEnv:VAR}` resolution.
     ///
     /// `None` at config-parse time. Populated for the second-pass `remoteEnv`
@@ -60,7 +61,7 @@ impl SubstitutionContext {
             local_workspace_folder: folder,
             local_workspace_folder_basename: basename,
             container_workspace_folder: container_wf,
-            devcontainer_id: devcontainer_id.to_string(),
+            devcontainer_id: Some(devcontainer_id.to_string()),
             container_env: None,
         }
     }
@@ -78,9 +79,17 @@ impl SubstitutionContext {
             local_workspace_folder: String::new(),
             local_workspace_folder_basename: String::new(),
             container_workspace_folder: String::new(),
-            devcontainer_id: String::new(),
+            devcontainer_id: None,
             container_env: None,
         }
+    }
+
+    /// Consume this context and return it with `${devcontainerId}` resolving to
+    /// `devcontainer_id`, including for a local-env-only context.
+    #[must_use]
+    pub fn with_devcontainer_id(mut self, devcontainer_id: String) -> Self {
+        self.devcontainer_id = Some(devcontainer_id);
+        self
     }
 
     /// Consume this context and return it with `container_env` populated.
@@ -185,6 +194,7 @@ impl SubstitutionContext {
             Scope::LocalEnvOnly => {
                 matches!(keyword, "localEnv" | "env")
                     || (keyword == "containerEnv" && self.container_env.is_some())
+                    || (keyword == "devcontainerId" && self.devcontainer_id.is_some())
             }
         }
     }
@@ -231,7 +241,7 @@ impl SubstitutionContext {
                     .file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().to_string())
             }
-            "devcontainerId" => self.devcontainer_id.clone(),
+            "devcontainerId" => self.devcontainer_id.clone().unwrap_or_default(),
             _ => format!("${{{expr}}}"),
         }
     }
@@ -252,7 +262,7 @@ mod tests {
             local_workspace_folder: "/projects/myapp".to_string(),
             local_workspace_folder_basename: "myapp".to_string(),
             container_workspace_folder: "/workspaces/myapp".to_string(),
-            devcontainer_id: "abc123".to_string(),
+            devcontainer_id: Some("abc123".to_string()),
             container_env: None,
         }
     }
@@ -442,7 +452,7 @@ mod tests {
             ctx.container_workspace_folder,
             "/workspaces/test_subst_workspace"
         );
-        assert_eq!(ctx.devcontainer_id, "deadbeef");
+        assert_eq!(ctx.devcontainer_id.as_deref(), Some("deadbeef"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -700,7 +710,7 @@ mod tests {
             local_workspace_folder: "/projects/myapp".to_string(),
             local_workspace_folder_basename: "myapp".to_string(),
             container_workspace_folder: "/workspaces/myapp".to_string(),
-            devcontainer_id: "abc123".to_string(),
+            devcontainer_id: Some("abc123".to_string()),
             container_env: Some(cenv),
         }
     }

@@ -64,7 +64,7 @@ pub fn parse_substituted_metadata(
 /// `dev.cella.workspace_path`). `${devcontainerId}` hashes `id_labels` when
 /// given, else the container's `devcontainer.local_folder` /
 /// `devcontainer.config_file` labels. Without a workspace label only
-/// `${localEnv:...}` expands.
+/// `${localEnv:...}` (and `${devcontainerId}` from `id_labels`) expand.
 #[must_use]
 pub fn container_subst_ctx<S: std::hash::BuildHasher>(
     labels: &HashMap<String, String, S>,
@@ -73,7 +73,13 @@ pub fn container_subst_ctx<S: std::hash::BuildHasher>(
     env: impl IntoIterator<Item = (String, String)>,
 ) -> SubstitutionContext {
     let Some(identity) = ContainerIdentity::from_labels(labels) else {
-        return SubstitutionContext::local_env_only(env.into_iter().collect());
+        let ctx = SubstitutionContext::local_env_only(env.into_iter().collect());
+        return match id_labels {
+            Some(id_labels) => ctx.with_devcontainer_id(
+                crate::devcontainer::resolve::spec_devcontainer_id(id_labels),
+            ),
+            None => ctx,
+        };
     };
     let devcontainer_id = id_labels.map_or_else(
         || identity.devcontainer_id(),
@@ -206,6 +212,20 @@ mod tests {
             ctx.substitute_str(concat!("${devcontainerId", "}")),
             crate::devcontainer::resolve::spec_devcontainer_id(&id_labels)
         );
+    }
+
+    /// Supplied id labels drive `${devcontainerId}` even when the container
+    /// has no workspace label; workspace variables stay literal.
+    #[test]
+    fn container_ctx_without_workspace_label_uses_id_labels() {
+        let id_labels = BTreeMap::from([("a".to_string(), "1".to_string())]);
+        let ctx = container_subst_ctx(&HashMap::new(), Some(&id_labels), None, HashMap::new());
+        assert_eq!(
+            ctx.substitute_str(concat!("${devcontainerId", "}")),
+            crate::devcontainer::resolve::spec_devcontainer_id(&id_labels)
+        );
+        let literal = concat!("${localWorkspaceFolder", "}");
+        assert_eq!(ctx.substitute_str(literal), literal);
     }
 
     #[test]
