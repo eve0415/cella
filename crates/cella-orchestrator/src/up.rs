@@ -1639,9 +1639,11 @@ impl EnsureUpContext<'_> {
         let config = self.config_json();
         let image_env = base_image_details.env;
         let subst_ctx = crate::subst_ctx(self.config.resolved);
-        let image_meta_user = base_image_details.metadata.as_deref().map(|m| {
-            crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx).1
-        });
+        let (image_meta_config, image_meta_user) = base_image_details
+            .metadata
+            .as_deref()
+            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx))
+            .unzip();
         let remote_user = crate::container_setup::resolve_remote_user(
             config,
             image_meta_user.as_ref(),
@@ -1677,13 +1679,6 @@ impl EnsureUpContext<'_> {
         let substituted_feature_config = resolved_features.map(|r| {
             crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
         });
-        let image_meta_config = if substituted_feature_config.is_none() {
-            base_image_details.metadata.as_deref().map(|m| {
-                crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx).0
-            })
-        } else {
-            None
-        };
         let effective_feature_config = substituted_feature_config
             .as_ref()
             .or(image_meta_config.as_ref());
