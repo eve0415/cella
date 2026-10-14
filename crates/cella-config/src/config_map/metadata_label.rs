@@ -48,20 +48,13 @@ fn substitute_entry(entry: &mut serde_json::Value, ctx: &SubstitutionContext) {
 /// Parse a `devcontainer.metadata` label after substituting its entries with
 /// [`substitute_metadata_label`].
 ///
-/// For readers whose result is not substituted again downstream. A
-/// single-object label is read as a one-entry array, as the official CLI does.
+/// For readers whose result is not substituted again downstream.
 #[must_use]
 pub fn parse_substituted_metadata(
     label: &str,
     ctx: &SubstitutionContext,
 ) -> (FeatureContainerConfig, ImageMetadataUserInfo) {
-    let substituted = substitute_metadata_label(label, ctx);
-    match serde_json::from_str::<serde_json::Value>(&substituted) {
-        Ok(entry @ serde_json::Value::Object(_)) => {
-            cella_features::parse_image_metadata(&serde_json::Value::Array(vec![entry]).to_string())
-        }
-        _ => cella_features::parse_image_metadata(&substituted),
-    }
+    cella_features::parse_image_metadata(&substitute_metadata_label(label, ctx))
 }
 
 /// Build the [`SubstitutionContext`] for a container when no devcontainer

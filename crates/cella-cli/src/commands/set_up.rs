@@ -370,11 +370,14 @@ fn lifecycle_remote_env(
     remote_env
 }
 
-/// Warn early if the label is present but not valid JSON, regardless of which
-/// result flags are passed — don't silently drop it.
+/// Warn early if the label is present but not a JSON array or object,
+/// regardless of which result flags are passed — don't silently drop it.
 fn warn_if_invalid_metadata(raw: Option<&str>) {
     if let Some(raw) = raw
-        && serde_json::from_str::<Vec<Value>>(raw).is_err()
+        && !matches!(
+            serde_json::from_str::<Value>(raw),
+            Ok(Value::Array(_) | Value::Object(_))
+        )
     {
         tracing::warn!(
             "devcontainer.metadata label is not valid JSON, treating as empty: {}",

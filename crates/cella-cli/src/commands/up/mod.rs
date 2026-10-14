@@ -788,7 +788,7 @@ fn inject_skip_workspace_mount(config: &mut serde_json::Value) {
 /// `workspaceFolder`, remote/container env) are lifted; the full lifecycle is
 /// re-read from the container by the orchestrator's reuse path.
 fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
-    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let entries = cella_features::metadata_label_entries(metadata_json);
     let mut merged = serde_json::Map::new();
     for entry in &entries {
         if let Some(obj) = entry.as_object() {
@@ -2643,6 +2643,47 @@ mod tests {
             [("PATH".to_string(), "/usr/bin".to_string())].into();
         let env = build_lifecycle_env(&resolved, &[], &[], Some(&probed));
         assert!(env.contains(&"PATH=/usr/bin:/x".to_string()), "{env:?}");
+    }
+
+    /// A single-object label (not an array) feeds both the config and the
+    /// container-label lifecycle on the id-label-only path.
+    #[test]
+    fn resolved_from_container_reads_single_object_label() {
+        let label = serde_json::json!({
+            "remoteEnv": {"FOO": "bar"},
+            "postAttachCommand": "echo attached",
+        })
+        .to_string();
+        let labels =
+            std::collections::HashMap::from([("devcontainer.metadata".to_string(), label.clone())]);
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        let resolved = resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        );
+        assert_eq!(resolved.config["remoteEnv"]["FOO"], "bar");
+        let entries = cella_backend::lifecycle::lifecycle_entries_for_phase(
+            Some(&label),
+            &resolved.config,
+            "postAttachCommand",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "echo attached");
     }
 
     #[test]

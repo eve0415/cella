@@ -423,7 +423,7 @@ pub fn metadata_remote_env(metadata: Option<&str>, ctx: &SubstitutionContext) ->
     let Some(json) = metadata else {
         return Vec::new();
     };
-    let entries: Vec<Value> = serde_json::from_str(json).unwrap_or_default();
+    let entries = cella_features::metadata_label_entries(json);
     // Accumulate later-wins so the same key set across entries resolves to the
     // last entry's value, matching mergeConfiguration.
     let mut acc: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -448,7 +448,7 @@ pub fn metadata_remote_env(metadata: Option<&str>, ctx: &SubstitutionContext) ->
 /// then this baked value, then the CLI `--default-user-env-probe`.
 #[must_use]
 pub fn metadata_user_env_probe(metadata: Option<&str>) -> Option<String> {
-    let entries: Vec<Value> = serde_json::from_str(metadata?).ok()?;
+    let entries = cella_features::metadata_label_entries(metadata?);
     entries.iter().rev().find_map(|e| {
         e.get("userEnvProbe")
             .and_then(Value::as_str)

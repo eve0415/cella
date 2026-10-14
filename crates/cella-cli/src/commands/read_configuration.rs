@@ -359,12 +359,7 @@ pub(super) fn build_merged_from_label(
     // metadata is not silently dropped.
     let label_json =
         cella_config::config_map::metadata_label::substitute_metadata_label(label_json, ctx);
-    let mut entries: Vec<serde_json::Value> =
-        match serde_json::from_str::<serde_json::Value>(&label_json) {
-            Ok(serde_json::Value::Array(a)) => a,
-            Ok(obj @ serde_json::Value::Object(_)) => vec![obj],
-            _ => Vec::new(),
-        };
+    let mut entries = cella_features::metadata_label_entries(&label_json);
 
     // Append the current config last so it is authoritative (matches the official
     // `getImageMetadataFromContainer`). `--id-label` contributes only updateable

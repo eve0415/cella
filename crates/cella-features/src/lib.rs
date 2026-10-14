@@ -30,8 +30,8 @@ pub use lockfile::{
     lockfile_path, read_lockfile, write_lockfile,
 };
 pub use merge::{
-    ImageMetadataUserInfo, merge_features, merge_with_devcontainer, parse_image_metadata,
-    validate_options,
+    ImageMetadataUserInfo, merge_features, merge_with_devcontainer, metadata_label_entries,
+    parse_image_metadata, validate_options,
 };
 pub use metadata::parse_feature_metadata;
 pub use oci::{FeatureFetcher, OciFetcher};
@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 /// Each metadata entry with an `"id"` field uses that as the origin; entries
 /// without use `"devcontainer.json"`.
 pub fn lifecycle_from_metadata_label(metadata_json: &str, phase: &str) -> Vec<LifecycleEntry> {
-    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let entries = metadata_label_entries(metadata_json);
     let mut result = Vec::new();
     for entry in &entries {
         let origin = entry
