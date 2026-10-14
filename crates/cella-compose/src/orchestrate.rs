@@ -2251,7 +2251,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
-            raw_config: serde_json::json!({"name": concat!("${localEnv", ":NAME}")}),
+            raw_config: config.clone(),
             container_identity: None,
             default_container_workspace_folder: None,
         };
@@ -2300,7 +2300,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
-            raw_config: serde_json::json!({"name": concat!("${localEnv", ":NAME}")}),
+            raw_config: config.clone(),
             container_identity: None,
             default_container_workspace_folder: None,
         };
