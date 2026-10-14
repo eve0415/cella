@@ -8,9 +8,20 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Which variable families a [`SubstitutionContext`] resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Every supported variable.
+    Full,
+    /// Only `${localEnv:...}` / `${env:...}`; every other expression is left
+    /// as its literal `${...}` text.
+    LocalEnvOnly,
+}
+
 /// Context for resolving devcontainer variable expressions.
 #[derive(Clone)]
 pub struct SubstitutionContext {
+    scope: Scope,
     local_env: HashMap<String, String>,
     local_workspace_folder: String,
     local_workspace_folder_basename: String,
@@ -45,11 +56,30 @@ impl SubstitutionContext {
             .map_or_else(|| format!("/workspaces/{basename}"), String::from);
 
         Self {
+            scope: Scope::Full,
             local_env: env,
             local_workspace_folder: folder,
             local_workspace_folder_basename: basename,
             container_workspace_folder: container_wf,
             devcontainer_id: devcontainer_id.to_string(),
+            container_env: HashMap::new(),
+        }
+    }
+
+    /// Create a context that expands only `${localEnv:...}` and `${env:...}`.
+    ///
+    /// Used where no devcontainer configuration is available: workspace,
+    /// `${devcontainerId}` and `${containerEnv:...}` expressions are left as
+    /// their literal `${...}` text.
+    #[must_use]
+    pub fn local_env_only(env: HashMap<String, String>) -> Self {
+        Self {
+            scope: Scope::LocalEnvOnly,
+            local_env: env,
+            local_workspace_folder: String::new(),
+            local_workspace_folder_basename: String::new(),
+            container_workspace_folder: String::new(),
+            devcontainer_id: String::new(),
             container_env: HashMap::new(),
         }
     }
@@ -152,6 +182,10 @@ impl SubstitutionContext {
         let mut parts = expr.splitn(3, ':');
         let keyword = parts.next().unwrap_or("");
 
+        if self.scope == Scope::LocalEnvOnly && !matches!(keyword, "localEnv" | "env") {
+            return format!("${{{expr}}}");
+        }
+
         match keyword {
             // `${env:VAR}` is the official alias for `${localEnv:VAR}`
             // (the CLI's variableSubstitution.ts has `case 'env'` fall through
@@ -200,6 +234,7 @@ mod tests {
         env.insert("EMPTY_VAR".to_string(), String::new());
 
         SubstitutionContext {
+            scope: Scope::Full,
             local_env: env,
             local_workspace_folder: "/projects/myapp".to_string(),
             local_workspace_folder_basename: "myapp".to_string(),
@@ -596,6 +631,34 @@ mod tests {
         );
     }
 
+    // --- local_env_only ---
+
+    #[test]
+    fn local_env_only_expands_local_env_and_env_alias() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/u".to_string());
+        let ctx = SubstitutionContext::local_env_only(env);
+        assert_eq!(ctx.substitute_str("${localEnv:HOME}/x"), "/home/u/x");
+        assert_eq!(ctx.substitute_str("${env:HOME}"), "/home/u");
+        assert_eq!(ctx.substitute_str("${localEnv:MISSING:dflt}"), "dflt");
+    }
+
+    #[test]
+    fn local_env_only_leaves_other_variables_literal() {
+        let ctx = SubstitutionContext::local_env_only(HashMap::new());
+        for expr in [
+            "${localWorkspaceFolder}",
+            "${localWorkspaceFolderBasename}",
+            "${containerWorkspaceFolder}",
+            "${containerWorkspaceFolderBasename}",
+            "${devcontainerId}",
+            "${containerEnv:PATH}",
+            "${containerEnv:PATH:/usr/bin}",
+        ] {
+            assert_eq!(ctx.substitute_str(expr), expr);
+        }
+    }
+
     // --- with_container_env / substitute_remote_env tests ---
 
     fn ctx_with_container_env() -> SubstitutionContext {
@@ -608,6 +671,7 @@ mod tests {
         );
         cenv.insert("SHELL".to_string(), "/bin/bash".to_string());
         SubstitutionContext {
+            scope: Scope::Full,
             local_env: local,
             local_workspace_folder: "/projects/myapp".to_string(),
             local_workspace_folder_basename: "myapp".to_string(),
