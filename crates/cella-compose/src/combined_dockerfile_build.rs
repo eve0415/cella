@@ -23,6 +23,7 @@ use crate::{
 ///
 /// Compose up to v5.6.0 grants bake `fs.read` only for the build context and `additional_contexts`, so a Dockerfile outside both is rejected with "additional privileges requested" (<https://github.com/docker/compose/issues/14285>).
 /// Listing the directory here makes compose grant it; the Dockerfile never references this context.
+/// Drop it once the minimum supported Compose grants the Dockerfile path itself.
 const COMBINED_DOCKERFILE_CONTEXT: &str = "cella_combined_dockerfile";
 
 /// Result of resolving features for a compose service.
@@ -208,7 +209,7 @@ pub async fn resolve_compose_features(
     .await?;
 
     // 6. Generate combined Dockerfile and write to disk.
-    let combined_path = write_combined_dockerfile(
+    write_combined_dockerfile(
         &project.project_name,
         &original_dockerfile,
         &resolved.dockerfile,
@@ -221,7 +222,6 @@ pub async fn resolve_compose_features(
         config,
         &service_info,
         project,
-        combined_path,
         resolved,
         image_user,
         base_image_metadata,
@@ -316,23 +316,21 @@ fn write_combined_dockerfile(
     features_dockerfile: &str,
     stage_name: &str,
     image_user: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let combined = crate::generate_combined_dockerfile(
         original_dockerfile,
         features_dockerfile,
         stage_name,
         image_user,
     );
+    std::fs::create_dir_all(compose_dockerfile_dir(project_name))?;
     let combined_path = compose_dockerfile_path(project_name);
-    if let Some(parent) = combined_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     std::fs::write(&combined_path, &combined)?;
     info!(
         "Combined Dockerfile written to: {}",
         combined_path.display()
     );
-    Ok(combined_path)
+    Ok(())
 }
 
 /// Assemble the `ComposeFeaturesBuild` with build context overrides.
@@ -340,7 +338,6 @@ fn assemble_features_build(
     config: &serde_json::Value,
     service_info: &ServiceBuildInfo,
     project: &ComposeProject,
-    combined_dockerfile: PathBuf,
     resolved: ResolvedFeatures,
     image_user: String,
     base_image_metadata: Option<String>,
@@ -370,7 +367,7 @@ fn assemble_features_build(
     };
 
     Ok(ComposeFeaturesBuild {
-        combined_dockerfile,
+        combined_dockerfile: compose_dockerfile_path(&project.project_name),
         build_target: FEATURES_TARGET_STAGE.to_string(),
         build_context,
         additional_contexts,
@@ -683,7 +680,6 @@ RUN echo hi
             &serde_json::json!({}),
             &service_info,
             &project,
-            super::compose_dockerfile_path(&project.project_name),
             resolved,
             "root".to_string(),
             None,
