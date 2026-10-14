@@ -805,9 +805,11 @@ fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
 ///
 /// The config content comes from the container's `devcontainer.metadata` label
 /// (merged) with the workspace mount disabled; `workspace_root` is the nominal
-/// cwd (used for substitution/labels only). The recorded `config_path` is the
-/// container's `dev.cella.config_path` label when present, else a synthetic
-/// path under the nominal root.
+/// cwd (used for labels only). The label config is substituted with a context
+/// built from the container's own identity labels (`devcontainer.local_folder`
+/// / `devcontainer.config_file`, or the id labels), not from the cwd. The
+/// recorded `config_path` is the container's `dev.cella.config_path` label when
+/// present, else a synthetic path under the nominal root.
 fn resolved_from_container(
     container: &cella_backend::ContainerInfo,
     nominal_root: &Path,
@@ -817,6 +819,24 @@ fn resolved_from_container(
         .labels
         .get("devcontainer.metadata")
         .map_or_else(|| json!({}), |m| config_from_metadata_label(m));
+    let container_workspace_folder = config
+        .get("workspaceFolder")
+        .and_then(serde_json::Value::as_str)
+        .filter(|wf| !wf.contains("${"))
+        .or_else(|| {
+            container
+                .labels
+                .get("dev.cella.workspace_folder")
+                .map(String::as_str)
+        })
+        .map(String::from);
+    let ctx = cella_config::config_map::metadata_label::container_subst_ctx(
+        &container.labels,
+        options.id_labels.as_ref(),
+        container_workspace_folder.as_deref(),
+        std::env::vars(),
+    );
+    ctx.substitute_value(&mut config);
     inject_skip_workspace_mount(&mut config);
 
     let config_path = container.labels.get("dev.cella.config_path").map_or_else(
@@ -2464,6 +2484,55 @@ mod tests {
             serde_json::json!({})
         );
         assert_eq!(config_from_metadata_label("[]"), serde_json::json!({}));
+    }
+
+    /// The label config is substituted with the found container's identity
+    /// (its `devcontainer.local_folder`), not the nominal cwd.
+    #[test]
+    fn resolved_from_container_substitutes_with_container_identity() {
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{
+                    "workspaceFolder": "/workspaces/app",
+                    "postCreateCommand": concat!("echo ${localWorkspaceFolder", "}"),
+                    "containerEnv": {"WS": concat!("${containerWorkspaceFolder", "}")},
+                }])
+                .to_string(),
+            ),
+            (
+                "devcontainer.local_folder".to_string(),
+                "/home/me/app".to_string(),
+            ),
+            (
+                "devcontainer.config_file".to_string(),
+                "/home/me/app/.devcontainer/devcontainer.json".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        let resolved = resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        );
+        assert_eq!(resolved.config["postCreateCommand"], "echo /home/me/app");
+        assert_eq!(resolved.config["containerEnv"]["WS"], "/workspaces/app");
     }
 
     #[test]

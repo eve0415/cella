@@ -382,7 +382,9 @@ pub fn config_with_override(
 /// container's `devcontainer.metadata` label rather than the filesystem. The
 /// config hash, `devcontainerId`, and typed view are computed the same way as
 /// [`config_with_override`]; `workspace_root` is the nominal cwd and
-/// `config_path` the recorded (not-necessarily-existing) path.
+/// `config_path` the recorded (not-necessarily-existing) path. `config` is
+/// taken as already substituted: the caller substitutes it with a context
+/// matching where it came from.
 #[must_use]
 pub fn from_config_value(
     config: serde_json::Value,
@@ -404,8 +406,8 @@ pub fn from_config_value(
         devcontainer_id,
         warnings: Vec::new(),
         typed,
-        // Config sourced from a container label is already substituted — no
-        // raw snapshot is available for a second-pass containerEnv resolution.
+        // The caller substituted `config` before handing it over, so no raw
+        // snapshot is available for a second-pass containerEnv resolution.
         raw_remote_env: None,
         default_container_workspace_folder: default_wf,
     }
