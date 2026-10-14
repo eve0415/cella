@@ -129,13 +129,13 @@ pub struct UserEntrypointCommand {
     pub command: Option<Vec<String>>,
 }
 
-/// Escape `docker compose` interpolation in an image-derived value (`$` → `$$`).
+/// Escape `docker compose` interpolation in a value cella writes (`$` → `$$`).
 ///
-/// Image `ENTRYPOINT`/`CMD` values are emitted into cella's `-f` override, which
-/// `docker compose` interpolates. Doubling each `$` makes compose yield a literal
-/// `$` for the shell (mirrors the official `c.replace(/\$/g, '$$$$')`). Service
-/// values are NOT escaped here — the resolved compose config already returns them
-/// in `$$`-escaped form.
+/// Image `ENTRYPOINT`/`CMD` values, labels and environment entries are emitted
+/// into cella's `-f` override, which `docker compose` interpolates. Doubling each
+/// `$` makes compose yield a literal `$` (mirrors the official
+/// `c.replace(/\$/g, '$$$$')`). Service values are NOT escaped here — the resolved
+/// compose config already returns them in `$$`-escaped form.
 fn escape_dollars(value: &str) -> String {
     value.replace('$', "$$")
 }
@@ -355,7 +355,7 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     if !config.extra_env.is_empty() {
         yaml.push_str("    environment:\n");
         for env in &config.extra_env {
-            let _ = writeln!(yaml, "      - \"{}\"", yaml_dq_escape(env));
+            let _ = writeln!(yaml, "      - \"{}\"", yaml_dq_escape(&escape_dollars(env)));
         }
     }
 
@@ -363,7 +363,11 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     if !config.extra_labels.is_empty() {
         yaml.push_str("    labels:\n");
         for (k, v) in &config.extra_labels {
-            let _ = writeln!(yaml, "      {k}: \"{}\"", yaml_dq_escape(v));
+            let _ = writeln!(
+                yaml,
+                "      {k}: \"{}\"",
+                yaml_dq_escape(&escape_dollars(v))
+            );
         }
     }
 
@@ -641,6 +645,24 @@ mod tests {
         let labels = &parsed["services"]["app"]["labels"];
         assert_eq!(labels["devcontainer.metadata"].as_str(), Some(metadata));
         assert_eq!(labels["devcontainer.local_folder"].as_str(), Some("/ws"));
+    }
+
+    /// Label and environment values are escaped against compose
+    /// interpolation, so a raw `${...}` survives as a literal.
+    #[test]
+    fn label_and_env_values_escape_compose_interpolation() {
+        let raw = concat!("${localEnv", ":HOME}");
+        let mut config = base_config();
+        config
+            .extra_labels
+            .insert("devcontainer.metadata".to_string(), raw.to_string());
+        config.extra_env.push(format!("TOKEN={raw}"));
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains(&format!("devcontainer.metadata: \"${raw}\"")),
+            "{yaml}"
+        );
+        assert!(yaml.contains(&format!("- \"TOKEN=${raw}\"")), "{yaml}");
     }
 
     #[test]
