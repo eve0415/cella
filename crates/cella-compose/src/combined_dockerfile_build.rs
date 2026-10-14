@@ -63,31 +63,13 @@ pub struct ResolveComposeFeaturesInput<'a> {
     pub lockfile_policy: cella_features::LockfilePolicy,
 }
 
-/// The base-image context for compose feature resolution.
-///
-/// `remoteUser`/`containerUser` are read from a copy of the base image's
-/// metadata label substituted with the build's context; the raw label is
-/// handed over for merging (substituted downstream) and for the persisted
-/// label.
-fn compose_base_ctx<'a>(
-    input: &'a ResolveComposeFeaturesInput<'_>,
-    stage_name: &'a str,
-    image_user: &'a str,
-    base_image_metadata: Option<&'a str>,
-) -> cella_features::BaseImageContext<'a> {
-    cella_features::BaseImageContext {
-        base_image: stage_name,
-        image_user,
-        metadata: base_image_metadata,
-        metadata_user: base_image_metadata.map(|m| {
-            cella_config::config_map::metadata_label::parse_substituted_metadata(m, input.subst_ctx)
-                .1
-        }),
-        omit: cella_features::MetadataOmit {
-            remote_env: input.omit_remote_env_from_metadata,
-            feature_customizations: input.omit_feature_customizations_from_metadata,
-        },
-        label_config: input.label_config,
+impl ResolveComposeFeaturesInput<'_> {
+    /// Which keys to omit from the generated `devcontainer.metadata` label.
+    const fn metadata_omit(&self) -> cella_features::MetadataOmit {
+        cella_features::MetadataOmit {
+            remote_env: self.omit_remote_env_from_metadata,
+            feature_customizations: self.omit_feature_customizations_from_metadata,
+        }
     }
 }
 
@@ -203,11 +185,13 @@ pub async fn resolve_compose_features(
             config_path,
             &platform,
             &cache,
-            &compose_base_ctx(
-                input,
+            &cella_config::config_map::metadata_label::base_image_context(
                 &stage_name,
                 &image_user,
                 base_image_metadata.as_deref(),
+                input.metadata_omit(),
+                input.label_config,
+                input.subst_ctx,
             ),
             true, // compose builds use named content source via additional_contexts
             input.lockfile_policy,

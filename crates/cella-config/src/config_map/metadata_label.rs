@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::devcontainer::resolve::ContainerIdentity;
-use cella_features::{FeatureContainerConfig, ImageMetadataUserInfo};
+use cella_features::{
+    BaseImageContext, FeatureContainerConfig, ImageMetadataUserInfo, MetadataOmit,
+};
 
 use crate::devcontainer::subst::SubstitutionContext;
 
@@ -55,6 +57,29 @@ pub fn parse_substituted_metadata(
     ctx: &SubstitutionContext,
 ) -> (FeatureContainerConfig, ImageMetadataUserInfo) {
     cella_features::parse_image_metadata(&substitute_metadata_label(label, ctx))
+}
+
+/// The base-image context for feature resolution.
+///
+/// `remoteUser`/`containerUser` are read from a copy of the base image's `metadata` label substituted with `ctx`.
+/// The raw label itself is handed over for merging, which substitutes it downstream, and for the persisted label.
+#[must_use]
+pub fn base_image_context<'a>(
+    base_image: &'a str,
+    image_user: &'a str,
+    metadata: Option<&'a str>,
+    omit: MetadataOmit,
+    label_config: &'a serde_json::Value,
+    ctx: &SubstitutionContext,
+) -> BaseImageContext<'a> {
+    BaseImageContext {
+        base_image,
+        image_user,
+        metadata,
+        metadata_user: metadata.map(|m| parse_substituted_metadata(m, ctx).1),
+        omit,
+        label_config,
+    }
 }
 
 /// Build the [`SubstitutionContext`] for a container when no devcontainer

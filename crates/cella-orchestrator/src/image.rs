@@ -509,30 +509,6 @@ fn parse_platform_str(platform: &str) -> Option<(&str, &str)> {
     Some((os, arch))
 }
 
-/// The base-image context for feature resolution.
-///
-/// `remoteUser`/`containerUser` are read from a copy of the base image's
-/// metadata label substituted with `subst_ctx`; the raw label is handed over
-/// for merging (substituted downstream) and for the persisted label.
-fn features_base_ctx<'a>(
-    base_image_tag: &'a str,
-    details: &'a ImageDetails,
-    omit: cella_features::MetadataOmit,
-    label_config: &'a serde_json::Value,
-    subst_ctx: &SubstitutionContext,
-) -> cella_features::BaseImageContext<'a> {
-    cella_features::BaseImageContext {
-        base_image: base_image_tag,
-        image_user: &details.user,
-        metadata: details.metadata.as_deref(),
-        metadata_user: details.metadata.as_deref().map(|m| {
-            cella_config::config_map::metadata_label::parse_substituted_metadata(m, subst_ctx).1
-        }),
-        omit,
-        label_config,
-    }
-}
-
 /// Resolve features and build the features layer image.
 async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
@@ -562,9 +538,10 @@ async fn resolve_and_build_features(
         input.config_path,
         &platform,
         &cache,
-        &features_base_ctx(
+        &cella_config::config_map::metadata_label::base_image_context(
             input.base_image_tag,
-            input.base_image_details,
+            &input.base_image_details.user,
+            input.base_image_details.metadata.as_deref(),
             cella_features::MetadataOmit {
                 remote_env: input.omit_remote_env_from_metadata,
                 feature_customizations: input.omit_feature_customizations_from_metadata,
@@ -917,9 +894,10 @@ mod tests {
             &dir.path().join("devcontainer.json"),
             &cella_features::oci::detect_platform("linux", "x86_64"),
             &cella_features::FeatureCache::with_root(cache_dir.path().join("features")),
-            &features_base_ctx(
+            &cella_config::config_map::metadata_label::base_image_context(
                 "base",
-                &details,
+                &details.user,
+                details.metadata.as_deref(),
                 cella_features::MetadataOmit::default(),
                 &config,
                 &ctx,
