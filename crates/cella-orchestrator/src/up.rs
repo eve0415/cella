@@ -2800,6 +2800,34 @@ mod tests {
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
 
+    /// With no features and no base label, the generated label records the raw
+    /// config, not the substituted one.
+    #[test]
+    fn container_metadata_label_records_raw_config() {
+        let raw_token = concat!("${localEnv", ":SECRET}");
+        let resolved = cella_config::devcontainer::resolve::ResolvedConfig {
+            config: serde_json::json!({"containerEnv": {"TOKEN": "xyz"}}),
+            config_path: std::path::PathBuf::from("/ws/.devcontainer/devcontainer.json"),
+            workspace_root: std::path::PathBuf::from("/ws"),
+            config_hash: String::new(),
+            devcontainer_id: String::new(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env: None,
+            raw_config: serde_json::json!({"containerEnv": {"TOKEN": raw_token}}),
+            container_identity: None,
+            default_container_workspace_folder: None,
+        };
+        let label = container_metadata_label(&resolved, None, None, false);
+        assert!(label.contains(raw_token), "{label}");
+        assert!(!label.contains("xyz"), "{label}");
+        // An existing base label is reused verbatim.
+        assert_eq!(
+            container_metadata_label(&resolved, None, Some("[{}]"), false),
+            "[{}]"
+        );
+    }
+
     /// Attaching to a VS Code or official-CLI container must not leave cella
     /// blocks in its rc files; a container cella created must still be healed.
     #[test]

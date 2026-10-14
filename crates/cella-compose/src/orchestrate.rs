@@ -2251,7 +2251,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
-            raw_config: config.clone(),
+            raw_config: serde_json::json!({"name": concat!("${localEnv", ":NAME}")}),
             container_identity: None,
             default_container_workspace_folder: None,
         };
@@ -2322,7 +2322,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
-            raw_config: config.clone(),
+            raw_config: serde_json::json!({"name": concat!("${localEnv", ":NAME}")}),
             container_identity: None,
             default_container_workspace_folder: None,
         };
@@ -2409,6 +2409,74 @@ mod tests {
             container_identity: None,
             default_container_workspace_folder: None,
         }
+    }
+
+    /// A substituted config and its raw snapshot that differ, so a writer
+    /// that persists the wrong one is caught.
+    fn substituted_and_raw() -> (serde_json::Value, serde_json::Value) {
+        (
+            serde_json::json!({"containerEnv": {"TOKEN": "xyz"}}),
+            serde_json::json!({"containerEnv": {"TOKEN": concat!("${localEnv", ":SECRET}")}}),
+        )
+    }
+
+    #[test]
+    fn compose_metadata_label_records_raw_config() {
+        let (config, raw) = substituted_and_raw();
+        let label = compose_metadata_label(None, &resolved_with(config, raw.clone()), None, false);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
+        assert_eq!(parsed, vec![raw]);
+    }
+
+    #[test]
+    fn compose_features_input_persists_raw_config() {
+        let (config, raw) = substituted_and_raw();
+        let resolved = resolved_with(config.clone(), raw.clone());
+        let config_path = PathBuf::from("/tmp/devcontainer.json");
+        let workspace_root = PathBuf::from("/tmp/workspace");
+        let cfg = ComposeUpConfig {
+            resolved: &resolved,
+            config: &config,
+            config_path: &config_path,
+            workspace_root: &workspace_root,
+            container_name: "test-container",
+            remote_env: &[],
+            cli_remote_env: &[],
+            resolution: ContainerResolution::default(),
+            skip_checksum: false,
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
+            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::default(),
+            dotfiles: DotfilesConfig::default(),
+        };
+        let project = ComposeProject {
+            project_name: "cella-test".to_string(),
+            compose_files: vec![],
+            override_file: PathBuf::from("/tmp/override.yaml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspace".to_string(),
+            config_dir: PathBuf::from("/tmp"),
+            workspace_root: workspace_root.clone(),
+            config_hash: "hash123".to_string(),
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        };
+        let subst_ctx = cella_config::config_map::subst_ctx(&resolved);
+        let input = compose_features_input(&cfg, &project, &subst_ctx);
+        assert_eq!(input.label_config, &raw);
+        assert_eq!(input.config, &config);
     }
 
     #[test]
