@@ -137,26 +137,42 @@ pub struct ContainerIdentity {
     /// The host workspace folder: `devcontainer.local_folder`, else
     /// `dev.cella.workspace_path`.
     pub local_folder: PathBuf,
-    /// The spec identity labels present on the container
-    /// (`devcontainer.local_folder` / `devcontainer.config_file`).
+    /// The spec identity labels (`devcontainer.local_folder` /
+    /// `devcontainer.config_file`) the container is identified by.
     pub labels: BTreeMap<String, String>,
 }
 
 impl ContainerIdentity {
     /// Read the identity from a container's labels, or `None` when the
     /// container carries no workspace label.
+    ///
+    /// A container with only cella's own `dev.cella.workspace_path` /
+    /// `dev.cella.config_path` labels is identified by those values, as if they
+    /// were the spec labels.
     pub fn from_labels<S: std::hash::BuildHasher>(
         labels: &std::collections::HashMap<String, String, S>,
     ) -> Option<Self> {
         let local_folder = labels
             .get(LOCAL_FOLDER_LABEL)
             .or_else(|| labels.get("dev.cella.workspace_path"))?;
+        let spec_labels: BTreeMap<String, String> = [LOCAL_FOLDER_LABEL, CONFIG_FILE_LABEL]
+            .into_iter()
+            .filter_map(|key| labels.get(key).map(|v| (key.to_string(), v.clone())))
+            .collect();
+        let identity_labels = if spec_labels.is_empty() {
+            [
+                (LOCAL_FOLDER_LABEL, "dev.cella.workspace_path"),
+                (CONFIG_FILE_LABEL, "dev.cella.config_path"),
+            ]
+            .into_iter()
+            .filter_map(|(spec, cella)| labels.get(cella).map(|v| (spec.to_string(), v.clone())))
+            .collect()
+        } else {
+            spec_labels
+        };
         Some(Self {
             local_folder: PathBuf::from(local_folder),
-            labels: [LOCAL_FOLDER_LABEL, CONFIG_FILE_LABEL]
-                .into_iter()
-                .filter_map(|key| labels.get(key).map(|v| (key.to_string(), v.clone())))
-                .collect(),
+            labels: identity_labels,
         })
     }
 
@@ -1111,6 +1127,31 @@ mod tests {
         assert_eq!(resolved.config["build"]["args"]["TOKEN"], "xyz");
         assert_eq!(resolved.raw_config["containerEnv"]["TOKEN"], token);
         assert_eq!(resolved.raw_config["build"]["args"]["TOKEN"], token);
+    }
+
+    /// Containers labelled only with cella's own workspace/config labels get
+    /// distinct ids, equal to the ids those paths produce.
+    #[test]
+    fn legacy_container_identity_hashes_cella_labels() {
+        let legacy = |ws: &str| {
+            std::collections::HashMap::from([
+                ("dev.cella.workspace_path".to_string(), ws.to_string()),
+                (
+                    "dev.cella.config_path".to_string(),
+                    format!("{ws}/.devcontainer/devcontainer.json"),
+                ),
+            ])
+        };
+        let a = ContainerIdentity::from_labels(&legacy("/src/a")).unwrap();
+        let b = ContainerIdentity::from_labels(&legacy("/src/b")).unwrap();
+        assert_ne!(a.devcontainer_id(), b.devcontainer_id());
+        assert_eq!(
+            a.devcontainer_id(),
+            devcontainer_id(
+                Path::new("/src/a"),
+                Path::new("/src/a/.devcontainer/devcontainer.json")
+            )
+        );
     }
 
     #[test]
