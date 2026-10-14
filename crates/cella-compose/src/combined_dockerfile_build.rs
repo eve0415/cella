@@ -379,10 +379,13 @@ fn has_features(config: &serde_json::Value) -> bool {
 }
 
 /// Compute the path for the combined Dockerfile.
+///
+/// The file gets a directory of its own so that granting the build read access to that directory exposes nothing else.
 fn compose_dockerfile_path(project_name: &str) -> PathBuf {
     cella_data_dir()
         .join("compose")
         .join(project_name)
+        .join("dockerfile")
         .join("Dockerfile.combined")
 }
 
