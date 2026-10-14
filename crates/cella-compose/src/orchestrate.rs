@@ -547,7 +547,7 @@ async fn resolve_user_and_env(
     // `build_labels`).
     let metadata_label = compose_metadata_label(
         features_build.map(|fb| fb.resolved_features.metadata_label.as_str()),
-        &cfg.resolved.raw_config,
+        cfg.resolved,
         base_metadata.as_deref(),
         cfg.omit_remote_env_from_metadata,
     );
@@ -600,20 +600,10 @@ async fn prepare_and_start(
     crate::check_compose_features_support().await?;
 
     // 6. Resolve features via combined-Dockerfile approach (if features configured)
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     let features_build = crate::combined_dockerfile_build::resolve_compose_features(
         client,
-        &crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
-            config,
-            subst_ctx: &cella_config::config_map::subst_ctx(cfg.resolved),
-            label_config: &cfg.resolved.raw_config,
-            config_path: cfg.config_path,
-            project,
-            omit_remote_env_from_metadata: cfg.omit_remote_env_from_metadata,
-            // --skip-persisting-customizations-from-features is a build-only flag;
-            // compose up always persists feature customizations.
-            omit_feature_customizations_from_metadata: false,
-            lockfile_policy: cfg.lockfile_policy,
-        },
+        &compose_features_input(cfg, project, &subst_ctx),
         progress,
     )
     .await?;
@@ -1700,10 +1690,11 @@ async fn compose_up_with_ssh_fallback(
 /// resolved, reuse the label computed during feature resolution (it already
 /// merges the base image, feature, and config entries). Otherwise build it from
 /// the base image's metadata (if any) plus the devcontainer.json config entry —
-/// exactly what the official CLI's `getDevcontainerMetadata` writes.
+/// exactly what the official CLI's `getDevcontainerMetadata` writes. The config
+/// entry is the pre-substitution config.
 fn compose_metadata_label(
     features_metadata_label: Option<&str>,
-    config: &serde_json::Value,
+    resolved: &ResolvedConfig,
     base_metadata: Option<&str>,
     omit_remote_env: bool,
 ) -> String {
@@ -1711,7 +1702,7 @@ fn compose_metadata_label(
         || {
             cella_features::generate_metadata_label(
                 &[],
-                config,
+                &resolved.raw_config,
                 base_metadata,
                 cella_features::MetadataOmit {
                     remote_env: omit_remote_env,
@@ -1722,6 +1713,27 @@ fn compose_metadata_label(
         },
         ToString::to_string,
     )
+}
+
+/// The feature-resolution input for `compose up`: the substituted config for
+/// resolution, the raw config for the persisted label.
+const fn compose_features_input<'a>(
+    cfg: &'a ComposeUpConfig<'_>,
+    project: &'a ComposeProject,
+    subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
+) -> crate::combined_dockerfile_build::ResolveComposeFeaturesInput<'a> {
+    crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
+        config: cfg.config,
+        subst_ctx,
+        label_config: &cfg.resolved.raw_config,
+        config_path: cfg.config_path,
+        project,
+        omit_remote_env_from_metadata: cfg.omit_remote_env_from_metadata,
+        // --skip-persisting-customizations-from-features is a build-only flag;
+        // compose up always persists feature customizations.
+        omit_feature_customizations_from_metadata: false,
+        lockfile_policy: cfg.lockfile_policy,
+    }
 }
 
 /// Build cella labels for the compose override file.
@@ -2383,6 +2395,22 @@ mod tests {
         assert!(labels.contains_key("dev.cella.docker_runtime"));
     }
 
+    fn resolved_with(config: serde_json::Value, raw_config: serde_json::Value) -> ResolvedConfig {
+        ResolvedConfig {
+            config,
+            config_path: PathBuf::from("/tmp/devcontainer.json"),
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            config_hash: String::new(),
+            devcontainer_id: String::new(),
+            warnings: vec![],
+            typed: None,
+            raw_remote_env: None,
+            raw_config,
+            container_identity: None,
+            default_container_workspace_folder: None,
+        }
+    }
+
     #[test]
     fn compose_metadata_label_features_reuses_precomputed_label() {
         // Features path: the label computed during feature resolution (base +
@@ -2391,7 +2419,7 @@ mod tests {
         let config = serde_json::json!({ "remoteUser": "node" });
         let label = compose_metadata_label(
             Some(precomputed),
-            &config,
+            &resolved_with(config.clone(), config),
             Some(r#"[{"id":"base"}]"#),
             false,
         );
@@ -2404,7 +2432,12 @@ mod tests {
         // entry appended -- matching official getDevcontainerMetadata.
         let base = r#"[{"id":"ghcr.io/base/feat:1"}]"#;
         let config = serde_json::json!({ "remoteUser": "vscode" });
-        let label = compose_metadata_label(None, &config, Some(base), false);
+        let label = compose_metadata_label(
+            None,
+            &resolved_with(config.clone(), config.clone()),
+            Some(base),
+            false,
+        );
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(&label).expect("metadata label is a JSON array");
         assert_eq!(parsed.len(), 2, "base entry + config entry: {label}");
@@ -2415,7 +2448,12 @@ mod tests {
     #[test]
     fn compose_metadata_label_no_features_no_base_is_config_only() {
         let config = serde_json::json!({ "remoteUser": "vscode" });
-        let label = compose_metadata_label(None, &config, None, false);
+        let label = compose_metadata_label(
+            None,
+            &resolved_with(config.clone(), config.clone()),
+            None,
+            false,
+        );
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(&label).expect("metadata label is a JSON array");
         assert_eq!(parsed, vec![config]);

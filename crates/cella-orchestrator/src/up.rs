@@ -1059,33 +1059,15 @@ impl EnsureUpContext<'_> {
             );
         }
 
-        if let Some(rf) = resolved_features {
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                rf.metadata_label.clone(),
-            );
-        } else if let Some(existing) = base_metadata {
-            // The base image already carries a devcontainer.metadata label
-            // (either from a prebuilt image or from the Dockerfile build that
-            // embedded it via --label). Re-use it directly instead of
-            // regenerating, which would duplicate entries.
-            labels.insert("devcontainer.metadata".to_string(), existing.to_string());
-        } else {
-            // No features and no base image metadata -- generate from config.
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                cella_features::generate_metadata_label(
-                    &[],
-                    &self.config.resolved.raw_config,
-                    None,
-                    cella_features::MetadataOmit {
-                        remote_env: self.config.metadata_options.omit_remote_env,
-                        // up never strips feature customizations.
-                        feature_customizations: false,
-                    },
-                ),
-            );
-        }
+        labels.insert(
+            "devcontainer.metadata".to_string(),
+            container_metadata_label(
+                self.config.resolved,
+                resolved_features,
+                base_metadata,
+                self.config.metadata_options.omit_remote_env,
+            ),
+        );
 
         let ports_attrs = crate::config_map::ports::parse_ports_attributes(config);
         let other_ports_attrs = crate::config_map::ports::parse_other_ports_attributes(config);
@@ -2654,6 +2636,35 @@ fn spec_identity_labels(
             lexical_absolute(config_path).to_string_lossy()
         ),
     ]
+}
+
+/// The `devcontainer.metadata` label for a new container.
+///
+/// The features label when features were resolved, else the base image's own
+/// label (the Dockerfile build already embedded it, so regenerating would
+/// duplicate entries), else one generated from the pre-substitution config.
+fn container_metadata_label(
+    resolved: &cella_config::devcontainer::resolve::ResolvedConfig,
+    resolved_features: Option<&cella_features::ResolvedFeatures>,
+    base_metadata: Option<&str>,
+    omit_remote_env: bool,
+) -> String {
+    if let Some(rf) = resolved_features {
+        return rf.metadata_label.clone();
+    }
+    if let Some(existing) = base_metadata {
+        return existing.to_string();
+    }
+    cella_features::generate_metadata_label(
+        &[],
+        &resolved.raw_config,
+        None,
+        cella_features::MetadataOmit {
+            remote_env: omit_remote_env,
+            // up never strips feature customizations.
+            feature_customizations: false,
+        },
+    )
 }
 
 /// Resolve `remoteEnv` to a `KEY=value` vec for lifecycle command injection.
