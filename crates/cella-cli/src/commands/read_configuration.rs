@@ -344,13 +344,11 @@ pub async fn resolve_config_features(
 /// while other targets (e.g. `--container-id`) append the full config (incl
 /// lifecycle/customizations). A single-object label is normalised to one entry.
 ///
-/// The label's entries are substituted with `ctx` before the (already
-/// substituted) config is appended, so each value is substituted once.
-pub(super) fn build_merged_from_label(
+/// `label_json` must already be substituted; the (already substituted) config is appended as is, so each value is substituted once.
+pub(super) fn build_merged_from_substituted_label(
     config: &serde_json::Value,
     label_json: &str,
     has_id_labels: bool,
-    ctx: &SubstitutionContext,
 ) -> serde_json::Value {
     use cella_features::types::{FeatureMetadata, ResolvedFeature};
     use std::collections::HashMap;
@@ -359,9 +357,7 @@ pub(super) fn build_merged_from_label(
     // The baked metadata is normally a JSON array; some tooling/images emit a
     // single object instead — normalise it to a one-element array so its
     // metadata is not silently dropped.
-    let label_json =
-        cella_config::config_map::metadata_label::substitute_metadata_label(label_json, ctx);
-    let mut entries = cella_features::metadata_label_entries(&label_json);
+    let mut entries = cella_features::metadata_label_entries(label_json);
 
     // Append the current config last so it is authoritative (matches the official
     // `getImageMetadataFromContainer`). `--id-label` contributes only updateable
@@ -411,6 +407,20 @@ pub(super) fn build_merged_from_label(
     };
 
     build_merged_output(config, Some(&rf))
+}
+
+/// [`build_merged_from_substituted_label`] for a raw container label, whose entries are substituted with `ctx` first.
+fn build_merged_from_label(
+    config: &serde_json::Value,
+    label_json: &str,
+    has_id_labels: bool,
+    ctx: &SubstitutionContext,
+) -> serde_json::Value {
+    build_merged_from_substituted_label(
+        config,
+        &cella_config::config_map::metadata_label::substitute_metadata_label(label_json, ctx),
+        has_id_labels,
+    )
 }
 
 /// Pick a subset of object keys into a new JSON object (empty when none present).
@@ -1834,11 +1844,6 @@ mod tests {
         );
     }
 
-    /// A context that expands nothing these tests use.
-    fn no_subst() -> SubstitutionContext {
-        SubstitutionContext::local_env_only(HashMap::new())
-    }
-
     /// Label entries are substituted with the `configuration` context; the
     /// appended (already-substituted) config is not substituted again.
     #[test]
@@ -1870,7 +1875,7 @@ mod tests {
         // so its hook is authoritative and ordered after the feature's.
         let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
         let config = json!({"image": "ubuntu", "postCreateCommand": "echo dev"});
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
 
         assert_eq!(
             out["postCreateCommands"],
@@ -1896,7 +1901,7 @@ mod tests {
             }
         });
 
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         let cust = &out["customizations"];
 
         // vscode: feat-a contribution, feat-b contribution, devcontainer.json contribution.
@@ -1916,7 +1921,7 @@ mod tests {
         .to_string();
         let config = json!({"image": "ubuntu", "containerEnv": {"BASE": "1"}});
 
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         // All env vars from the label are merged into the output.
         assert_eq!(out["containerEnv"]["FOO"], json!("feat"));
         // Later entry in the label wins (last-wins semantics from parse_image_metadata).
@@ -1933,7 +1938,7 @@ mod tests {
             "image": "ubuntu",
             "postCreateCommand": "echo hi",
         });
-        let out = build_merged_from_label(&config, "", false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, "", false);
 
         // The current config's hook is present (appended as the sole entry).
         assert_eq!(out["postCreateCommands"], json!(["echo hi"]));
@@ -1946,7 +1951,7 @@ mod tests {
     fn merged_from_label_absent_label_yields_empty_array_keys() {
         // Absent label (empty string from unwrap_or_default in execute).
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, "", false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, "", false);
         // All plural lifecycle arrays present and empty.
         assert_eq!(out["onCreateCommands"], json!([]));
         assert_eq!(out["updateContentCommands"], json!([]));
@@ -1965,7 +1970,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["init"], json!(true));
         assert_eq!(out["privileged"], json!(false));
     }
@@ -1979,7 +1984,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         let cap_add = out["capAdd"].as_array().expect("capAdd must be present");
         // Deduplicated: SYS_PTRACE appears once.
         assert!(cap_add.contains(&json!("SYS_PTRACE")));
@@ -1995,7 +2000,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["entrypoints"], json!(["/init-feat.sh"]));
     }
 
@@ -2008,7 +2013,7 @@ mod tests {
             "workspaceFolder": "/workspace",
             "name": "my-dev",
         });
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["remoteUser"], json!("vscode"));
         assert_eq!(out["workspaceFolder"], json!("/workspace"));
         assert_eq!(out["name"], json!("my-dev"));
@@ -2020,7 +2025,7 @@ mod tests {
         // rather than an array; it must be normalised to one entry, not dropped.
         let label = json!({"id": "feat-a", "postCreateCommand": "echo obj"}).to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, false);
 
         assert_eq!(out["postCreateCommands"], json!(["echo obj"]));
     }
@@ -2032,7 +2037,7 @@ mod tests {
         // so the baked/feature hooks stand.
         let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
         let config = json!({"postCreateCommand": "echo dev", "remoteUser": "vscode"});
-        let out = build_merged_from_label(&config, &label, true, &no_subst());
+        let out = build_merged_from_substituted_label(&config, &label, true);
 
         // The current config's lifecycle is NOT appended on the id-label path.
         assert_eq!(out["postCreateCommands"], json!(["echo feat-a"]));

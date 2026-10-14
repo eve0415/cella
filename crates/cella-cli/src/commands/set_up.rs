@@ -239,16 +239,11 @@ impl SetUpArgs {
             result?;
         }
 
-        Ok(self.success_envelope(&config, raw_metadata.as_deref(), &label_ctx))
+        Ok(self.success_envelope(&config, metadata.as_deref()))
     }
 
     /// Render the success envelope with the requested result sections.
-    fn success_envelope(
-        &self,
-        config: &Value,
-        raw_metadata: Option<&str>,
-        label_ctx: &SubstitutionContext,
-    ) -> String {
+    fn success_envelope(&self, config: &Value, metadata: Option<&str>) -> String {
         let mut envelope = json!({ "outcome": "success" });
 
         if self.result.include_configuration {
@@ -259,16 +254,12 @@ impl SetUpArgs {
             // `read-configuration`) so the shape matches `up`/`read-configuration`:
             // plural lifecycle arrays + Record-of-arrays customizations.
             //
-            // Use the RAW label, not `effective_metadata`: `build_merged_from_label`
-            // appends the current config itself (in full, since set-up targets by
-            // container-id → `has_id_labels = false`), and `effective_metadata`
-            // has already appended the config's picked lifecycle hooks — passing
-            // it would duplicate them in the plural arrays.
-            let merged = raw_metadata.map_or_else(
+            // Use the substituted label, not `effective_metadata`: the merge appends the current config itself (in full, since set-up targets by container-id → `has_id_labels = false`), and `effective_metadata` has already appended the config's picked lifecycle hooks — passing it would duplicate them in the plural arrays.
+            let merged = metadata.map_or_else(
                 || config.clone(),
                 |meta| {
-                    super::read_configuration::build_merged_from_label(
-                        config, meta, false, label_ctx,
+                    super::read_configuration::build_merged_from_substituted_label(
+                        config, meta, false,
                     )
                 },
             );
