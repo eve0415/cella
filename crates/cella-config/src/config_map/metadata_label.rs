@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use cella_backend::names::{CONFIG_FILE_LABEL, LOCAL_FOLDER_LABEL};
+use cella_features::{FeatureContainerConfig, ImageMetadataUserInfo};
 
 use crate::devcontainer::subst::SubstitutionContext;
 
@@ -43,6 +44,18 @@ fn substitute_entry(entry: &mut serde_json::Value, ctx: &SubstitutionContext) {
             ctx.substitute_value(value);
         }
     }
+}
+
+/// Parse a `devcontainer.metadata` label after substituting its entries with
+/// [`substitute_metadata_label`].
+///
+/// For readers whose result is not substituted again downstream.
+#[must_use]
+pub fn parse_substituted_metadata(
+    label: &str,
+    ctx: &SubstitutionContext,
+) -> (FeatureContainerConfig, ImageMetadataUserInfo) {
+    cella_features::parse_image_metadata(&substitute_metadata_label(label, ctx))
 }
 
 /// Build the [`SubstitutionContext`] for a container when no devcontainer
@@ -133,6 +146,36 @@ mod tests {
     #[test]
     fn invalid_label_is_returned_unchanged() {
         assert_eq!(substitute_metadata_label("not json", &ctx()), "not json");
+    }
+
+    #[test]
+    fn parse_substituted_metadata_substitutes_users_and_collections() {
+        let label = json!([{
+            "remoteUser": concat!("${localEnv", ":X}"),
+            "containerEnv": {"ID": concat!("${devcontainerId", "}")},
+            "mounts": [concat!("source=${localEnv", ":X},target=/x,type=volume")],
+        }])
+        .to_string();
+        let (config, user) = parse_substituted_metadata(&label, &ctx());
+        assert_eq!(user.remote_user.as_deref(), Some("hello"));
+        assert_eq!(
+            config.container_env.get("ID").map(String::as_str),
+            Some("the-id")
+        );
+        assert_eq!(config.mounts, vec!["source=hello,target=/x,type=volume"]);
+    }
+
+    /// Substitution is a single pass: an env value that itself looks like a
+    /// variable stays literal.
+    #[test]
+    fn parse_substituted_metadata_does_not_rescan_values() {
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let env = HashMap::from([("X".to_string(), literal.to_string())]);
+        let ctx = SubstitutionContext::new(Path::new("/projects/app"), None, "id", env);
+        let label =
+            json!([{"mounts": [concat!("source=${localEnv", ":X},target=/x")]}]).to_string();
+        let (config, _) = parse_substituted_metadata(&label, &ctx);
+        assert_eq!(config.mounts, vec![format!("source={literal},target=/x")]);
     }
 
     #[test]

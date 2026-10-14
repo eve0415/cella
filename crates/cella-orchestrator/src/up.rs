@@ -225,10 +225,11 @@ impl EnsureUpContext<'_> {
             return u.to_string();
         }
 
+        let subst = crate::subst_ctx(self.config.resolved);
         let meta_user = container
             .labels
             .get("devcontainer.metadata")
-            .map(|m| cella_features::parse_image_metadata(m).1);
+            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, &subst).1);
         if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
             return u.to_string();
         }
@@ -1655,10 +1656,10 @@ impl EnsureUpContext<'_> {
     ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
         let image_env = base_image_details.env;
-        let image_meta_user = base_image_details
-            .metadata
-            .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
+        let subst_ctx = crate::subst_ctx(self.config.resolved);
+        let image_meta_user = base_image_details.metadata.as_deref().map(|m| {
+            crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx).1
+        });
         let remote_user = crate::container_setup::resolve_remote_user(
             config,
             image_meta_user.as_ref(),
@@ -1691,14 +1692,12 @@ impl EnsureUpContext<'_> {
             crate::credential_protect::add_protect_label(&mut labels, self.config.container_name);
         }
 
-        let subst_ctx = crate::subst_ctx(self.config.resolved);
         let substituted_feature_config = resolved_features.map(|r| {
             crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
         });
         let image_meta_config = if substituted_feature_config.is_none() {
             base_image_details.metadata.as_deref().map(|m| {
-                let cfg = cella_features::parse_image_metadata(m).0;
-                crate::config_map::substitute_feature_config(cfg, &subst_ctx)
+                crate::config_map::metadata_label::parse_substituted_metadata(m, &subst_ctx).0
             })
         } else {
             None

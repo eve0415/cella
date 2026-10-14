@@ -506,6 +506,7 @@ async fn resolve_user_and_env(
 ) -> ComposeRuntimeResolution {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     let (image_user, image_meta_user, base_image_security, base_metadata) =
         resolve_compose_image_info(
             client,
@@ -513,6 +514,7 @@ async fn resolve_user_and_env(
             features_build,
             cfg.docker_binaries(),
             progress,
+            &subst_ctx,
         )
         .await;
     // Runtime security props: prefer the resolved-features config; fall back to
@@ -528,12 +530,17 @@ async fn resolve_user_and_env(
     // Feature entrypoints (install order), `${devcontainerId}`-substituted, from
     // the same merged config the security props use. Empty when no feature (or
     // base-image-metadata feature) declares an entrypoint, in which case the
-    // wrapped entrypoint is skipped unless `overrideCommand` is set.
+    // wrapped entrypoint is skipped unless `overrideCommand` is set. The
+    // base-image fallback was parsed from an already-substituted label.
     let feature_entrypoints = effective_feature_config
         .as_ref()
         .map(|fc| {
-            let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
-            cella_config::config_map::substitute_feature_config(fc.clone(), &subst_ctx).entrypoints
+            if features_build.is_some() {
+                cella_config::config_map::substitute_feature_config(fc.clone(), &subst_ctx)
+                    .entrypoints
+            } else {
+                fc.entrypoints.clone()
+            }
         })
         .unwrap_or_default();
     // Merged `devcontainer.metadata` label: the features path reuses the label
@@ -1118,6 +1125,7 @@ async fn resolve_compose_image_info(
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     docker_binaries: (Option<String>, Option<String>),
     progress: &ProgressSender,
+    subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
 ) -> (
     String,
     Option<cella_features::ImageMetadataUserInfo>,
@@ -1126,10 +1134,9 @@ async fn resolve_compose_image_info(
 ) {
     // If features resolved an image, its metadata was already extracted.
     if let Some(fb) = features_build {
-        let meta_user = fb
-            .base_image_metadata
-            .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
+        let meta_user = fb.base_image_metadata.as_deref().map(|m| {
+            cella_config::config_map::metadata_label::parse_substituted_metadata(m, subst_ctx).1
+        });
         return (
             fb.image_user.clone(),
             meta_user,
@@ -1176,9 +1183,12 @@ async fn resolve_compose_image_info(
     match client.inspect_image_details(&image_name).await {
         Ok(details) => match details.metadata {
             // Keep the raw label string for the merged metadata label; the parsed
-            // form only carries security/user props.
+            // (substituted) form only carries security/user props and entrypoints.
             Some(meta) => {
-                let (cfg, user) = cella_features::parse_image_metadata(&meta);
+                let (cfg, user) =
+                    cella_config::config_map::metadata_label::parse_substituted_metadata(
+                        &meta, subst_ctx,
+                    );
                 (details.user, Some(user), Some(cfg), Some(meta))
             }
             None => (details.user, None, None, None),
