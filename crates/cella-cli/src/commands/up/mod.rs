@@ -815,10 +815,12 @@ fn resolved_from_container(
     nominal_root: &Path,
     options: &resolve::ResolveOptions,
 ) -> ResolvedConfig {
-    let mut config = container
+    let mut raw_config = container
         .labels
         .get("devcontainer.metadata")
         .map_or_else(|| json!({}), |m| config_from_metadata_label(m));
+    inject_skip_workspace_mount(&mut raw_config);
+    let mut config = raw_config.clone();
     let container_workspace_folder = config
         .get("workspaceFolder")
         .and_then(serde_json::Value::as_str)
@@ -837,14 +839,13 @@ fn resolved_from_container(
         std::env::vars(),
     );
     ctx.substitute_value(&mut config);
-    inject_skip_workspace_mount(&mut config);
 
     let config_path = container.labels.get("dev.cella.config_path").map_or_else(
         || nominal_root.join(".devcontainer/devcontainer.json"),
         PathBuf::from,
     );
 
-    resolve::from_config_value(config, nominal_root, config_path, options)
+    resolve::from_config_value(config, raw_config, nominal_root, config_path, options)
 }
 
 /// The resolve-time inputs for an `up` invocation. With no workspace there is
@@ -889,6 +890,7 @@ impl UpContext {
 
         if no_workspace {
             inject_skip_workspace_mount(&mut resolved.config);
+            inject_skip_workspace_mount(&mut resolved.raw_config);
         }
 
         for w in &resolved.warnings {
@@ -899,7 +901,7 @@ impl UpContext {
         // wins on collision). This flows into the image cache digest and
         // feature resolution, so the feature set and cache key both reflect it.
         if let Some(ref additional) = args.config_inputs.additional_features {
-            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+            super::features::resolve::merge_additional_features_resolved(&mut resolved, additional)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
@@ -3363,6 +3365,7 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env,
+            raw_config: serde_json::json!({}),
             default_container_workspace_folder: None,
         }
     }

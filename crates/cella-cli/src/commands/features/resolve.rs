@@ -80,6 +80,20 @@ pub fn extract_features(config: &serde_json::Value) -> Vec<(String, serde_json::
         .collect()
 }
 
+/// [`merge_additional_features`] into both the substituted config and its
+/// pre-substitution snapshot, so the persisted metadata label keeps them too.
+///
+/// # Errors
+///
+/// As [`merge_additional_features`].
+pub fn merge_additional_features_resolved(
+    resolved: &mut cella_config::devcontainer::resolve::ResolvedConfig,
+    additional_json: &str,
+) -> Result<(), String> {
+    merge_additional_features(&mut resolved.config, additional_json)?;
+    merge_additional_features(&mut resolved.raw_config, additional_json)
+}
+
 /// Merge `--additional-features` JSON into the config's `features` map.
 ///
 /// Config features win on key collision: an additional feature is added only
@@ -247,6 +261,24 @@ mod tests {
         assert_eq!(features["ghcr.io/x/foo:1"]["a"], serde_json::json!(1));
         // Non-colliding additional feature appended.
         assert!(features.contains_key("ghcr.io/x/bar:1"));
+    }
+
+    #[test]
+    fn merge_additional_features_resolved_updates_raw_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devcontainer.json"), r#"{"image": "ubuntu"}"#).unwrap();
+        let mut resolved = cella_config::devcontainer::resolve::config(tmp.path(), None).unwrap();
+        merge_additional_features_resolved(&mut resolved, r#"{"ghcr.io/x/node:1": {}}"#).unwrap();
+        for config in [&resolved.config, &resolved.raw_config] {
+            assert!(
+                config["features"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("ghcr.io/x/node:1")
+            );
+        }
     }
 
     #[test]

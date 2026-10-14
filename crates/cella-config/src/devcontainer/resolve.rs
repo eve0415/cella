@@ -38,6 +38,12 @@ pub struct ResolvedConfig {
     /// `remoteEnv` to resolve against the actual running container.  `None`
     /// when the merged config has no `remoteEnv` key.
     pub raw_remote_env: Option<serde_json::Value>,
+    /// The merged config before variable substitution.
+    ///
+    /// Persisted in the `devcontainer.metadata` label so the label records the
+    /// variables rather than host values substituted into them (matching the
+    /// official CLI, which stores the raw config).
+    pub raw_config: serde_json::Value,
     /// The caller's default `${containerWorkspaceFolder}` for a config with no
     /// `workspaceFolder` (see [`ResolveOptions`]). Always `None` for Compose
     /// configs, which must set `workspaceFolder` themselves.
@@ -329,6 +335,7 @@ pub fn config_with_override(
     // can perform a second pass after userEnvProbe, resolving
     // ${containerEnv:VAR} against the live container environment.
     let raw_remote_env = config.get("remoteEnv").cloned();
+    let raw_config = config.clone();
 
     ctx.substitute_value(&mut config);
 
@@ -370,6 +377,7 @@ pub fn config_with_override(
         warnings,
         typed,
         raw_remote_env,
+        raw_config,
         default_container_workspace_folder: default_wf,
     })
 }
@@ -384,10 +392,11 @@ pub fn config_with_override(
 /// [`config_with_override`]; `workspace_root` is the nominal cwd and
 /// `config_path` the recorded (not-necessarily-existing) path. `config` is
 /// taken as already substituted: the caller substitutes it with a context
-/// matching where it came from.
+/// matching where it came from, and passes the pre-substitution `raw_config`.
 #[must_use]
 pub fn from_config_value(
     config: serde_json::Value,
+    raw_config: serde_json::Value,
     workspace_root: &Path,
     config_path: PathBuf,
     options: &ResolveOptions,
@@ -409,6 +418,7 @@ pub fn from_config_value(
         // The caller substituted `config` before handing it over, so no raw
         // snapshot is available for a second-pass containerEnv resolution.
         raw_remote_env: None,
+        raw_config,
         default_container_workspace_folder: default_wf,
     }
 }
@@ -502,6 +512,7 @@ mod tests {
     fn from_config_value_computes_hash_and_id() {
         let cfg = serde_json::json!({"image": "ubuntu", "workspaceMount": ""});
         let resolved = from_config_value(
+            cfg.clone(),
             cfg,
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
@@ -527,6 +538,7 @@ mod tests {
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
         let from_file = config(tmp.path(), None).unwrap();
         let from_value = from_config_value(
+            serde_json::json!({"image": "ubuntu"}),
             serde_json::json!({"image": "ubuntu"}),
             tmp.path(),
             from_file.config_path.clone(),
@@ -917,6 +929,7 @@ mod tests {
         let options = id_label_options();
         let resolved = from_config_value(
             serde_json::json!({"image": "ubuntu"}),
+            serde_json::json!({"image": "ubuntu"}),
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
             &options,
@@ -1016,6 +1029,7 @@ mod tests {
     fn from_config_value_keeps_default_container_workspace_folder() {
         let resolved = from_config_value(
             serde_json::json!({"image": "ubuntu"}),
+            serde_json::json!({"image": "ubuntu"}),
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
             &default_folder_options("/workspaces/repo/cwd"),
@@ -1025,6 +1039,26 @@ mod tests {
             ctx.substitute_str(concat!("${containerWorkspaceFolder", "}")),
             "/workspaces/repo/cwd"
         );
+    }
+
+    /// The raw snapshot keeps variables; the substituted config does not.
+    #[test]
+    fn raw_config_keeps_variables_before_substitution() {
+        let tmp = TempDir::new().unwrap();
+        let token = concat!("${localEnv", ":CELLA_TEST_SURELY_UNSET_VAR:xyz}");
+        create_devcontainer(
+            tmp.path(),
+            &serde_json::json!({
+                "build": {"dockerfile": "Dockerfile", "args": {"TOKEN": token}},
+                "containerEnv": {"TOKEN": token},
+            })
+            .to_string(),
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        assert_eq!(resolved.config["containerEnv"]["TOKEN"], "xyz");
+        assert_eq!(resolved.config["build"]["args"]["TOKEN"], "xyz");
+        assert_eq!(resolved.raw_config["containerEnv"]["TOKEN"], token);
+        assert_eq!(resolved.raw_config["build"]["args"]["TOKEN"], token);
     }
 
     #[test]

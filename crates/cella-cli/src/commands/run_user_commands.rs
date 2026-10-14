@@ -646,6 +646,7 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env: raw,
+            raw_config: json!({}),
             default_container_workspace_folder: None,
         }
     }

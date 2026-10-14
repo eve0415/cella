@@ -2239,6 +2239,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
+            raw_config: config.clone(),
             default_container_workspace_folder: None,
         };
         let cfg = ComposeUpConfig {
@@ -2308,6 +2309,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
+            raw_config: config.clone(),
             default_container_workspace_folder: None,
         };
         let cfg = ComposeUpConfig {

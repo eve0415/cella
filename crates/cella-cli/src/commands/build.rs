@@ -245,7 +245,7 @@ impl BuildArgs {
         // compose/single-container split, so both paths build the added features
         // (the official CLI applies --additional-features to both).
         if let Some(ref additional) = self.additional_features {
-            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+            super::features::resolve::merge_additional_features_resolved(&mut resolved, additional)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
