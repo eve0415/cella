@@ -83,4 +83,44 @@ mod tests {
         assert_eq!(layout.host_mount_folder, app);
         assert_eq!(layout.container_workspace_folder, "/workspaces/app");
     }
+
+    /// A workspace in a git subdirectory resolves `${containerWorkspaceFolder}`
+    /// to where the git-root mount actually puts it.
+    #[test]
+    fn git_subdirectory_workspace_resolves_container_workspace_folder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let app = repo.join("packages/app");
+        std::fs::create_dir_all(app.join(".devcontainer")).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(
+            app.join(".devcontainer/devcontainer.json"),
+            concat!(
+                r#"{"image": "ubuntu", "mounts": ["source=x,target=${containerWorkspaceFolder"#,
+                r#"}/x,type=volume"]}"#
+            ),
+        )
+        .unwrap();
+
+        let layout = DefaultWorkspace::detect(&app, true);
+        assert_eq!(
+            layout.container_workspace_folder,
+            "/workspaces/repo/packages/app"
+        );
+        let options = cella_config::devcontainer::resolve::ResolveOptions {
+            default_container_workspace_folder: Some(layout.container_workspace_folder),
+        };
+        let resolved =
+            cella_config::devcontainer::resolve::config_with_override(&app, None, None, &options)
+                .unwrap();
+        assert_eq!(
+            resolved.config["mounts"][0],
+            "source=x,target=/workspaces/repo/packages/app/x,type=volume"
+        );
+    }
 }

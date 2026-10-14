@@ -304,6 +304,9 @@ fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverr
 }
 
 /// Build a [`SubstitutionContext`] from a resolved devcontainer config.
+///
+/// `${containerWorkspaceFolder}` is the config's `workspaceFolder`, else the
+/// default the config was resolved with, matching the resolve-time context.
 pub fn subst_ctx(
     resolved: &crate::devcontainer::resolve::ResolvedConfig,
 ) -> crate::devcontainer::subst::SubstitutionContext {
@@ -312,7 +315,8 @@ pub fn subst_ctx(
         resolved
             .config
             .get("workspaceFolder")
-            .and_then(|v| v.as_str()),
+            .and_then(|v| v.as_str())
+            .or(resolved.default_container_workspace_folder.as_deref()),
         &resolved.devcontainer_id,
         std::env::vars().collect(),
     )

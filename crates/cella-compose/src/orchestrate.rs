@@ -2229,6 +2229,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
+            default_container_workspace_folder: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,
@@ -2297,6 +2298,7 @@ mod tests {
             warnings: vec![],
             typed: None,
             raw_remote_env: None,
+            default_container_workspace_folder: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,

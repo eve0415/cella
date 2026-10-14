@@ -144,6 +144,7 @@ mod tests {
             warnings: vec![],
             typed,
             raw_remote_env: None,
+            default_container_workspace_folder: None,
         }
     }
 

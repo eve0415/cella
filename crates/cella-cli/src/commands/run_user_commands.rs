@@ -29,6 +29,7 @@ use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
+use super::default_workspace::DefaultWorkspace;
 use super::up::{map_env_object, parse_secrets_file};
 use super::{LogFormat, LogLevel};
 use crate::backend::BackendArgs;
@@ -148,8 +149,9 @@ pub struct CompatArgs {
     #[arg(long = "user-data-folder")]
     user_data_folder: Option<PathBuf>,
 
-    /// Mount the workspace using its Git root (compatibility no-op, default
-    /// `true`). Accepts the official yargs boolean forms: bare, explicit
+    /// Mount the workspace using its Git root (default `true`); decides the
+    /// default `${containerWorkspaceFolder}` for `--config`. Accepts the
+    /// official yargs boolean forms: bare, explicit
     /// (`--mount-workspace-git-root false`), and absent (defaults to `true`).
     #[arg(
         long = "mount-workspace-git-root",
@@ -378,7 +380,16 @@ impl RunUserCommandsArgs {
             .map(std::path::Path::to_path_buf)
             .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        Ok(Some(resolve::config(&ws, Some(config_path))?))
+        let default_workspace = DefaultWorkspace::detect(&ws, self.compat.mount_workspace_git_root);
+        let options = resolve::ResolveOptions {
+            default_container_workspace_folder: Some(default_workspace.container_workspace_folder),
+        };
+        Ok(Some(resolve::config_with_override(
+            &ws,
+            Some(config_path),
+            None,
+            &options,
+        )?))
     }
 
     /// Probe the user environment and build the lifecycle env with the official
@@ -559,6 +570,7 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env: raw,
+            default_container_workspace_folder: None,
         }
     }
 

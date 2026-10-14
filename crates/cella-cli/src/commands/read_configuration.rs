@@ -116,7 +116,13 @@ impl ReadConfigurationArgs {
         // is false. Compose configs ignore this (no bind mount).
         let default_workspace =
             DefaultWorkspace::detect(&cwd, self.compat.mount_workspace_git_root);
-        let mut resolved = resolve::config(&cwd, config_path)?;
+        let resolve_options = resolve::ResolveOptions {
+            default_container_workspace_folder: Some(
+                default_workspace.container_workspace_folder.clone(),
+            ),
+        };
+        let mut resolved =
+            resolve::config_with_override(&cwd, config_path, None, &resolve_options)?;
 
         if let Some(ref additional) = self.additional_features {
             super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;

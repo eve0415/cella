@@ -38,6 +38,10 @@ pub struct ResolvedConfig {
     /// `remoteEnv` to resolve against the actual running container.  `None`
     /// when the merged config has no `remoteEnv` key.
     pub raw_remote_env: Option<serde_json::Value>,
+    /// The caller's default `${containerWorkspaceFolder}` for a config with no
+    /// `workspaceFolder` (see [`ResolveOptions`]). Always `None` for Compose
+    /// configs, which must set `workspaceFolder` themselves.
+    pub default_container_workspace_folder: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -114,6 +118,15 @@ impl ResolvedConfig {
                 .collect(),
         )
     }
+}
+
+/// Caller-supplied inputs to config resolution that the devcontainer config
+/// itself cannot provide.
+#[derive(Debug, Clone, Default)]
+pub struct ResolveOptions {
+    /// The in-container workspace folder cella mounts the workspace at, used
+    /// as `${containerWorkspaceFolder}` when `workspaceFolder` is unset.
+    pub default_container_workspace_folder: Option<String>,
 }
 
 /// Compute the spec-compliant `devcontainerId`.
@@ -193,7 +206,12 @@ pub fn config(
     workspace_root: &Path,
     config_path_override: Option<&Path>,
 ) -> Result<ResolvedConfig, CellaConfigError> {
-    config_with_override(workspace_root, config_path_override, None)
+    config_with_override(
+        workspace_root,
+        config_path_override,
+        None,
+        &ResolveOptions::default(),
+    )
 }
 
 /// Resolve config with `--override-config` semantics.
@@ -205,6 +223,8 @@ pub fn config(
 /// workspace-local layer merges are bypassed for single-document parity with
 /// the official CLI.
 ///
+/// `options` carries the caller's default container workspace folder.
+///
 /// # Errors
 ///
 /// Returns an error if the config file cannot be read or parsed.
@@ -212,6 +232,7 @@ pub fn config_with_override(
     workspace_root: &Path,
     config_path_override: Option<&Path>,
     override_config_file: Option<&Path>,
+    options: &ResolveOptions,
 ) -> Result<ResolvedConfig, CellaConfigError> {
     // A relative `--config` resolves against the cwd, matching the official
     // CLI's `path.resolve(process.cwd(), config)`.
@@ -268,30 +289,14 @@ pub fn config_with_override(
         }
     }
 
-    // Two-pass substitution: resolve workspaceFolder first so
-    // ${containerWorkspaceFolder} uses the substituted value everywhere else.
     let devcontainer_id = devcontainer_id(workspace_root, &config_path);
-    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let container_wf = config
-        .get("workspaceFolder")
-        .and_then(|v| v.as_str())
-        .map(|raw| {
-            if !raw.contains("${") {
-                return raw.to_string();
-            }
-            let pre_ctx = super::subst::SubstitutionContext::new(
-                workspace_root,
-                None,
-                &devcontainer_id,
-                env.clone(),
-            );
-            pre_ctx.substitute_str(raw)
-        });
-    let ctx = super::subst::SubstitutionContext::new(
+    let default_wf = default_container_workspace_folder(&config, options);
+    let ctx = substitution_context(
+        &config,
         workspace_root,
-        container_wf.as_deref(),
         &devcontainer_id,
-        env,
+        default_wf.as_deref(),
+        std::env::vars().collect(),
     );
 
     // Snapshot raw remoteEnv BEFORE phase-1 substitution so the orchestrator
@@ -339,6 +344,7 @@ pub fn config_with_override(
         warnings,
         typed,
         raw_remote_env,
+        default_container_workspace_folder: default_wf,
     })
 }
 
@@ -356,8 +362,10 @@ pub fn from_config_value(
     config: serde_json::Value,
     workspace_root: &Path,
     config_path: PathBuf,
+    options: &ResolveOptions,
 ) -> ResolvedConfig {
     let devcontainer_id = devcontainer_id(workspace_root, &config_path);
+    let default_wf = default_container_workspace_folder(&config, options);
     let canonical = serde_json::to_string(&config).unwrap_or_default();
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
     let typed = crate::schema::DevContainer::validate(&config, "").ok();
@@ -373,7 +381,56 @@ pub fn from_config_value(
         // Config sourced from a container label is already substituted — no
         // raw snapshot is available for a second-pass containerEnv resolution.
         raw_remote_env: None,
+        default_container_workspace_folder: default_wf,
     }
+}
+
+/// Build the context that substitutes a merged config.
+///
+/// Two-pass: `workspaceFolder` is resolved first so `${containerWorkspaceFolder}`
+/// uses its substituted value everywhere else; with no `workspaceFolder` the
+/// caller's default (if any) applies.
+fn substitution_context(
+    config: &serde_json::Value,
+    workspace_root: &Path,
+    devcontainer_id: &str,
+    default_wf: Option<&str>,
+    env: std::collections::HashMap<String, String>,
+) -> super::subst::SubstitutionContext {
+    let container_wf = config
+        .get("workspaceFolder")
+        .and_then(|v| v.as_str())
+        .map(|raw| {
+            if !raw.contains("${") {
+                return raw.to_string();
+            }
+            let pre_ctx = super::subst::SubstitutionContext::new(
+                workspace_root,
+                default_wf,
+                devcontainer_id,
+                env.clone(),
+            );
+            pre_ctx.substitute_str(raw)
+        })
+        .or_else(|| default_wf.map(String::from));
+    super::subst::SubstitutionContext::new(
+        workspace_root,
+        container_wf.as_deref(),
+        devcontainer_id,
+        env,
+    )
+}
+
+/// The caller's default container workspace folder, unless `config` is a
+/// Compose config (whose `workspaceFolder` is required, so no default applies).
+fn default_container_workspace_folder(
+    config: &serde_json::Value,
+    options: &ResolveOptions,
+) -> Option<String> {
+    if config.get("dockerComposeFile").is_some() {
+        return None;
+    }
+    options.default_container_workspace_folder.clone()
 }
 
 /// Read a JSONC file and return it as a `serde_json::Value`.
@@ -420,6 +477,7 @@ mod tests {
             cfg,
             Path::new("/cwd"),
             PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            &ResolveOptions::default(),
         );
         assert_eq!(resolved.config["image"], "ubuntu");
         assert_eq!(resolved.config["workspaceMount"], "");
@@ -444,6 +502,7 @@ mod tests {
             serde_json::json!({"image": "ubuntu"}),
             tmp.path(),
             from_file.config_path.clone(),
+            &ResolveOptions::default(),
         );
         assert_eq!(from_file.config_hash, from_value.config_hash);
     }
@@ -467,8 +526,13 @@ mod tests {
         let override_file = tmp.path().join("override.json");
         std::fs::write(&override_file, r#"{"image": "override-image"}"#).unwrap();
 
-        let resolved =
-            config_with_override(tmp.path(), None, Some(override_file.as_path())).unwrap();
+        let resolved = config_with_override(
+            tmp.path(),
+            None,
+            Some(override_file.as_path()),
+            &ResolveOptions::default(),
+        )
+        .unwrap();
 
         // Content comes from the override file.
         assert_eq!(resolved.config["image"], "override-image");
@@ -491,7 +555,13 @@ mod tests {
         // Content comes from the override file, so the relative `--config`
         // path never has to exist on disk.
         let rel = Path::new("sub/../.devcontainer/devcontainer.json");
-        let resolved = config_with_override(tmp.path(), Some(rel), Some(&override_file)).unwrap();
+        let resolved = config_with_override(
+            tmp.path(),
+            Some(rel),
+            Some(&override_file),
+            &ResolveOptions::default(),
+        )
+        .unwrap();
         assert!(resolved.config_path.is_absolute());
         assert_eq!(resolved.config_path, lexical_absolute(rel));
     }
@@ -503,8 +573,13 @@ mod tests {
         let override_file = tmp.path().join("over.json");
         std::fs::write(&override_file, r#"{"image": "only-override"}"#).unwrap();
 
-        let resolved =
-            config_with_override(tmp.path(), None, Some(override_file.as_path())).unwrap();
+        let resolved = config_with_override(
+            tmp.path(),
+            None,
+            Some(override_file.as_path()),
+            &ResolveOptions::default(),
+        )
+        .unwrap();
         assert_eq!(resolved.config["image"], "only-override");
     }
 
@@ -769,6 +844,112 @@ mod tests {
         assert!(
             mount.contains(&expected_target),
             "mount should contain substituted containerWorkspaceFolder, got: {mount}"
+        );
+    }
+
+    fn default_folder_options(folder: &str) -> ResolveOptions {
+        ResolveOptions {
+            default_container_workspace_folder: Some(folder.to_string()),
+        }
+    }
+
+    #[test]
+    fn default_container_workspace_folder_option_is_used_without_workspace_folder() {
+        let tmp = TempDir::new().unwrap();
+        let app = tmp.path().join("repo/packages/app");
+        create_devcontainer(
+            &app,
+            concat!(
+                r#"{"image": "ubuntu", "mounts": ["source=x,target=${containerWorkspaceFolder"#,
+                r#"}/x,type=volume"]}"#
+            ),
+        );
+        let resolved = config_with_override(
+            &app,
+            None,
+            None,
+            &default_folder_options("/workspaces/repo/packages/app"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config["mounts"][0],
+            "source=x,target=/workspaces/repo/packages/app/x,type=volume"
+        );
+        let ctx = crate::config_map::subst_ctx(&resolved);
+        assert_eq!(
+            ctx.substitute_str(concat!("${containerWorkspaceFolder", "}")),
+            "/workspaces/repo/packages/app"
+        );
+        assert_eq!(
+            ctx.substitute_str(concat!("${containerWorkspaceFolderBasename", "}")),
+            "app"
+        );
+    }
+
+    #[test]
+    fn explicit_workspace_folder_wins_over_default_option() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            concat!(
+                r#"{"image": "ubuntu", "workspaceFolder": "/src", "#,
+                r#""mounts": ["source=x,target=${containerWorkspaceFolder"#,
+                r#"},type=volume"]}"#
+            ),
+        );
+        let resolved = config_with_override(
+            tmp.path(),
+            None,
+            None,
+            &default_folder_options("/elsewhere"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config["mounts"][0],
+            "source=x,target=/src,type=volume"
+        );
+        let ctx = crate::config_map::subst_ctx(&resolved);
+        assert_eq!(
+            ctx.substitute_str(concat!("${containerWorkspaceFolder", "}")),
+            "/src"
+        );
+    }
+
+    #[test]
+    fn compose_config_ignores_default_container_workspace_folder() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            concat!(
+                r#"{"dockerComposeFile": "compose.yaml", "service": "app", "#,
+                r#""mounts": ["source=x,target=${containerWorkspaceFolder"#,
+                r#"},type=volume"]}"#
+            ),
+        );
+        let resolved = config_with_override(
+            tmp.path(),
+            None,
+            None,
+            &default_folder_options("/elsewhere"),
+        )
+        .unwrap();
+        assert!(resolved.default_container_workspace_folder.is_none());
+        let mount = resolved.config["mounts"][0].as_str().unwrap();
+        assert!(!mount.contains("/elsewhere"), "{mount}");
+    }
+
+    #[test]
+    fn from_config_value_keeps_default_container_workspace_folder() {
+        let resolved = from_config_value(
+            serde_json::json!({"image": "ubuntu"}),
+            Path::new("/cwd"),
+            PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+            &default_folder_options("/workspaces/repo/cwd"),
+        );
+        let ctx = crate::config_map::subst_ctx(&resolved);
+        assert_eq!(
+            ctx.substitute_str(concat!("${containerWorkspaceFolder", "}")),
+            "/workspaces/repo/cwd"
         );
     }
 

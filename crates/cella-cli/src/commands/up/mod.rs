@@ -823,7 +823,24 @@ fn resolved_from_container(
         PathBuf::from,
     );
 
-    resolve::from_config_value(config, nominal_root, config_path)
+    resolve::from_config_value(
+        config,
+        nominal_root,
+        config_path,
+        &resolve::ResolveOptions::default(),
+    )
+}
+
+/// The resolve-time inputs for an `up` invocation. With no workspace there is
+/// no workspace mount, so no default container workspace folder applies.
+fn up_resolve_options(
+    no_workspace: bool,
+    default_workspace: &DefaultWorkspace,
+) -> resolve::ResolveOptions {
+    resolve::ResolveOptions {
+        default_container_workspace_folder: (!no_workspace)
+            .then(|| default_workspace.container_workspace_folder.clone()),
+    }
 }
 
 impl UpContext {
@@ -835,6 +852,7 @@ impl UpContext {
         let no_workspace = no_workspace_requested(args);
         let default_workspace =
             DefaultWorkspace::detect(&cwd, args.mounts.mount_workspace_git_root);
+        let resolve_options = up_resolve_options(no_workspace, &default_workspace);
 
         // 1. Resolve config and connect to the backend. The no-workspace path
         // (official `dcspec.ts:155`) does not discover a devcontainer.json from
@@ -847,7 +865,7 @@ impl UpContext {
         let (mut resolved, client) = progress
             .run_step(
                 "Resolving devcontainer configuration...",
-                Self::resolve_no_workspace_config(args, &cwd, no_workspace),
+                Self::resolve_no_workspace_config(args, &cwd, no_workspace, &resolve_options),
             )
             .await?;
 
@@ -972,6 +990,7 @@ impl UpContext {
         args: &UpArgs,
         cwd: &Path,
         no_workspace: bool,
+        options: &resolve::ResolveOptions,
     ) -> Result<(ResolvedConfig, Box<dyn ContainerBackend>), Box<dyn std::error::Error + Send + Sync>>
     {
         let id_label_only = no_workspace && args.config_inputs.override_config.is_none();
@@ -1004,6 +1023,7 @@ impl UpContext {
             cwd,
             args.config.as_deref(),
             args.config_inputs.override_config.as_deref(),
+            options,
         )?;
         let client = args.backend.resolve_client().await?;
         client.ping().await?;
@@ -1027,10 +1047,15 @@ impl UpContext {
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
         let default_workspace = DefaultWorkspace::detect(&cwd, true);
+        let resolve_options = resolve::ResolveOptions {
+            default_container_workspace_folder: Some(
+                default_workspace.container_workspace_folder.clone(),
+            ),
+        };
 
         let resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
-                resolve::config(&cwd, None)
+                resolve::config_with_override(&cwd, None, None, &resolve_options)
             })
             .await?;
 
@@ -2007,7 +2032,13 @@ fn resolve_spec_identity_labels(
     override_config: Option<&Path>,
 ) -> Option<[String; 2]> {
     let cwd = crate::commands::resolve_workspace_folder(workspace_folder).ok()?;
-    let resolved = resolve::config_with_override(&cwd, config, override_config).ok()?;
+    let resolved = resolve::config_with_override(
+        &cwd,
+        config,
+        override_config,
+        &resolve::ResolveOptions::default(),
+    )
+    .ok()?;
     Some(spec_identity_labels(
         &resolved.workspace_root,
         &resolved.config_path,
@@ -3260,6 +3291,7 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env,
+            default_container_workspace_folder: None,
         }
     }
 
