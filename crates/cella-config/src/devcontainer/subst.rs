@@ -29,10 +29,9 @@ pub struct SubstitutionContext {
     devcontainer_id: String,
     /// Live container environment for `${containerEnv:VAR}` resolution.
     ///
-    /// Empty by default (config-parse time). Populated for the second-pass
-    /// `remoteEnv` resolution after `userEnvProbe` has captured the container's
-    /// actual env.
-    container_env: HashMap<String, String>,
+    /// `None` at config-parse time. Populated for the second-pass `remoteEnv`
+    /// resolution after `userEnvProbe` has captured the container's actual env.
+    container_env: Option<HashMap<String, String>>,
 }
 
 impl SubstitutionContext {
@@ -62,7 +61,7 @@ impl SubstitutionContext {
             local_workspace_folder_basename: basename,
             container_workspace_folder: container_wf,
             devcontainer_id: devcontainer_id.to_string(),
-            container_env: HashMap::new(),
+            container_env: None,
         }
     }
 
@@ -72,7 +71,7 @@ impl SubstitutionContext {
     /// `${devcontainerId}` and `${containerEnv:...}` expressions are left as
     /// their literal `${...}` text.
     #[must_use]
-    pub fn local_env_only(env: HashMap<String, String>) -> Self {
+    pub const fn local_env_only(env: HashMap<String, String>) -> Self {
         Self {
             scope: Scope::LocalEnvOnly,
             local_env: env,
@@ -80,7 +79,7 @@ impl SubstitutionContext {
             local_workspace_folder_basename: String::new(),
             container_workspace_folder: String::new(),
             devcontainer_id: String::new(),
-            container_env: HashMap::new(),
+            container_env: None,
         }
     }
 
@@ -91,7 +90,7 @@ impl SubstitutionContext {
     /// environment captured by `userEnvProbe`.
     #[must_use]
     pub fn with_container_env(mut self, container_env: HashMap<String, String>) -> Self {
-        self.container_env = container_env;
+        self.container_env = Some(container_env);
         self
     }
 
@@ -176,13 +175,27 @@ impl SubstitutionContext {
             .collect()
     }
 
+    /// Whether this context resolves `keyword`, or leaves it literal.
+    ///
+    /// A local-env-only context also resolves `${containerEnv:...}` once the
+    /// probed container env has been supplied.
+    fn resolves(&self, keyword: &str) -> bool {
+        match self.scope {
+            Scope::Full => true,
+            Scope::LocalEnvOnly => {
+                matches!(keyword, "localEnv" | "env")
+                    || (keyword == "containerEnv" && self.container_env.is_some())
+            }
+        }
+    }
+
     /// Resolve a single expression (the content between `${` and `}`).
     fn resolve_expr(&self, expr: &str) -> String {
         // Split into at most 3 parts: keyword, name, default
         let mut parts = expr.splitn(3, ':');
         let keyword = parts.next().unwrap_or("");
 
-        if self.scope == Scope::LocalEnvOnly && !matches!(keyword, "localEnv" | "env") {
+        if !self.resolves(keyword) {
             return format!("${{{expr}}}");
         }
 
@@ -203,10 +216,10 @@ impl SubstitutionContext {
                 let default = parts.next().unwrap_or("");
                 // When container_env is populated (second pass after container
                 // start), resolve against the live env. At config-parse time
-                // container_env is empty, so we fall through to `default` or ""
-                // — identical to today's behaviour.
+                // there is none, so we fall through to `default` or "".
                 self.container_env
-                    .get(var_name)
+                    .as_ref()
+                    .and_then(|env| env.get(var_name))
                     .map_or_else(|| default.to_string(), Clone::clone)
             }
             "localWorkspaceFolder" => self.local_workspace_folder.clone(),
@@ -240,7 +253,7 @@ mod tests {
             local_workspace_folder_basename: "myapp".to_string(),
             container_workspace_folder: "/workspaces/myapp".to_string(),
             devcontainer_id: "abc123".to_string(),
-            container_env: HashMap::new(),
+            container_env: None,
         }
     }
 
@@ -659,6 +672,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_env_only_resolves_container_env_once_probed() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let ctx = SubstitutionContext::local_env_only(HashMap::new()).with_container_env(cenv);
+        assert_eq!(ctx.substitute_str("${containerEnv:PATH}:/x"), "/usr/bin:/x");
+        assert_eq!(
+            ctx.substitute_str("${localWorkspaceFolder}"),
+            "${localWorkspaceFolder}"
+        );
+    }
+
     // --- with_container_env / substitute_remote_env tests ---
 
     fn ctx_with_container_env() -> SubstitutionContext {
@@ -677,7 +701,7 @@ mod tests {
             local_workspace_folder_basename: "myapp".to_string(),
             container_workspace_folder: "/workspaces/myapp".to_string(),
             devcontainer_id: "abc123".to_string(),
-            container_env: cenv,
+            container_env: Some(cenv),
         }
     }
 

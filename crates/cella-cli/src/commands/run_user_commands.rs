@@ -338,6 +338,7 @@ impl RunUserCommandsArgs {
                     config: &config,
                     resolved: resolved.as_ref(),
                     metadata: metadata.as_deref(),
+                    label_ctx: &label_ctx,
                 },
                 &secrets,
             )
@@ -433,6 +434,7 @@ impl RunUserCommandsArgs {
             config,
             resolved,
             metadata,
+            label_ctx,
         } = *sources;
         // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
         // --config wins (it's in pickUpdateableConfigProperties, appended last in
@@ -450,11 +452,14 @@ impl RunUserCommandsArgs {
 
         // Order the vec for merge_env's later-wins insert: probed first
         // (provided by merge_env), then CLI --remote-env, then metadata, then
-        // the on-disk config `remoteEnv` last so it wins. The config portion is
-        // resolved AFTER the probe so `${containerEnv:VAR}` resolves against the
-        // live container env (the baked metadata portion can't be un-collapsed).
+        // the on-disk config `remoteEnv` last so it wins. Both `remoteEnv`
+        // portions are resolved AFTER the probe so `${containerEnv:VAR}`
+        // resolves against the live container env.
         let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(metadata));
+        remote_env.extend(orchestrator::metadata_remote_env(
+            metadata,
+            &with_probed_env(label_ctx, probed.as_ref()),
+        ));
         remote_env.extend(resolve_config_remote_env(config, resolved, probed.as_ref()));
 
         let mut lifecycle_env = probed.as_ref().map_or_else(
@@ -492,12 +497,25 @@ impl RunUserCommandsArgs {
 
 /// The config sources `build_lifecycle_env` resolves `remoteEnv` from: the
 /// substituted on-disk config, the full resolved config (for the raw remoteEnv
-/// snapshot + substitution inputs), and the container's baked metadata label.
+/// snapshot + substitution inputs), the container's baked metadata label, and
+/// the context its (raw) `remoteEnv` is substituted with.
 #[derive(Clone, Copy)]
-struct LifecycleConfigSources<'a> {
-    config: &'a Value,
-    resolved: Option<&'a resolve::ResolvedConfig>,
-    metadata: Option<&'a str>,
+pub(super) struct LifecycleConfigSources<'a> {
+    pub(super) config: &'a Value,
+    pub(super) resolved: Option<&'a resolve::ResolvedConfig>,
+    pub(super) metadata: Option<&'a str>,
+    pub(super) label_ctx: &'a SubstitutionContext,
+}
+
+/// `ctx` with the probed container env attached, when the probe succeeded.
+pub(super) fn with_probed_env(
+    ctx: &SubstitutionContext,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> SubstitutionContext {
+    probed.map_or_else(
+        || ctx.clone(),
+        |p| ctx.clone().with_container_env(p.clone()),
+    )
 }
 
 /// Resolve the on-disk config `remoteEnv` into `K=V` strings, resolving live

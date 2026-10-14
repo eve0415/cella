@@ -33,7 +33,7 @@ use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
-use super::run_user_commands::{AttachArgs, CompatArgs};
+use super::run_user_commands::{AttachArgs, CompatArgs, LifecycleConfigSources, with_probed_env};
 use super::up::{map_env_object, parse_secrets_file};
 use crate::backend::BackendArgs;
 
@@ -153,16 +153,7 @@ impl SetUpArgs {
             .map_or_else(|| json!({}), |r| r.config.clone());
         let raw_metadata = container.labels.get("devcontainer.metadata").cloned();
 
-        // Warn early if the label is present but not valid JSON, regardless of
-        // which result flags are passed — don't silently drop it.
-        if let Some(raw) = raw_metadata.as_deref()
-            && serde_json::from_str::<Vec<Value>>(raw).is_err()
-        {
-            tracing::warn!(
-                "devcontainer.metadata label is not valid JSON, treating as empty: {}",
-                raw
-            );
-        }
+        warn_if_invalid_metadata(raw_metadata.as_deref());
 
         // Label entries are substituted with the `--config` context, or with
         // `${localEnv}` alone when there is no config (as the official CLI
@@ -196,8 +187,12 @@ impl SetUpArgs {
                     &*client,
                     &container.id,
                     &remote_user,
-                    &config,
-                    metadata.as_deref(),
+                    &LifecycleConfigSources {
+                        config: &config,
+                        resolved: resolved.as_ref(),
+                        metadata: metadata.as_deref(),
+                        label_ctx: &label_ctx,
+                    },
                     &secrets,
                 )
                 .await;
@@ -314,14 +309,15 @@ impl SetUpArgs {
         client: &dyn cella_backend::ContainerBackend,
         container_id: &str,
         remote_user: &str,
-        config: &Value,
-        metadata: Option<&str>,
+        sources: &LifecycleConfigSources<'_>,
         secrets: &[String],
     ) -> Vec<String> {
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(metadata));
-        remote_env.extend(map_env_object(config.get("remoteEnv")));
-
+        let LifecycleConfigSources {
+            config,
+            metadata,
+            label_ctx,
+            ..
+        } = *sources;
         let probe_type = config
             .get("userEnvProbe")
             .and_then(Value::as_str)
@@ -333,12 +329,34 @@ impl SetUpArgs {
         let probed =
             probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
 
+        // The metadata `remoteEnv` is resolved after the probe so
+        // `${containerEnv:VAR}` resolves against the live container env.
+        let mut remote_env = self.remote_env.clone();
+        remote_env.extend(orchestrator::metadata_remote_env(
+            metadata,
+            &with_probed_env(label_ctx, probed.as_ref()),
+        ));
+        remote_env.extend(map_env_object(config.get("remoteEnv")));
+
         let mut lifecycle_env = probed.as_ref().map_or_else(
             || remote_env.clone(),
             |p| cella_env::user_env_probe::merge_env(p, &remote_env),
         );
         lifecycle_env.extend_from_slice(secrets);
         lifecycle_env
+    }
+}
+
+/// Warn early if the label is present but not valid JSON, regardless of which
+/// result flags are passed — don't silently drop it.
+fn warn_if_invalid_metadata(raw: Option<&str>) {
+    if let Some(raw) = raw
+        && serde_json::from_str::<Vec<Value>>(raw).is_err()
+    {
+        tracing::warn!(
+            "devcontainer.metadata label is not valid JSON, treating as empty: {}",
+            raw
+        );
     }
 }
 

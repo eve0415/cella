@@ -48,6 +48,7 @@ use cella_backend::lifecycle::{
     write_lifecycle_state,
 };
 use cella_backend::progress::ProgressSender;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use serde_json::Value;
 
 use crate::dotfiles::install_dotfiles;
@@ -414,8 +415,11 @@ pub async fn resolve_remote_user(
 /// returned `name=value` list is ordered for `merge_env`'s later-wins `HashMap`
 /// insert, so callers append it AFTER `--remote-env` to get the official
 /// precedence (probed < `--remote-env` < merged `remoteEnv`).
+///
+/// The label keeps `remoteEnv` raw; values are substituted here with `ctx`,
+/// which carries the probed container env so `${containerEnv:VAR}` resolves.
 #[must_use]
-pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
+pub fn metadata_remote_env(metadata: Option<&str>, ctx: &SubstitutionContext) -> Vec<String> {
     let Some(json) = metadata else {
         return Vec::new();
     };
@@ -427,7 +431,7 @@ pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
         if let Some(obj) = entry.get("remoteEnv").and_then(Value::as_object) {
             for (k, v) in obj {
                 if let Some(s) = v.as_str() {
-                    acc.insert(k.clone(), s.to_string());
+                    acc.insert(k.clone(), ctx.substitute_str(s));
                 }
             }
         }
@@ -506,7 +510,7 @@ pub(crate) mod tests {
             {"id": "feature", "remoteEnv": {"B": "2", "C": "2"}}
         ])
         .to_string();
-        let env = metadata_remote_env(Some(&meta));
+        let env = metadata_remote_env(Some(&meta), &empty_ctx());
         assert!(env.contains(&"A=1".to_string()));
         assert!(env.contains(&"B=2".to_string())); // later entry wins
         assert!(env.contains(&"C=2".to_string()));
@@ -514,9 +518,33 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_remote_env_empty_without_label() {
-        assert!(metadata_remote_env(None).is_empty());
-        assert!(metadata_remote_env(Some("[]")).is_empty());
-        assert!(metadata_remote_env(Some("not json")).is_empty());
+        assert!(metadata_remote_env(None, &empty_ctx()).is_empty());
+        assert!(metadata_remote_env(Some("[]"), &empty_ctx()).is_empty());
+        assert!(metadata_remote_env(Some("not json"), &empty_ctx()).is_empty());
+    }
+
+    fn empty_ctx() -> SubstitutionContext {
+        SubstitutionContext::local_env_only(std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn metadata_remote_env_substitutes_values() {
+        let meta = json!([{"remoteEnv": {
+            "TOKEN": concat!("${localEnv", ":X}"),
+            "PATH": concat!("${containerEnv", ":PATH}:/extra"),
+        }}])
+        .to_string();
+        let ctx = SubstitutionContext::local_env_only(std::collections::HashMap::from([(
+            "X".to_string(),
+            "hi".to_string(),
+        )]))
+        .with_container_env(std::collections::HashMap::from([(
+            "PATH".to_string(),
+            "/usr/bin".to_string(),
+        )]));
+        let env = metadata_remote_env(Some(&meta), &ctx);
+        assert!(env.contains(&"TOKEN=hi".to_string()), "{env:?}");
+        assert!(env.contains(&"PATH=/usr/bin:/extra".to_string()), "{env:?}");
     }
 
     #[test]
