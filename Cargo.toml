@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.6"
+version = "0.10.0"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -45,7 +45,7 @@ rust-version = "1.98.1"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "=1.53.2", features = [
+tokio = { version = "=1.53.3", features = [
     "fs",
     "io-std",
     "io-util",
@@ -60,9 +60,9 @@ tokio = { version = "=1.53.2", features = [
 
 # Serialization
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 yaml_serde = "=0.10.7"
-toml = "=1.1.6"
+toml = "=1.1.8"
 
 # Encoding
 base64 = "=0.23.1"
@@ -144,13 +144,13 @@ jsonc-parser = { version = "=0.34.0", features = ["cst"] }
 
 # Certificate management
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["aws-lc-rs", "std"] }
-rustls-native-certs = "=0.8.4"
+rustls = { version = "=0.23.46", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-native-certs = "=0.8.5"
 tokio-rustls = "=0.26.6"
 tokio-stream = "=0.1.19"
 
 # HTTP proxy (MITM relay)
-hyper = { version = "=1.11.1", features = ["server", "client", "http1", "http2"] }
+hyper = { version = "=1.12.0", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "=0.1.5"
 
@@ -164,15 +164,15 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal", "te
 portable-pty = "=0.9.0"
 
 # Proc macros
-syn = { version = "=3.0.6", features = ["full"] }
+syn = { version = "=3.0.9", features = ["full"] }
 quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.27.0", features = ["v4"] }
+uuid = { version = "=1.28.0", features = ["v4"] }
 
 # Credential cache memory safety
-zeroize = "=1.9.0"
+zeroize = "=1.9.1"
 
 # Wayland clipboard server (cella-wayland)
 # wayland-backend's pure-Rust server is the default; `server_system` (libwayland)
@@ -193,7 +193,7 @@ wl-clipboard-rs = "=0.9.4"
 arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
 filetime = "=0.2.29"
 insta = { version = "=1.49.0", features = ["json", "yaml", "redactions"] }
-trybuild = "=1.0.121"
+trybuild = "=1.0.122"
 divan = "=0.1.21"
 
 # Internal crates
