@@ -6,6 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
+use super::default_workspace::DefaultWorkspace;
 use super::exec::spec_identity_labels;
 use super::{
     BuildKitMode, ComposePullPolicy, GpuAvailability, ImagePullPolicy, LogFormat, LogLevel,
@@ -544,24 +545,6 @@ pub fn parse_secrets_file(
     Ok(secrets)
 }
 
-pub fn compute_default_workspace_folder(workspace_root: &Path, host_mount_folder: &Path) -> String {
-    let mount_basename = host_mount_folder.file_name().map_or_else(
-        || "workspace".to_string(),
-        |n| n.to_string_lossy().to_string(),
-    );
-    let container_mount_folder = format!("/workspaces/{mount_basename}");
-    if host_mount_folder == workspace_root {
-        return container_mount_folder;
-    }
-    if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
-        let rel_posix = rel.to_string_lossy().replace('\\', "/");
-        if !rel_posix.is_empty() {
-            return format!("{container_mount_folder}/{rel_posix}");
-        }
-    }
-    container_mount_folder
-}
-
 use cella_orchestrator::NetworkRulePolicy;
 
 /// Resolved mount configuration for an `up` invocation.
@@ -805,7 +788,7 @@ fn inject_skip_workspace_mount(config: &mut serde_json::Value) {
 /// `workspaceFolder`, remote/container env) are lifted; the full lifecycle is
 /// re-read from the container by the orchestrator's reuse path.
 fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
-    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let entries = cella_features::metadata_label_entries(metadata_json);
     let mut merged = serde_json::Map::new();
     for entry in &entries {
         if let Some(obj) = entry.as_object() {
@@ -822,25 +805,74 @@ fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
 ///
 /// The config content comes from the container's `devcontainer.metadata` label
 /// (merged) with the workspace mount disabled; `workspace_root` is the nominal
-/// cwd (used for substitution/labels only). The recorded `config_path` is the
-/// container's `dev.cella.config_path` label when present, else a synthetic
-/// path under the nominal root.
+/// cwd (used for labels only). The label config is substituted with a context
+/// built from the container's own identity labels (`devcontainer.local_folder`
+/// / `devcontainer.config_file`, or the id labels), not from the cwd. The
+/// recorded `config_path` is the container's `dev.cella.config_path` label when
+/// present, else a synthetic path under the nominal root.
 fn resolved_from_container(
     container: &cella_backend::ContainerInfo,
     nominal_root: &Path,
+    options: &resolve::ResolveOptions,
 ) -> ResolvedConfig {
-    let mut config = container
+    let mut raw_config = container
         .labels
         .get("devcontainer.metadata")
         .map_or_else(|| json!({}), |m| config_from_metadata_label(m));
-    inject_skip_workspace_mount(&mut config);
+    inject_skip_workspace_mount(&mut raw_config);
+    let mut config = raw_config.clone();
+    let container_workspace_folder = config
+        .get("workspaceFolder")
+        .and_then(serde_json::Value::as_str)
+        .filter(|wf| !wf.contains("${"))
+        .or_else(|| {
+            container
+                .labels
+                .get("dev.cella.workspace_folder")
+                .map(String::as_str)
+        })
+        .map(String::from);
+    let ctx = cella_config::config_map::metadata_label::container_subst_ctx(
+        &container.labels,
+        options.id_labels.as_ref(),
+        container_workspace_folder.as_deref(),
+        std::env::vars(),
+    );
+    ctx.substitute_value(&mut config);
 
     let config_path = container.labels.get("dev.cella.config_path").map_or_else(
         || nominal_root.join(".devcontainer/devcontainer.json"),
         PathBuf::from,
     );
 
-    resolve::from_config_value(config, nominal_root, config_path)
+    // Carry the container's workspace folder so later substitution (the
+    // lifecycle context) agrees with the config.
+    let options = resolve::ResolveOptions {
+        default_container_workspace_folder: container_workspace_folder,
+        ..options.clone()
+    };
+    resolve::from_config_value(
+        config,
+        raw_config,
+        nominal_root,
+        config_path,
+        resolve::ContainerIdentity::from_labels(&container.labels),
+        &options,
+    )
+}
+
+/// The resolve-time inputs for an `up` invocation. With no workspace there is
+/// no workspace mount, so no default container workspace folder applies.
+fn up_resolve_options(
+    args: &UpArgs,
+    no_workspace: bool,
+    default_workspace: &DefaultWorkspace,
+) -> resolve::ResolveOptions {
+    resolve::ResolveOptions {
+        id_labels: crate::commands::id_label_map(&args.config_inputs.id_label),
+        default_container_workspace_folder: (!no_workspace)
+            .then(|| default_workspace.container_workspace_folder.clone()),
+    }
 }
 
 impl UpContext {
@@ -850,6 +882,9 @@ impl UpContext {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
         let no_workspace = no_workspace_requested(args);
+        let default_workspace =
+            DefaultWorkspace::detect(&cwd, args.mounts.mount_workspace_git_root);
+        let resolve_options = up_resolve_options(args, no_workspace, &default_workspace);
 
         // 1. Resolve config and connect to the backend. The no-workspace path
         // (official `dcspec.ts:155`) does not discover a devcontainer.json from
@@ -862,12 +897,13 @@ impl UpContext {
         let (mut resolved, client) = progress
             .run_step(
                 "Resolving devcontainer configuration...",
-                Self::resolve_no_workspace_config(args, &cwd, no_workspace),
+                Self::resolve_no_workspace_config(args, &cwd, no_workspace, &resolve_options),
             )
             .await?;
 
         if no_workspace {
             inject_skip_workspace_mount(&mut resolved.config);
+            inject_skip_workspace_mount(&mut resolved.raw_config);
         }
 
         for w in &resolved.warnings {
@@ -878,7 +914,7 @@ impl UpContext {
         // wins on collision). This flows into the image cache digest and
         // feature resolution, so the feature set and cache key both reflect it.
         if let Some(ref additional) = args.config_inputs.additional_features {
-            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+            super::features::resolve::merge_additional_features_resolved(&mut resolved, additional)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
@@ -891,12 +927,7 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let host_mount_folder = cella_git::find_git_root_folder(
-            &resolved.workspace_root,
-            args.mounts.mount_workspace_git_root,
-        );
-        let default_workspace_folder =
-            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
+        let default_workspace_folder = default_workspace.container_workspace_folder;
 
         let lifecycle_secrets = resolve_lifecycle_secrets(args)?;
 
@@ -992,6 +1023,7 @@ impl UpContext {
         args: &UpArgs,
         cwd: &Path,
         no_workspace: bool,
+        options: &resolve::ResolveOptions,
     ) -> Result<(ResolvedConfig, Box<dyn ContainerBackend>), Box<dyn std::error::Error + Send + Sync>>
     {
         let id_label_only = no_workspace && args.config_inputs.override_config.is_none();
@@ -1012,7 +1044,7 @@ impl UpContext {
             let Some(container) = found else {
                 return Err("No dev container config and no workspace found.".into());
             };
-            return Ok((resolved_from_container(&container, cwd), client));
+            return Ok((resolved_from_container(&container, cwd, options), client));
         }
 
         // Override-config and normal paths both go through `config_with_override`.
@@ -1024,6 +1056,7 @@ impl UpContext {
             cwd,
             args.config.as_deref(),
             args.config_inputs.override_config.as_deref(),
+            options,
         )?;
         let client = args.backend.resolve_client().await?;
         client.ping().await?;
@@ -1046,10 +1079,17 @@ impl UpContext {
         let cwd = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
+        let default_workspace = DefaultWorkspace::detect(&cwd, true);
+        let resolve_options = resolve::ResolveOptions {
+            default_container_workspace_folder: Some(
+                default_workspace.container_workspace_folder.clone(),
+            ),
+            ..resolve::ResolveOptions::default()
+        };
 
         let resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
-                resolve::config(&cwd, None)
+                resolve::config_with_override(&cwd, None, None, &resolve_options)
             })
             .await?;
 
@@ -1069,9 +1109,7 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let host_mount_folder = cella_git::find_git_root_folder(&resolved.workspace_root, true);
-        let default_workspace_folder =
-            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
+        let default_workspace_folder = default_workspace.container_workspace_folder;
 
         Ok(Self {
             resolved,
@@ -1843,13 +1881,8 @@ pub async fn populate_envelope_extras(
         // KNOWN GAP: merged shape diverges from official mergeConfiguration
         // (plural lifecycle arrays, customizations Record); tracked for a
         // follow-up.
-        result.merged_configuration = Some(
-            super::read_configuration::resolve_merged_config(
-                ctx.config(),
-                &ctx.resolved.config_path,
-            )
-            .await?,
-        );
+        result.merged_configuration =
+            Some(super::read_configuration::resolve_merged_config(&ctx.resolved).await?);
     }
     Ok(())
 }
@@ -2028,7 +2061,13 @@ fn resolve_spec_identity_labels(
     override_config: Option<&Path>,
 ) -> Option<[String; 2]> {
     let cwd = crate::commands::resolve_workspace_folder(workspace_folder).ok()?;
-    let resolved = resolve::config_with_override(&cwd, config, override_config).ok()?;
+    let resolved = resolve::config_with_override(
+        &cwd,
+        config,
+        override_config,
+        &resolve::ResolveOptions::default(),
+    )
+    .ok()?;
     Some(spec_identity_labels(
         &resolved.workspace_root,
         &resolved.config_path,
@@ -2457,21 +2496,8 @@ mod tests {
         assert_eq!(config_from_metadata_label("[]"), serde_json::json!({}));
     }
 
-    #[test]
-    fn resolved_from_container_skips_mount_and_reads_workspace_folder() {
-        let labels = [
-            (
-                "devcontainer.metadata".to_string(),
-                serde_json::json!([{"workspaceFolder": "/workspaces/app", "remoteUser": "vscode"}])
-                    .to_string(),
-            ),
-            (
-                "dev.cella.config_path".to_string(),
-                "/home/me/app/.devcontainer/devcontainer.json".to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect();
+    /// Resolve a config from a container carrying `labels`, with the nominal cwd `/cwd`.
+    fn resolved_from_labels(labels: std::collections::HashMap<String, String>) -> ResolvedConfig {
         let container = cella_backend::ContainerInfo {
             id: "abc".to_string(),
             name: "abc".to_string(),
@@ -2487,7 +2513,138 @@ mod tests {
             mounts: Vec::new(),
             backend: cella_backend::BackendKind::Docker,
         };
-        let resolved = resolved_from_container(&container, Path::new("/cwd"));
+        resolved_from_container(
+            &container,
+            Path::new("/cwd"),
+            &resolve::ResolveOptions::default(),
+        )
+    }
+
+    /// The label config is substituted with the found container's identity
+    /// (its `devcontainer.local_folder`), not the nominal cwd.
+    #[test]
+    fn resolved_from_container_substitutes_with_container_identity() {
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{
+                    "workspaceFolder": "/workspaces/app",
+                    "postCreateCommand": concat!("echo ${localWorkspaceFolder", "}"),
+                    "containerEnv": {"WS": concat!("${containerWorkspaceFolder", "}")},
+                }])
+                .to_string(),
+            ),
+            (
+                "devcontainer.local_folder".to_string(),
+                "/home/me/app".to_string(),
+            ),
+            (
+                "devcontainer.config_file".to_string(),
+                "/home/me/app/.devcontainer/devcontainer.json".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolved_from_labels(labels);
+        assert_eq!(resolved.config["postCreateCommand"], "echo /home/me/app");
+        assert_eq!(resolved.config["containerEnv"]["WS"], "/workspaces/app");
+        // The orchestrator substitutes the container label's lifecycle with
+        // this context; it must use the container's folder, not the cwd.
+        let ctx = cella_config::config_map::subst_ctx(&resolved);
+        assert_eq!(
+            ctx.substitute_str(concat!("${localWorkspaceFolder", "}")),
+            "/home/me/app"
+        );
+        assert_eq!(resolved.workspace_root, Path::new("/cwd"));
+    }
+
+    /// Without `workspaceFolder` in the label, the container's recorded
+    /// workspace folder drives `${containerWorkspaceFolder}` for both the config
+    /// and the lifecycle context.
+    #[test]
+    fn resolved_from_container_uses_recorded_workspace_folder() {
+        let wf = concat!("${containerWorkspaceFolder", "}");
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{"postCreateCommand": wf}]).to_string(),
+            ),
+            (
+                "devcontainer.local_folder".to_string(),
+                "/home/me/repo/packages/app".to_string(),
+            ),
+            (
+                "dev.cella.workspace_folder".to_string(),
+                "/workspaces/repo/packages/app".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolved_from_labels(labels);
+        assert_eq!(
+            resolved.config["postCreateCommand"],
+            "/workspaces/repo/packages/app"
+        );
+        assert_eq!(
+            cella_config::config_map::subst_ctx(&resolved).substitute_str(wf),
+            "/workspaces/repo/packages/app"
+        );
+    }
+
+    /// The label's raw `remoteEnv` survives for the post-probe pass, so
+    /// `${containerEnv:PATH}` resolves against the live container.
+    #[test]
+    fn resolved_from_container_resolves_container_env_after_probe() {
+        let labels = std::collections::HashMap::from([(
+            "devcontainer.metadata".to_string(),
+            serde_json::json!([{"remoteEnv": {"PATH": concat!("${containerEnv", ":PATH}:/x")}}])
+                .to_string(),
+        )]);
+        let resolved = resolved_from_labels(labels);
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/usr/bin".to_string())].into();
+        let env = build_lifecycle_env(&resolved, &[], &[], Some(&probed));
+        assert!(env.contains(&"PATH=/usr/bin:/x".to_string()), "{env:?}");
+    }
+
+    /// A single-object label (not an array) feeds both the config and the
+    /// container-label lifecycle on the id-label-only path.
+    #[test]
+    fn resolved_from_container_reads_single_object_label() {
+        let label = serde_json::json!({
+            "remoteEnv": {"FOO": "bar"},
+            "postAttachCommand": "echo attached",
+        })
+        .to_string();
+        let labels =
+            std::collections::HashMap::from([("devcontainer.metadata".to_string(), label.clone())]);
+        let resolved = resolved_from_labels(labels);
+        assert_eq!(resolved.config["remoteEnv"]["FOO"], "bar");
+        let entries = cella_backend::lifecycle::lifecycle_entries_for_phase(
+            Some(&label),
+            &resolved.config,
+            "postAttachCommand",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "echo attached");
+    }
+
+    #[test]
+    fn resolved_from_container_skips_mount_and_reads_workspace_folder() {
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{"workspaceFolder": "/workspaces/app", "remoteUser": "vscode"}])
+                    .to_string(),
+            ),
+            (
+                "dev.cella.config_path".to_string(),
+                "/home/me/app/.devcontainer/devcontainer.json".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolved_from_labels(labels);
         assert_eq!(
             resolved
                 .config
@@ -3281,6 +3438,9 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env,
+            raw_config: serde_json::json!({}),
+            container_identity: None,
+            default_container_workspace_folder: None,
         }
     }
 

@@ -15,5 +15,5 @@ mod validation;
 
 pub use devcontainer::merge_with_devcontainer;
 pub use feature::merge_features;
-pub use image_metadata::{ImageMetadataUserInfo, parse_image_metadata};
+pub use image_metadata::{ImageMetadataUserInfo, metadata_label_entries, parse_image_metadata};
 pub use validation::validate_options;

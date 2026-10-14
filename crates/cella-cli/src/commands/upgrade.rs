@@ -95,7 +95,9 @@ impl UpgradeArgs {
             base_image,
             image_user: "root",
             metadata: None,
+            metadata_user: None,
             omit: cella_features::MetadataOmit::default(),
+            label_config: &config_json,
         };
 
         let resolved = cella_features::resolve_features(

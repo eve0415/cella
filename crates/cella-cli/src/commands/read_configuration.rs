@@ -6,8 +6,10 @@ use serde_json::json;
 
 use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
 
+use super::default_workspace::DefaultWorkspace;
 use crate::backend::BackendArgs;
 
 /// Read and output the resolved devcontainer configuration.
@@ -68,7 +70,7 @@ impl ReadConfigurationArgs {
         // When targeting a running container, capture its `devcontainer.metadata` label so
         // `mergedConfiguration` can be built from the already-baked label (no OCI access),
         // matching the official CLI's behaviour.
-        let (mut resolved, cwd, container_metadata_label) = if has_container_target {
+        let (cwd, container_metadata_label) = if has_container_target {
             let client = self.backend.resolve_client().await?;
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
@@ -99,30 +101,40 @@ impl ReadConfigurationArgs {
                 .labels
                 .get("dev.cella.workspace_path")
                 .ok_or("container has no dev.cella.workspace_path label")?;
-            let ws = PathBuf::from(workspace_path);
-            let res = resolve::config(&ws, config_path)?;
-            (res, ws, Some((metadata_label, has_id_labels)))
+            (
+                PathBuf::from(workspace_path),
+                Some((metadata_label, has_id_labels)),
+            )
         } else {
-            let ws = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let res = resolve::config(&ws, config_path)?;
-            (res, ws, None)
+            (
+                super::resolve_workspace_folder(self.workspace_folder.as_deref())?,
+                None,
+            )
         };
+
+        // Report the default single-container mount `up` would create: it
+        // bind-mounts the git-root folder unless `--mount-workspace-git-root`
+        // is false. Compose configs ignore this (no bind mount).
+        let default_workspace =
+            DefaultWorkspace::detect(&cwd, self.compat.mount_workspace_git_root);
+        let resolve_options = resolve::ResolveOptions {
+            id_labels: super::id_label_map(&self.id_label),
+            default_container_workspace_folder: Some(
+                default_workspace.container_workspace_folder.clone(),
+            ),
+        };
+        let mut resolved =
+            resolve::config_with_override(&cwd, config_path, None, &resolve_options)?;
 
         if let Some(ref additional) = self.additional_features {
             super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
-        // Report the default single-container mount `up` would create: it
-        // bind-mounts the git-root folder (mountWorkspaceGitRoot defaults to
-        // true). read-configuration exposes no flag to override this, so the
-        // default is reported. Compose configs ignore this (no bind mount).
-        let host_mount_folder =
-            cella_git::find_git_root_folder(&cwd, self.compat.mount_workspace_git_root);
         let mut output = build_base_output(
             &resolved.config,
             &resolved.config_path,
             &cwd,
-            &host_mount_folder,
+            &default_workspace.host_mount_folder,
         );
 
         // `featuresConfiguration` is emitted when explicitly requested, or when
@@ -144,9 +156,18 @@ impl ReadConfigurationArgs {
                     // Container target: read from the already-baked `devcontainer.metadata`
                     // label — no OCI network access needed. Matches the official CLI's
                     // `getImageMetadataFromContainer` path.
-                    build_merged_from_label(&resolved.config, &label, has_id_labels)
+                    build_merged_from_label(
+                        &resolved.config,
+                        &label,
+                        has_id_labels,
+                        &cella_config::config_map::subst_ctx(&resolved),
+                    )
                 } else {
-                    build_merged_output(&resolved.config, resolved_features.as_ref())
+                    build_substituted_merged_output(
+                        &resolved.config,
+                        resolved_features.as_ref(),
+                        &cella_config::config_map::subst_ctx(&resolved),
+                    )
                 };
         }
 
@@ -205,7 +226,12 @@ fn build_base_output(
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map_or_else(
-                || super::up::compute_default_workspace_folder(workspace_root, host_mount_folder),
+                || {
+                    super::default_workspace::compute_default_workspace_folder(
+                        workspace_root,
+                        host_mount_folder,
+                    )
+                },
                 String::from,
             );
 
@@ -258,13 +284,17 @@ fn derive_workspace_mount(host_mount_folder: &Path, container_target: &str) -> S
 /// Build the `mergedConfiguration` output for a resolved devcontainer,
 /// matching the official `mergeConfiguration` shape from the devcontainers CLI.
 ///
-/// Reused by `up --include-merged-configuration`.
+/// Used by `up --include-merged-configuration`.
+/// Feature contributions are substituted with the config's context, as in `read-configuration`.
 pub async fn resolve_merged_config(
-    config: &serde_json::Value,
-    config_path: &Path,
+    resolved: &resolve::ResolvedConfig,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let rf = resolve_config_features(config, config_path).await?;
-    Ok(build_merged_output(config, rf.as_ref()))
+    let rf = resolve_config_features(&resolved.config, &resolved.config_path).await?;
+    Ok(build_substituted_merged_output(
+        &resolved.config,
+        rf.as_ref(),
+        &cella_config::config_map::subst_ctx(resolved),
+    ))
 }
 
 /// Resolve the config's features for `mergedConfiguration`/`featuresConfiguration`,
@@ -289,8 +319,10 @@ pub async fn resolve_config_features(
         base_image,
         image_user: "root",
         metadata: None,
+        metadata_user: None,
         // read-configuration only merges config; no label is persisted.
         omit: cella_features::MetadataOmit::default(),
+        label_config: config,
     };
     let rf = cella_features::resolve_features(
         config,
@@ -315,7 +347,9 @@ pub async fn resolve_config_features(
 /// only the updateable properties (`remoteUser`/`userEnvProbe`/`remoteEnv`),
 /// while other targets (e.g. `--container-id`) append the full config (incl
 /// lifecycle/customizations). A single-object label is normalised to one entry.
-pub(super) fn build_merged_from_label(
+///
+/// `label_json` must already be substituted; the (already substituted) config is appended as is, so each value is substituted once.
+pub(super) fn build_merged_from_substituted_label(
     config: &serde_json::Value,
     label_json: &str,
     has_id_labels: bool,
@@ -327,12 +361,7 @@ pub(super) fn build_merged_from_label(
     // The baked metadata is normally a JSON array; some tooling/images emit a
     // single object instead — normalise it to a one-element array so its
     // metadata is not silently dropped.
-    let mut entries: Vec<serde_json::Value> =
-        match serde_json::from_str::<serde_json::Value>(label_json) {
-            Ok(serde_json::Value::Array(a)) => a,
-            Ok(obj @ serde_json::Value::Object(_)) => vec![obj],
-            _ => Vec::new(),
-        };
+    let mut entries = cella_features::metadata_label_entries(label_json);
 
     // Append the current config last so it is authoritative (matches the official
     // `getImageMetadataFromContainer`). `--id-label` contributes only updateable
@@ -384,6 +413,20 @@ pub(super) fn build_merged_from_label(
     build_merged_output(config, Some(&rf))
 }
 
+/// [`build_merged_from_substituted_label`] for a raw container label, whose entries are substituted with `ctx` first.
+fn build_merged_from_label(
+    config: &serde_json::Value,
+    label_json: &str,
+    has_id_labels: bool,
+    ctx: &SubstitutionContext,
+) -> serde_json::Value {
+    build_merged_from_substituted_label(
+        config,
+        &cella_config::config_map::metadata_label::substitute_metadata_label(label_json, ctx),
+        has_id_labels,
+    )
+}
+
 /// Pick a subset of object keys into a new JSON object (empty when none present).
 fn pick_properties(config: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
     let mut out = serde_json::Map::new();
@@ -395,6 +438,71 @@ fn pick_properties(config: &serde_json::Value, keys: &[&str]) -> serde_json::Val
         }
     }
     serde_json::Value::Object(out)
+}
+
+/// [`build_merged_output`] with each feature's contributions (mounts,
+/// entrypoint, containerEnv, lifecycle, customizations) substituted with
+/// `ctx`, the context the `configuration` section was substituted with.
+///
+/// Output-only: the merged container config is rebuilt from the substituted
+/// feature metadata and the already-substituted `config`, so neither is
+/// substituted twice. `rf` itself (shared with `featuresConfiguration`) is
+/// left raw.
+fn build_substituted_merged_output(
+    config: &serde_json::Value,
+    rf: Option<&ResolvedFeatures>,
+    ctx: &SubstitutionContext,
+) -> serde_json::Value {
+    let Some(rf) = rf else {
+        return build_merged_output(config, None);
+    };
+    let mut features = rf.features.clone();
+    for feature in &mut features {
+        substitute_feature_metadata(&mut feature.metadata, ctx);
+    }
+    let container_config = cella_features::merge_with_devcontainer(
+        &cella_features::merge_features(&features, None),
+        config,
+    );
+    // Only `features` and `container_config` feed the merged output.
+    let substituted = ResolvedFeatures {
+        features,
+        dockerfile: String::new(),
+        build_context: PathBuf::new(),
+        container_config,
+        metadata_label: String::new(),
+        lockfile: None,
+    };
+    build_merged_output(config, Some(&substituted))
+}
+
+/// Substitute the `mergedConfiguration`-visible fields of one feature's metadata.
+fn substitute_feature_metadata(
+    meta: &mut cella_features::types::FeatureMetadata,
+    ctx: &SubstitutionContext,
+) {
+    for mount in &mut meta.mounts {
+        *mount = ctx.substitute_str(mount);
+    }
+    if let Some(ep) = meta.entrypoint.as_mut() {
+        *ep = ctx.substitute_str(ep);
+    }
+    for value in meta.container_env.values_mut() {
+        *value = ctx.substitute_str(value);
+    }
+    for command in [
+        &mut meta.on_create_command,
+        &mut meta.update_content_command,
+        &mut meta.post_create_command,
+        &mut meta.post_start_command,
+        &mut meta.post_attach_command,
+        &mut meta.customizations,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ctx.substitute_value(command);
+    }
 }
 
 /// Assemble the official `mergeConfiguration` output shape.
@@ -1384,6 +1492,35 @@ mod tests {
         workspace
     }
 
+    /// `up --include-merged-configuration` substitutes feature contributions with the config's context, as `read-configuration` does.
+    #[tokio::test]
+    async fn resolve_merged_config_substitutes_feature_contributions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dc = tmp.path().join(".devcontainer");
+        let feature = dc.join("my-feature");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(
+            feature.join("devcontainer-feature.json"),
+            concat!(
+                r#"{"id": "my-feature", "version": "1.0.0", "entrypoint": "/run/${devcontainerId"#,
+                r#"}.sh"}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "ubuntu", "features": {"./my-feature": {}}}"#,
+        )
+        .unwrap();
+        let resolved = resolve::config(tmp.path(), None).unwrap();
+        let out = resolve_merged_config(&resolved).await.unwrap();
+        assert_eq!(
+            out["entrypoints"],
+            json!([format!("/run/{}.sh", resolved.devcontainer_id)])
+        );
+    }
+
     #[tokio::test]
     async fn execute_basic_read_succeeds() {
         let workspace = make_temp_workspace(r#"{"image": "ubuntu:22.04"}"#);
@@ -1678,6 +1815,92 @@ mod tests {
     // build_merged_from_label — container-path mergedConfiguration (no OCI)
     // -------------------------------------------------------------------------
 
+    /// Feature contributions in `mergedConfiguration` are substituted with the
+    /// `configuration` context; the already-substituted config is not.
+    #[test]
+    fn merged_output_substitutes_feature_contributions() {
+        let id = concat!("${devcontainerId", "}");
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let feature = cella_features::types::ResolvedFeature {
+            id: "feat-a".to_string(),
+            original_ref: "feat-a".to_string(),
+            metadata: cella_features::types::FeatureMetadata {
+                id: "feat-a".to_string(),
+                mounts: vec![format!("source=vol-{id},target=/data,type=volume")],
+                entrypoint: Some(format!("/run/{id}.sh")),
+                container_env: HashMap::from([("ID".to_string(), id.to_string())]),
+                post_create_command: Some(json!(format!("echo {id}"))),
+                customizations: Some(json!({"vscode": {"settings": {"id": id}}})),
+                ..Default::default()
+            },
+            user_options: HashMap::new(),
+            artifact_dir: PathBuf::from("/tmp"),
+            has_install_script: false,
+            oci: None,
+        };
+        let config = json!({"image": "ubuntu", "postCreateCommand": literal});
+        let features = vec![feature];
+        let container_config = cella_features::merge_with_devcontainer(
+            &cella_features::merge_features(&features, None),
+            &config,
+        );
+        let rf = ResolvedFeatures {
+            features,
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let ctx = SubstitutionContext::new(
+            Path::new("/projects/app"),
+            Some("/workspaces/app"),
+            "the-id",
+            HashMap::new(),
+        );
+        let out = build_substituted_merged_output(&config, Some(&rf), &ctx);
+        assert_eq!(out["postCreateCommands"], json!(["echo the-id", literal]));
+        assert_eq!(out["entrypoints"], json!(["/run/the-id.sh"]));
+        assert_eq!(out["containerEnv"]["ID"], "the-id");
+        assert_eq!(
+            out["mounts"],
+            json!(["source=vol-the-id,target=/data,type=volume"])
+        );
+        assert_eq!(
+            out["customizations"]["vscode"][0]["settings"]["id"],
+            "the-id"
+        );
+        // The shared resolution stays raw for `featuresConfiguration`.
+        assert_eq!(
+            rf.features[0].metadata.entrypoint.as_deref(),
+            Some(format!("/run/{id}.sh").as_str())
+        );
+    }
+
+    /// Label entries are substituted with the `configuration` context; the
+    /// appended (already-substituted) config is not substituted again.
+    #[test]
+    fn merged_from_label_substitutes_label_entries_once() {
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let label = json!([{
+            "id": "feat-a",
+            "postCreateCommand": concat!("echo ${localEnv", ":X}"),
+            "containerEnv": {"WS": literal},
+        }])
+        .to_string();
+        let config = json!({"image": "ubuntu", "postStartCommand": literal});
+        let ctx = SubstitutionContext::new(
+            Path::new("/projects/app"),
+            Some("/workspaces/app"),
+            "the-id",
+            HashMap::from([("X".to_string(), "hi".to_string())]),
+        );
+        let out = build_merged_from_label(&config, &label, false, &ctx);
+        assert_eq!(out["postCreateCommands"], json!(["echo hi"]));
+        assert_eq!(out["containerEnv"]["WS"], "/projects/app");
+        assert_eq!(out["postStartCommands"], json!([literal]));
+    }
+
     #[test]
     fn merged_from_label_appends_current_config_lifecycle_last() {
         // The label carries a feature's hook; the current devcontainer.json is
@@ -1685,7 +1908,7 @@ mod tests {
         // so its hook is authoritative and ordered after the feature's.
         let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
         let config = json!({"image": "ubuntu", "postCreateCommand": "echo dev"});
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
 
         assert_eq!(
             out["postCreateCommands"],
@@ -1711,7 +1934,7 @@ mod tests {
             }
         });
 
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         let cust = &out["customizations"];
 
         // vscode: feat-a contribution, feat-b contribution, devcontainer.json contribution.
@@ -1731,7 +1954,7 @@ mod tests {
         .to_string();
         let config = json!({"image": "ubuntu", "containerEnv": {"BASE": "1"}});
 
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         // All env vars from the label are merged into the output.
         assert_eq!(out["containerEnv"]["FOO"], json!("feat"));
         // Later entry in the label wins (last-wins semantics from parse_image_metadata).
@@ -1748,7 +1971,7 @@ mod tests {
             "image": "ubuntu",
             "postCreateCommand": "echo hi",
         });
-        let out = build_merged_from_label(&config, "", false);
+        let out = build_merged_from_substituted_label(&config, "", false);
 
         // The current config's hook is present (appended as the sole entry).
         assert_eq!(out["postCreateCommands"], json!(["echo hi"]));
@@ -1761,7 +1984,7 @@ mod tests {
     fn merged_from_label_absent_label_yields_empty_array_keys() {
         // Absent label (empty string from unwrap_or_default in execute).
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, "", false);
+        let out = build_merged_from_substituted_label(&config, "", false);
         // All plural lifecycle arrays present and empty.
         assert_eq!(out["onCreateCommands"], json!([]));
         assert_eq!(out["updateContentCommands"], json!([]));
@@ -1780,7 +2003,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["init"], json!(true));
         assert_eq!(out["privileged"], json!(false));
     }
@@ -1794,7 +2017,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         let cap_add = out["capAdd"].as_array().expect("capAdd must be present");
         // Deduplicated: SYS_PTRACE appears once.
         assert!(cap_add.contains(&json!("SYS_PTRACE")));
@@ -1810,7 +2033,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["entrypoints"], json!(["/init-feat.sh"]));
     }
 
@@ -1823,7 +2046,7 @@ mod tests {
             "workspaceFolder": "/workspace",
             "name": "my-dev",
         });
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
         assert_eq!(out["remoteUser"], json!("vscode"));
         assert_eq!(out["workspaceFolder"], json!("/workspace"));
         assert_eq!(out["name"], json!("my-dev"));
@@ -1835,7 +2058,7 @@ mod tests {
         // rather than an array; it must be normalised to one entry, not dropped.
         let label = json!({"id": "feat-a", "postCreateCommand": "echo obj"}).to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label, false);
+        let out = build_merged_from_substituted_label(&config, &label, false);
 
         assert_eq!(out["postCreateCommands"], json!(["echo obj"]));
     }
@@ -1847,7 +2070,7 @@ mod tests {
         // so the baked/feature hooks stand.
         let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
         let config = json!({"postCreateCommand": "echo dev", "remoteUser": "vscode"});
-        let out = build_merged_from_label(&config, &label, true);
+        let out = build_merged_from_substituted_label(&config, &label, true);
 
         // The current config's lifecycle is NOT appended on the id-label path.
         assert_eq!(out["postCreateCommands"], json!(["echo feat-a"]));

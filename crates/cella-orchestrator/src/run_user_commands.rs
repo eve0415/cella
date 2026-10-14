@@ -48,6 +48,7 @@ use cella_backend::lifecycle::{
     write_lifecycle_state,
 };
 use cella_backend::progress::ProgressSender;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use serde_json::Value;
 
 use crate::dotfiles::install_dotfiles;
@@ -370,11 +371,13 @@ async fn maybe_install_dotfiles(lc_ctx: &LifecycleContext<'_>, input: &RunUserCo
 ///
 /// Mirrors the `up` reuse-path priority: config `remoteUser` > config
 /// `containerUser` > metadata `remoteUser` > metadata `containerUser` > image
-/// `USER` > the `dev.cella.remote_user` label > `root`.
+/// `USER` > the `dev.cella.remote_user` label > `root`. `metadata` is the
+/// container's (substituted) `devcontainer.metadata` label.
 pub async fn resolve_remote_user(
     client: &dyn ContainerBackend,
     container: &cella_backend::ContainerInfo,
     config: &Value,
+    metadata: Option<&str>,
 ) -> String {
     if let Some(u) = config.get("remoteUser").and_then(Value::as_str) {
         return u.to_string();
@@ -383,10 +386,7 @@ pub async fn resolve_remote_user(
         return u.to_string();
     }
 
-    let meta_user = container
-        .labels
-        .get("devcontainer.metadata")
-        .map(|m| cella_features::parse_image_metadata(m).1);
+    let meta_user = metadata.map(|m| cella_features::parse_image_metadata(m).1);
     if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
         return u.to_string();
     }
@@ -415,12 +415,15 @@ pub async fn resolve_remote_user(
 /// returned `name=value` list is ordered for `merge_env`'s later-wins `HashMap`
 /// insert, so callers append it AFTER `--remote-env` to get the official
 /// precedence (probed < `--remote-env` < merged `remoteEnv`).
+///
+/// The label keeps `remoteEnv` raw; values are substituted here with `ctx`,
+/// which carries the probed container env so `${containerEnv:VAR}` resolves.
 #[must_use]
-pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
+pub fn metadata_remote_env(metadata: Option<&str>, ctx: &SubstitutionContext) -> Vec<String> {
     let Some(json) = metadata else {
         return Vec::new();
     };
-    let entries: Vec<Value> = serde_json::from_str(json).unwrap_or_default();
+    let entries = cella_features::metadata_label_entries(json);
     // Accumulate later-wins so the same key set across entries resolves to the
     // last entry's value, matching mergeConfiguration.
     let mut acc: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -428,7 +431,7 @@ pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
         if let Some(obj) = entry.get("remoteEnv").and_then(Value::as_object) {
             for (k, v) in obj {
                 if let Some(s) = v.as_str() {
-                    acc.insert(k.clone(), s.to_string());
+                    acc.insert(k.clone(), ctx.substitute_str(s));
                 }
             }
         }
@@ -445,7 +448,7 @@ pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
 /// then this baked value, then the CLI `--default-user-env-probe`.
 #[must_use]
 pub fn metadata_user_env_probe(metadata: Option<&str>) -> Option<String> {
-    let entries: Vec<Value> = serde_json::from_str(metadata?).ok()?;
+    let entries = cella_features::metadata_label_entries(metadata?);
     entries.iter().rev().find_map(|e| {
         e.get("userEnvProbe")
             .and_then(Value::as_str)
@@ -507,7 +510,7 @@ pub(crate) mod tests {
             {"id": "feature", "remoteEnv": {"B": "2", "C": "2"}}
         ])
         .to_string();
-        let env = metadata_remote_env(Some(&meta));
+        let env = metadata_remote_env(Some(&meta), &empty_ctx());
         assert!(env.contains(&"A=1".to_string()));
         assert!(env.contains(&"B=2".to_string())); // later entry wins
         assert!(env.contains(&"C=2".to_string()));
@@ -515,9 +518,33 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_remote_env_empty_without_label() {
-        assert!(metadata_remote_env(None).is_empty());
-        assert!(metadata_remote_env(Some("[]")).is_empty());
-        assert!(metadata_remote_env(Some("not json")).is_empty());
+        assert!(metadata_remote_env(None, &empty_ctx()).is_empty());
+        assert!(metadata_remote_env(Some("[]"), &empty_ctx()).is_empty());
+        assert!(metadata_remote_env(Some("not json"), &empty_ctx()).is_empty());
+    }
+
+    fn empty_ctx() -> SubstitutionContext {
+        SubstitutionContext::local_env_only(std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn metadata_remote_env_substitutes_values() {
+        let meta = json!([{"remoteEnv": {
+            "TOKEN": concat!("${localEnv", ":X}"),
+            "PATH": concat!("${containerEnv", ":PATH}:/extra"),
+        }}])
+        .to_string();
+        let ctx = SubstitutionContext::local_env_only(std::collections::HashMap::from([(
+            "X".to_string(),
+            "hi".to_string(),
+        )]))
+        .with_container_env(std::collections::HashMap::from([(
+            "PATH".to_string(),
+            "/usr/bin".to_string(),
+        )]));
+        let env = metadata_remote_env(Some(&meta), &ctx);
+        assert!(env.contains(&"TOKEN=hi".to_string()), "{env:?}");
+        assert!(env.contains(&"PATH=/usr/bin:/extra".to_string()), "{env:?}");
     }
 
     #[test]
@@ -670,6 +697,7 @@ pub(crate) mod tests {
         recorded_started_at: Option<String>,
         recorded: Arc<Mutex<Vec<String>>>,
         recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
+        recorded_build_options: Mutex<Option<Vec<String>>>,
         ssh_agent: cella_backend::SshAgentTransport,
     }
 
@@ -686,6 +714,7 @@ pub(crate) mod tests {
                 recorded_started_at: None,
                 recorded: Arc::clone(&recorded),
                 recorded_build_paths: Mutex::new(None),
+                recorded_build_options: Mutex::new(None),
                 ssh_agent: cella_backend::SshAgentTransport::BindMount,
             };
             (backend, recorded)
@@ -701,6 +730,10 @@ pub(crate) mod tests {
 
         pub fn recorded_build_paths(&self) -> Option<(String, PathBuf)> {
             self.recorded_build_paths.lock().expect("mutex").clone()
+        }
+
+        pub fn recorded_build_options(&self) -> Option<Vec<String>> {
+            self.recorded_build_options.lock().expect("mutex").clone()
         }
     }
 
@@ -871,6 +904,10 @@ pub(crate) mod tests {
                 .lock()
                 .expect("mutex")
                 .replace((opts.dockerfile.clone(), opts.context_path.clone()));
+            self.recorded_build_options
+                .lock()
+                .expect("mutex")
+                .replace(opts.options.clone());
             Box::pin(async { Ok("built-image".to_string()) })
         }
 

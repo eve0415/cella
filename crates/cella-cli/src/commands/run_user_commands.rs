@@ -23,12 +23,15 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use cella_backend::ContainerTarget;
+use cella_config::config_map::metadata_label;
 use cella_config::devcontainer::resolve;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::user_env_probe::UserEnvProbe;
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
+use super::default_workspace::DefaultWorkspace;
 use super::up::{map_env_object, parse_secrets_file};
 use super::{LogFormat, LogLevel};
 use crate::backend::BackendArgs;
@@ -148,8 +151,9 @@ pub struct CompatArgs {
     #[arg(long = "user-data-folder")]
     user_data_folder: Option<PathBuf>,
 
-    /// Mount the workspace using its Git root (compatibility no-op, default
-    /// `true`). Accepts the official yargs boolean forms: bare, explicit
+    /// Mount the workspace using its Git root (default `true`); decides the
+    /// default `${containerWorkspaceFolder}` for `--config`. Accepts the
+    /// official yargs boolean forms: bare, explicit
     /// (`--mount-workspace-git-root false`), and absent (defaults to `true`).
     #[arg(
         long = "mount-workspace-git-root",
@@ -285,7 +289,7 @@ impl RunUserCommandsArgs {
         let config = resolved
             .as_ref()
             .map_or_else(|| json!({}), |r| r.config.clone());
-        let metadata = container.labels.get("devcontainer.metadata").cloned();
+        let workspace_folder = workspace_folder_in_container(&config, &container);
 
         // Official `getImageMetadataFromContainer` branches on `hasIdLabels`: a
         // container matched by `--id-label` / workspace folder (true) is driven
@@ -297,14 +301,26 @@ impl RunUserCommandsArgs {
         // official treats as branch A; matching that exactly would require
         // porting `findContainerAndIdLabels`.)
         let appends_config = self.target.container_id.is_some();
-        let effective_metadata = cella_backend::lifecycle::effective_lifecycle_metadata(
-            metadata.as_deref(),
+        let label_ctx = label_subst_ctx(
+            resolved.as_ref(),
+            &container,
+            &self.target.id_label,
+            &workspace_folder,
+            std::env::vars(),
+        );
+        let (metadata, effective_metadata) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &label_ctx,
             &config,
             appends_config,
         );
 
-        let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
-        let workspace_folder = workspace_folder_in_container(&config, &container);
+        let remote_user =
+            orchestrator::resolve_remote_user(&*client, &container, &config, metadata.as_deref())
+                .await;
 
         // Read --secrets-file up front so a bad file fails before any command
         // runs (mirrors official doRunUserCommands → readSecretsFromFile).
@@ -313,19 +329,21 @@ impl RunUserCommandsArgs {
             None => Vec::new(),
         };
 
-        let lifecycle_env = self
-            .build_lifecycle_env(
-                &*client,
-                &container.id,
-                &remote_user,
-                &LifecycleConfigSources {
-                    config: &config,
-                    resolved: resolved.as_ref(),
-                    metadata: metadata.as_deref(),
-                },
-                &secrets,
-            )
-            .await;
+        let lifecycle_env = build_lifecycle_env(
+            &*client,
+            &container.id,
+            &remote_user,
+            &LifecycleConfigSources {
+                config: &config,
+                resolved: resolved.as_ref(),
+                metadata: metadata.as_deref(),
+                label_ctx: &label_ctx,
+            },
+            &secrets,
+            &self.remote_env,
+            self.default_user_env_probe,
+        )
+        .await;
 
         let gating = self.build_gating(&config, effective_metadata.as_deref());
         let (sender, renderer) = crate::progress::bridge(&progress);
@@ -378,65 +396,17 @@ impl RunUserCommandsArgs {
             .map(std::path::Path::to_path_buf)
             .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        Ok(Some(resolve::config(&ws, Some(config_path))?))
-    }
-
-    /// Probe the user environment and build the lifecycle env with the official
-    /// precedence: probed < `--remote-env` < (config + metadata) `remoteEnv`.
-    ///
-    /// The official `probeRemoteEnv(updatedMergedConfig)` spreads the
-    /// metadata-merged config's `remoteEnv`, not the raw on-disk one. cella's
-    /// `parse_image_metadata` does not expose `remoteEnv`, so the merged
-    /// `remoteEnv` is assembled here from (a) the metadata label's per-entry
-    /// `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config`
-    /// `remoteEnv` layered last — the on-disk user config is the final metadata
-    /// entry in the official merge, so it wins over earlier feature/base entries.
-    ///
-    /// `--secrets-file` entries are layered last of all, so they win over both
-    /// probed and `remoteEnv` values, mirroring `up` and the official
-    /// `runLifecycleHooks(..., secretsP)`.
-    async fn build_lifecycle_env(
-        &self,
-        client: &dyn cella_backend::ContainerBackend,
-        container_id: &str,
-        remote_user: &str,
-        sources: &LifecycleConfigSources<'_>,
-        secrets: &[String],
-    ) -> Vec<String> {
-        let LifecycleConfigSources {
-            config,
-            resolved,
-            metadata,
-        } = *sources;
-        // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
-        // --config wins (it's in pickUpdateableConfigProperties, appended last in
-        // every branch), then the baked metadata's value, then the CLI default.
-        let probe_type = config
-            .get("userEnvProbe")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| orchestrator::metadata_user_env_probe(metadata))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.default_user_env_probe);
-        let shell = detect_shell(client, container_id, remote_user).await;
-        let probed =
-            probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
-
-        // Order the vec for merge_env's later-wins insert: probed first
-        // (provided by merge_env), then CLI --remote-env, then metadata, then
-        // the on-disk config `remoteEnv` last so it wins. The config portion is
-        // resolved AFTER the probe so `${containerEnv:VAR}` resolves against the
-        // live container env (the baked metadata portion can't be un-collapsed).
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(metadata));
-        remote_env.extend(resolve_config_remote_env(config, resolved, probed.as_ref()));
-
-        let mut lifecycle_env = probed.as_ref().map_or_else(
-            || remote_env.clone(),
-            |p| cella_env::user_env_probe::merge_env(p, &remote_env),
-        );
-        lifecycle_env.extend_from_slice(secrets);
-        lifecycle_env
+        let default_workspace = DefaultWorkspace::detect(&ws, self.compat.mount_workspace_git_root);
+        let options = resolve::ResolveOptions {
+            id_labels: super::id_label_map(&self.target.id_label),
+            default_container_workspace_folder: Some(default_workspace.container_workspace_folder),
+        };
+        Ok(Some(resolve::config_with_override(
+            &ws,
+            Some(config_path),
+            None,
+            &options,
+        )?))
     }
 
     /// Build the lifecycle gating from the parity flags and resolved `waitFor`.
@@ -464,14 +434,88 @@ impl RunUserCommandsArgs {
     }
 }
 
+/// Probe the user environment and build the lifecycle env with the official precedence: probed < `--remote-env` < (config + metadata) `remoteEnv`.
+/// Shared by `run-user-commands` and `set-up`.
+///
+/// The official `probeRemoteEnv(updatedMergedConfig)` spreads the metadata-merged config's `remoteEnv`, not the raw on-disk one.
+/// cella's `parse_image_metadata` does not expose `remoteEnv`, so the merged `remoteEnv` is assembled here from (a) the metadata label's per-entry `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config` `remoteEnv` layered last — the on-disk user config is the final metadata entry in the official merge, so it wins over earlier feature/base entries.
+///
+/// `--secrets-file` entries are layered last of all, so they win over both probed and `remoteEnv` values, mirroring `up` and the official `runLifecycleHooks(..., secretsP)`.
+pub(super) async fn build_lifecycle_env(
+    client: &dyn cella_backend::ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    sources: &LifecycleConfigSources<'_>,
+    secrets: &[String],
+    cli_remote_env: &[String],
+    default_user_env_probe: UserEnvProbe,
+) -> Vec<String> {
+    let LifecycleConfigSources {
+        config, metadata, ..
+    } = *sources;
+    // userEnvProbe precedence mirrors official mergeConfiguration: the fresh --config wins (it's in pickUpdateableConfigProperties, appended last in every branch), then the baked metadata's value, then the CLI default.
+    let probe_type = config
+        .get("userEnvProbe")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| orchestrator::metadata_user_env_probe(metadata))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_user_env_probe);
+    let shell = detect_shell(client, container_id, remote_user).await;
+    let probed =
+        probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
+
+    let remote_env = lifecycle_remote_env(cli_remote_env, sources, probed.as_ref());
+
+    let mut lifecycle_env = probed.as_ref().map_or_else(
+        || remote_env.clone(),
+        |p| cella_env::user_env_probe::merge_env(p, &remote_env),
+    );
+    lifecycle_env.extend_from_slice(secrets);
+    lifecycle_env
+}
+
 /// The config sources `build_lifecycle_env` resolves `remoteEnv` from: the
 /// substituted on-disk config, the full resolved config (for the raw remoteEnv
-/// snapshot + substitution inputs), and the container's baked metadata label.
+/// snapshot + substitution inputs), the container's baked metadata label, and
+/// the context its (raw) `remoteEnv` is substituted with.
 #[derive(Clone, Copy)]
-struct LifecycleConfigSources<'a> {
-    config: &'a Value,
-    resolved: Option<&'a resolve::ResolvedConfig>,
-    metadata: Option<&'a str>,
+pub(super) struct LifecycleConfigSources<'a> {
+    pub(super) config: &'a Value,
+    pub(super) resolved: Option<&'a resolve::ResolvedConfig>,
+    pub(super) metadata: Option<&'a str>,
+    pub(super) label_ctx: &'a SubstitutionContext,
+}
+
+/// The `remoteEnv` layered over the probed env, ordered for `merge_env`'s later-wins insert: `--remote-env`, then the metadata label's, then the on-disk config's last so it wins.
+/// Both `remoteEnv` portions are resolved after the probe so `${containerEnv:VAR}` resolves against the live container env.
+fn lifecycle_remote_env(
+    cli_remote_env: &[String],
+    sources: &LifecycleConfigSources<'_>,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let mut remote_env = cli_remote_env.to_vec();
+    remote_env.extend(orchestrator::metadata_remote_env(
+        sources.metadata,
+        &with_probed_env(sources.label_ctx, probed),
+    ));
+    remote_env.extend(resolve_config_remote_env(
+        sources.config,
+        sources.resolved,
+        probed,
+    ));
+    remote_env
+}
+
+/// `ctx` with the probed container env attached, when the probe succeeded.
+fn with_probed_env(
+    ctx: &SubstitutionContext,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> SubstitutionContext {
+    probed.map_or_else(
+        || ctx.clone(),
+        |p| ctx.clone().with_container_env(p.clone()),
+    )
 }
 
 /// Resolve the on-disk config `remoteEnv` into `K=V` strings, resolving live
@@ -492,6 +536,49 @@ fn resolve_config_remote_env(
     } else {
         map_env_object(config.get("remoteEnv"))
     }
+}
+
+/// The context that substitutes the container's `devcontainer.metadata` label:
+/// the `--config` context when a config was resolved, else one derived from
+/// the container's identity labels.
+fn label_subst_ctx(
+    resolved: Option<&resolve::ResolvedConfig>,
+    container: &cella_backend::ContainerInfo,
+    id_labels: &[String],
+    container_workspace_folder: &str,
+    env: impl IntoIterator<Item = (String, String)>,
+) -> SubstitutionContext {
+    resolved.map_or_else(
+        || {
+            metadata_label::container_subst_ctx(
+                &container.labels,
+                super::id_label_map(id_labels).as_ref(),
+                Some(container_workspace_folder),
+                env,
+            )
+        },
+        cella_config::config_map::subst_ctx,
+    )
+}
+
+/// Substitute the container's metadata label, then derive the effective
+/// lifecycle metadata from it (appending the config when `appends_config`).
+///
+/// Returns `(metadata, effective_metadata)`. Substituting before appending
+/// keeps the already-substituted config from being substituted twice.
+pub(super) fn substitute_label_metadata(
+    raw_label: Option<&str>,
+    ctx: &SubstitutionContext,
+    config: &Value,
+    appends_config: bool,
+) -> (Option<String>, Option<String>) {
+    let metadata = raw_label.map(|m| metadata_label::substitute_metadata_label(m, ctx));
+    let effective = cella_backend::lifecycle::effective_lifecycle_metadata(
+        metadata.as_deref(),
+        config,
+        appends_config,
+    );
+    (metadata, effective)
 }
 
 /// Render the JSON success envelope (single line). Matches official
@@ -559,6 +646,9 @@ mod tests {
             warnings: Vec::new(),
             typed: None,
             raw_remote_env: raw,
+            raw_config: json!({}),
+            container_identity: None,
+            default_container_workspace_folder: None,
         }
     }
 
@@ -586,6 +676,34 @@ mod tests {
             resolve_config_remote_env(&resolved.config, Some(&resolved), None),
             map_env_object(resolved.config.get("remoteEnv"))
         );
+    }
+
+    /// The `--config` `remoteEnv` is resolved against the probed container env.
+    #[test]
+    fn lifecycle_remote_env_resolves_config_container_env_after_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            concat!(
+                r#"{"image": "ubuntu", "remoteEnv": {"PATH": "${containerEnv"#,
+                r#":PATH}:/x"}}"#
+            ),
+        )
+        .unwrap();
+        let resolved = resolve::config(tmp.path(), None).unwrap();
+        let label_ctx = cella_config::config_map::subst_ctx(&resolved);
+        let sources = LifecycleConfigSources {
+            config: &resolved.config,
+            resolved: Some(&resolved),
+            metadata: None,
+            label_ctx: &label_ctx,
+        };
+        let probed =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let env = lifecycle_remote_env(&[], &sources, Some(&probed));
+        assert_eq!(env, vec!["PATH=/usr/bin:/x".to_string()]);
     }
 
     // ── devcontainer-CLI flag parity ───────────────────────────────
@@ -861,6 +979,118 @@ mod tests {
             mounts: Vec::new(),
             backend: cella_backend::BackendKind::Docker,
         }
+    }
+
+    fn identity_labels_with_metadata(metadata: &Value) -> cella_backend::ContainerInfo {
+        container_with_labels(&[
+            ("devcontainer.local_folder", "/ws"),
+            (
+                "devcontainer.config_file",
+                "/ws/.devcontainer/devcontainer.json",
+            ),
+            ("devcontainer.metadata", &metadata.to_string()),
+        ])
+    }
+
+    fn post_create_commands(effective: Option<&str>, config: &Value) -> Vec<Value> {
+        cella_backend::lifecycle::lifecycle_entries_for_phase(
+            effective,
+            config,
+            "postCreateCommand",
+        )
+        .into_iter()
+        .map(|e| e.command)
+        .collect()
+    }
+
+    /// Without `--config`, label lifecycle entries resolve `${localEnv}` and
+    /// `${devcontainerId}` from the container's identity labels.
+    #[test]
+    fn label_lifecycle_is_substituted_without_config() {
+        let container = identity_labels_with_metadata(&json!([{
+            "postCreateCommand": concat!("echo ${localEnv", ":X} ${devcontainerId", "}")
+        }]));
+        let env = std::collections::HashMap::from([("X".to_string(), "hi".to_string())]);
+        let ctx = label_subst_ctx(None, &container, &[], "/workspaces/ws", env);
+        let config = json!({});
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &config,
+            false,
+        );
+        let id = resolve::devcontainer_id(
+            std::path::Path::new("/ws"),
+            std::path::Path::new("/ws/.devcontainer/devcontainer.json"),
+        );
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &config),
+            vec![json!(format!("echo hi {id}"))]
+        );
+    }
+
+    /// `--id-label` drives `${devcontainerId}` in label entries.
+    #[test]
+    fn label_lifecycle_uses_id_labels_for_devcontainer_id() {
+        let container = identity_labels_with_metadata(&json!([{
+            "postCreateCommand": concat!("${devcontainerId", "}")
+        }]));
+        let ctx = label_subst_ctx(
+            None,
+            &container,
+            &["a=1".to_string()],
+            "/workspaces/ws",
+            std::collections::HashMap::new(),
+        );
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &json!({}),
+            false,
+        );
+        let id = resolve::spec_devcontainer_id(&std::collections::BTreeMap::from([(
+            "a".to_string(),
+            "1".to_string(),
+        )]));
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &json!({})),
+            vec![json!(id)]
+        );
+    }
+
+    /// The appended `--config` is already substituted: a literal `${...}` it
+    /// carries must survive, while the same text in a label entry expands.
+    #[test]
+    fn appended_config_is_not_substituted_twice() {
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let container = identity_labels_with_metadata(&json!([{"postCreateCommand": literal}]));
+        let ctx = label_subst_ctx(
+            None,
+            &container,
+            &[],
+            "/workspaces/ws",
+            std::collections::HashMap::new(),
+        );
+        let config = json!({"postCreateCommand": literal});
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &config,
+            true,
+        );
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &config),
+            vec![json!("/ws"), json!(literal)]
+        );
     }
 
     #[test]

@@ -57,7 +57,8 @@ pub struct ProxySettings {
     #[serde(default)]
     pub no_proxy: Option<String>,
 
-    /// Path to additional CA certificate.
+    /// Path to additional CA certificate. A leading `~` expands to the home
+    /// directory.
     #[serde(default)]
     pub ca_cert: Option<String>,
 
@@ -132,7 +133,11 @@ impl Network {
                 http: self.proxy.http.clone(),
                 https: self.proxy.https.clone(),
                 no_proxy: self.proxy.no_proxy.clone(),
-                ca_cert: self.proxy.ca_cert.clone(),
+                ca_cert: self.proxy.ca_cert.as_deref().map(|p| {
+                    cella_env::paths::expand_tilde(p)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
                 proxy_port: self.proxy.proxy_port,
             },
             rules: self
@@ -189,6 +194,38 @@ action = "block"
         assert_eq!(network.rules.len(), 2);
         assert_eq!(network.rules[0].domain, "*.prod.internal");
         assert_eq!(network.rules[0].action, RuleAction::Block);
+    }
+
+    #[test]
+    fn to_network_config_expands_tilde_in_ca_cert() {
+        let Some(home) = cella_env::paths::home_dir() else {
+            return;
+        };
+        let network = Network {
+            proxy: ProxySettings {
+                ca_cert: Some("~/certs/ca.pem".to_string()),
+                ..ProxySettings::default()
+            },
+            ..Network::default()
+        };
+        let config = network.to_network_config();
+        assert_eq!(
+            config.proxy.ca_cert.as_deref(),
+            Some(home.join("certs/ca.pem").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn to_network_config_keeps_absolute_ca_cert() {
+        let network = Network {
+            proxy: ProxySettings {
+                ca_cert: Some("/etc/ssl/ca.pem".to_string()),
+                ..ProxySettings::default()
+            },
+            ..Network::default()
+        };
+        let config = network.to_network_config();
+        assert_eq!(config.proxy.ca_cert.as_deref(), Some("/etc/ssl/ca.pem"));
     }
 
     #[test]

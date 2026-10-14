@@ -560,9 +560,7 @@ pub fn effective_lifecycle_metadata(
     if !append_config {
         return Some(raw.to_string());
     }
-    let Ok(mut entries) = serde_json::from_str::<Vec<Value>>(raw) else {
-        return Some(raw.to_string());
-    };
+    let mut entries = cella_features::metadata_label_entries(raw);
     let mut picked = serde_json::Map::new();
     for key in [
         "onCreateCommand",
@@ -741,7 +739,7 @@ impl WaitForPhase {
         let Some(raw) = metadata else {
             return Self::from_config(config);
         };
-        let entries: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+        let entries = cella_features::metadata_label_entries(raw);
         entries
             .iter()
             .rev()

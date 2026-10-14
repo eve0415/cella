@@ -12,6 +12,7 @@ pub use cli::{Cli, CliBuild, OutputFormat, PullPolicy};
 pub use error::CellaConfigError;
 pub use security::{Security, SecurityMode};
 
+use crate::devcontainer::subst::SubstitutionContext;
 use crate::settings::{Clipboard, Credentials, Network, Shell, Tools};
 
 use self::format::load_layer;
@@ -65,13 +66,29 @@ impl CellaConfig {
         resolved: Option<&crate::devcontainer::resolve::ResolvedConfig>,
         global_dir: Option<&Path>,
     ) -> Result<Self, CellaConfigError> {
+        // Substitute each file layer on its own, before merging: the
+        // `customizations.cella` layer comes from the already-substituted
+        // devcontainer config and must not be substituted a second time.
+        let ctx = resolved.map_or_else(
+            || SubstitutionContext::local_env_only(std::env::vars().collect()),
+            crate::config_map::subst_ctx,
+        );
+        let load_substituted =
+            |dir: &Path, stem: &str| -> Result<Option<serde_json::Value>, CellaConfigError> {
+                let mut layer = load_layer(dir, stem)?;
+                if let Some(value) = layer.as_mut() {
+                    ctx.substitute_value(value);
+                }
+                Ok(layer)
+            };
+
         let mut layers = Vec::new();
 
         let global = match global_dir {
-            Some(dir) => load_layer(dir, "config")?,
+            Some(dir) => load_substituted(dir, "config")?,
             None => {
                 if let Some(dir) = cella_env::paths::cella_data_dir() {
-                    load_layer(&dir, "config")?
+                    load_substituted(&dir, "config")?
                 } else {
                     None
                 }
@@ -89,7 +106,7 @@ impl CellaConfig {
         }
 
         let project_dir = workspace.join(".devcontainer");
-        if let Some(val) = load_layer(&project_dir, "cella")? {
+        if let Some(val) = load_substituted(&project_dir, "cella")? {
             layers.push(val);
         }
 
@@ -127,6 +144,9 @@ mod tests {
             warnings: vec![],
             typed,
             raw_remote_env: None,
+            raw_config: Value::Null,
+            container_identity: None,
+            default_container_workspace_folder: None,
         }
     }
 
@@ -342,6 +362,84 @@ mod tests {
         let cfg =
             CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
         assert_eq!(cfg.shell.preferred, vec!["fish", "zsh", "bash", "sh"]);
+    }
+
+    #[test]
+    fn file_layers_expand_local_env_without_resolved_config() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            global.path().join("config.toml"),
+            concat!(
+                "[network.proxy]\nca_cert = \"${localEnv",
+                ":HOME}/ca.pem\"\n"
+            ),
+        )
+        .unwrap();
+        let cfg = CellaConfig::load_with_global(ws.path(), None, Some(global.path())).unwrap();
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            cfg.network.proxy.ca_cert.as_deref(),
+            Some(format!("{home}/ca.pem").as_str())
+        );
+    }
+
+    #[test]
+    fn file_layers_keep_workspace_variables_literal_without_resolved_config() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(
+            devcontainer.join("cella.json"),
+            concat!(
+                r#"{"network": {"proxy": {"#,
+                r#""ca_cert": "${localWorkspaceFolder}/ca.pem","#,
+                r#""http": "${devcontainerId}","#,
+                r#""no_proxy": "${containerEnv"#,
+                r#":NO_PROXY}"}}}"#,
+            ),
+        )
+        .unwrap();
+        let cfg = CellaConfig::load_with_global(ws.path(), None, Some(global.path())).unwrap();
+        assert_eq!(
+            cfg.network.proxy.ca_cert.as_deref(),
+            Some("${localWorkspaceFolder}/ca.pem")
+        );
+        assert_eq!(cfg.network.proxy.http.as_deref(), Some("${devcontainerId}"));
+        assert_eq!(
+            cfg.network.proxy.no_proxy.as_deref(),
+            Some(concat!("${containerEnv", ":NO_PROXY}"))
+        );
+    }
+
+    #[test]
+    fn file_layers_use_resolved_config_context() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(
+            devcontainer.join("cella.toml"),
+            "[network.proxy]\nca_cert = \"${localWorkspaceFolderBasename}.pem\"\n",
+        )
+        .unwrap();
+        let mut resolved = make_resolved(json!({"image": "ubuntu"}));
+        resolved.workspace_root = ws.path().to_path_buf();
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        let basename = ws
+            .path()
+            .canonicalize()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            cfg.network.proxy.ca_cert.as_deref(),
+            Some(format!("{basename}.pem").as_str())
+        );
     }
 
     #[test]

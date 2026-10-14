@@ -97,6 +97,20 @@ fn apply_lifecycle(config: &mut FeatureContainerConfig, entry: &serde_json::Valu
     }
 }
 
+/// The entries of a `devcontainer.metadata` label.
+///
+/// A JSON array yields its items and a single object is read as a one-entry
+/// array, as the official CLI does; anything else yields no entries. Every
+/// label reader goes through this.
+#[must_use]
+pub fn metadata_label_entries(metadata_json: &str) -> Vec<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(metadata_json) {
+        Ok(serde_json::Value::Array(entries)) => entries,
+        Ok(entry @ serde_json::Value::Object(_)) => vec![entry],
+        _ => Vec::new(),
+    }
+}
+
 /// Parse image metadata JSON into container config and user info.
 ///
 /// The metadata is a JSON array of objects. Each entry may contain
@@ -106,7 +120,7 @@ fn apply_lifecycle(config: &mut FeatureContainerConfig, entry: &serde_json::Valu
 pub fn parse_image_metadata(
     metadata_json: &str,
 ) -> (FeatureContainerConfig, ImageMetadataUserInfo) {
-    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let entries = metadata_label_entries(metadata_json);
 
     let mut config = FeatureContainerConfig::default();
     let mut user_info = ImageMetadataUserInfo::default();
@@ -132,6 +146,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn metadata_label_entries_reads_arrays_and_single_objects() {
+        assert_eq!(metadata_label_entries(r#"[{"a":1},{"b":2}]"#).len(), 2);
+        assert_eq!(
+            metadata_label_entries(r#"{"remoteUser":"vscode"}"#),
+            vec![json!({"remoteUser": "vscode"})]
+        );
+        assert!(metadata_label_entries("not json").is_empty());
+        assert!(metadata_label_entries("42").is_empty());
+    }
 
     #[test]
     fn extracts_remote_user() {

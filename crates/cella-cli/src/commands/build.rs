@@ -245,7 +245,7 @@ impl BuildArgs {
         // compose/single-container split, so both paths build the added features
         // (the official CLI applies --additional-features to both).
         if let Some(ref additional) = self.additional_features {
-            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+            super::features::resolve::merge_additional_features_resolved(&mut resolved, additional)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
@@ -340,8 +340,11 @@ impl BuildArgs {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reject_unsupported_compose_flags()?;
         let (sender, renderer) = crate::progress::bridge(&progress);
+        let subst_ctx = cella_config::config_map::subst_ctx(resolved);
         let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
             config: &resolved.config,
+            subst_ctx: &subst_ctx,
+            label_config: &resolved.raw_config,
             config_path: &resolved.config_path,
             workspace_root: &resolved.workspace_root,
             profiles: self.profile.clone(),
@@ -394,9 +397,12 @@ impl BuildArgs {
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (sender, renderer) = crate::progress::bridge(&progress);
+        let subst_ctx = cella_config::config_map::subst_ctx(resolved);
         let input = EnsureImageInput {
             client,
             config: &resolved.config,
+            subst_ctx: &subst_ctx,
+            label_config: &resolved.raw_config,
             workspace_root: &resolved.workspace_root,
             config_name: resolved.name(),
             config_path: &resolved.config_path,

@@ -6,6 +6,7 @@ mod compose_up;
 mod config;
 mod credential;
 mod daemon;
+mod default_workspace;
 mod doctor;
 mod down;
 mod exec;
@@ -45,6 +46,21 @@ pub fn parse_id_label(s: &str) -> Result<String, String> {
         Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
         _ => Err("id-label must match <name>=<value>".to_string()),
     }
+}
+
+/// Collect validated `--id-label` values into a label map, or `None` when no
+/// id label was given.
+pub fn id_label_map(id_labels: &[String]) -> Option<std::collections::BTreeMap<String, String>> {
+    if id_labels.is_empty() {
+        return None;
+    }
+    Some(
+        id_labels
+            .iter()
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
 }
 
 /// Validate a `--remote-env` value (`name=value`, value may be empty). Shared
@@ -613,7 +629,9 @@ impl Command {
             Self::List(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Logs(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Doctor(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Branch(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Branch(args) => Box::pin(args.execute(progress))
+                .await
+                .map_err(boxed_err_to_report),
             Self::Switch(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Prune(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::ReadConfiguration(args) => args.execute().await.map_err(boxed_err_to_report),
@@ -623,7 +641,9 @@ impl Command {
             Self::SetUp(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
             Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
-            Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Features(args) => Box::pin(args.execute(progress))
+                .await
+                .map_err(boxed_err_to_report),
             Self::Image(args) => args.execute(progress).await,
             Self::Upgrade(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
@@ -1093,6 +1113,18 @@ async fn restart_agents_in_all_containers(client: &dyn cella_backend::ContainerB
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn id_label_map_is_none_without_labels() {
+        assert!(id_label_map(&[]).is_none());
+    }
+
+    #[test]
+    fn id_label_map_splits_on_first_equals() {
+        let map = id_label_map(&["a=1".to_string(), "b=x=y".to_string()]).unwrap();
+        assert_eq!(map.get("a").map(String::as_str), Some("1"));
+        assert_eq!(map.get("b").map(String::as_str), Some("x=y"));
+    }
 
     // ── TERMINAL_ENV_VARS ───────────────────────────────────────────
 

@@ -225,10 +225,11 @@ impl EnsureUpContext<'_> {
             return u.to_string();
         }
 
+        let subst = crate::subst_ctx(self.config.resolved);
         let meta_user = container
             .labels
             .get("devcontainer.metadata")
-            .map(|m| cella_features::parse_image_metadata(m).1);
+            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, &subst).1);
         if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
             return u.to_string();
         }
@@ -1058,33 +1059,15 @@ impl EnsureUpContext<'_> {
             );
         }
 
-        if let Some(rf) = resolved_features {
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                rf.metadata_label.clone(),
-            );
-        } else if let Some(existing) = base_metadata {
-            // The base image already carries a devcontainer.metadata label
-            // (either from a prebuilt image or from the Dockerfile build that
-            // embedded it via --label). Re-use it directly instead of
-            // regenerating, which would duplicate entries.
-            labels.insert("devcontainer.metadata".to_string(), existing.to_string());
-        } else {
-            // No features and no base image metadata -- generate from config.
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                cella_features::generate_metadata_label(
-                    &[],
-                    config,
-                    None,
-                    cella_features::MetadataOmit {
-                        remote_env: self.config.metadata_options.omit_remote_env,
-                        // up never strips feature customizations.
-                        feature_customizations: false,
-                    },
-                ),
-            );
-        }
+        labels.insert(
+            "devcontainer.metadata".to_string(),
+            container_metadata_label(
+                self.config.resolved,
+                resolved_features,
+                base_metadata,
+                self.config.metadata_options.omit_remote_env,
+            ),
+        );
 
         let ports_attrs = crate::config_map::ports::parse_ports_attributes(config);
         let other_ports_attrs = crate::config_map::ports::parse_other_ports_attributes(config);
@@ -1652,13 +1635,15 @@ impl EnsureUpContext<'_> {
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
         agent_arch: &str,
+        subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
     ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
         let image_env = base_image_details.env;
-        let image_meta_user = base_image_details
+        let (image_meta_config, image_meta_user) = base_image_details
             .metadata
             .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
+            .map(|m| crate::config_map::metadata_label::parse_substituted_metadata(m, subst_ctx))
+            .unzip();
         let remote_user = crate::container_setup::resolve_remote_user(
             config,
             image_meta_user.as_ref(),
@@ -1691,18 +1676,9 @@ impl EnsureUpContext<'_> {
             crate::credential_protect::add_protect_label(&mut labels, self.config.container_name);
         }
 
-        let subst_ctx = crate::subst_ctx(self.config.resolved);
         let substituted_feature_config = resolved_features.map(|r| {
-            crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
+            crate::config_map::substitute_feature_config(r.container_config.clone(), subst_ctx)
         });
-        let image_meta_config = if substituted_feature_config.is_none() {
-            base_image_details.metadata.as_deref().map(|m| {
-                let cfg = cella_features::parse_image_metadata(m).0;
-                crate::config_map::substitute_feature_config(cfg, &subst_ctx)
-            })
-        } else {
-            None
-        };
         let effective_feature_config = substituted_feature_config
             .as_ref()
             .or(image_meta_config.as_ref());
@@ -2080,11 +2056,14 @@ impl EnsureUpContext<'_> {
         build_no_cache: bool,
     ) -> Result<CreateResult, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
+        let subst_ctx = crate::subst_ctx(self.config.resolved);
 
         let (img_name, resolved_features, base_image_details) =
             crate::image::ensure_image(&crate::image::EnsureImageInput {
                 client: self.client,
                 config,
+                subst_ctx: &subst_ctx,
+                label_config: &self.config.resolved.raw_config,
                 workspace_root: &self.config.resolved.workspace_root,
                 config_name: self.config.resolved.name(),
                 config_path: &self.config.resolved.config_path,
@@ -2127,6 +2106,7 @@ impl EnsureUpContext<'_> {
             base_image_details,
             resolved_features.as_ref(),
             &agent_arch,
+            &subst_ctx,
         )?;
 
         let ssh_agent_proxy = self.resolve_ssh_agent_proxy(&mut env_fwd).await;
@@ -2654,6 +2634,35 @@ fn spec_identity_labels(
     ]
 }
 
+/// The `devcontainer.metadata` label for a new container.
+///
+/// The features label when features were resolved, else the base image's own
+/// label (the Dockerfile build already embedded it, so regenerating would
+/// duplicate entries), else one generated from the pre-substitution config.
+fn container_metadata_label(
+    resolved: &cella_config::devcontainer::resolve::ResolvedConfig,
+    resolved_features: Option<&cella_features::ResolvedFeatures>,
+    base_metadata: Option<&str>,
+    omit_remote_env: bool,
+) -> String {
+    if let Some(rf) = resolved_features {
+        return rf.metadata_label.clone();
+    }
+    if let Some(existing) = base_metadata {
+        return existing.to_string();
+    }
+    cella_features::generate_metadata_label(
+        &[],
+        &resolved.raw_config,
+        None,
+        cella_features::MetadataOmit {
+            remote_env: omit_remote_env,
+            // up never strips feature customizations.
+            feature_customizations: false,
+        },
+    )
+}
+
 /// Resolve `remoteEnv` to a `KEY=value` vec for lifecycle command injection.
 ///
 /// When both `raw_remote_env` (the pre-substitution snapshot from config
@@ -2786,6 +2795,34 @@ mod tests {
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
+
+    /// With no features and no base label, the generated label records the raw
+    /// config, not the substituted one.
+    #[test]
+    fn container_metadata_label_records_raw_config() {
+        let raw_token = concat!("${localEnv", ":SECRET}");
+        let resolved = cella_config::devcontainer::resolve::ResolvedConfig {
+            config: serde_json::json!({"containerEnv": {"TOKEN": "xyz"}}),
+            config_path: std::path::PathBuf::from("/ws/.devcontainer/devcontainer.json"),
+            workspace_root: std::path::PathBuf::from("/ws"),
+            config_hash: String::new(),
+            devcontainer_id: String::new(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env: None,
+            raw_config: serde_json::json!({"containerEnv": {"TOKEN": raw_token}}),
+            container_identity: None,
+            default_container_workspace_folder: None,
+        };
+        let label = container_metadata_label(&resolved, None, None, false);
+        assert!(label.contains(raw_token), "{label}");
+        assert!(!label.contains("xyz"), "{label}");
+        // An existing base label is reused verbatim.
+        assert_eq!(
+            container_metadata_label(&resolved, None, Some("[{}]"), false),
+            "[{}]"
+        );
+    }
 
     /// Attaching to a VS Code or official-CLI container must not leave cella
     /// blocks in its rc files; a container cella created must still be healed.

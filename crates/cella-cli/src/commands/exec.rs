@@ -315,6 +315,7 @@ pub(super) async fn resolve_by_spec_identity_or_fallback(
         workspace_root,
         config_path_override,
         override_config_file,
+        &cella_config::devcontainer::resolve::ResolveOptions::default(),
     ) {
         Ok(resolved) => resolved,
         Err(e) => {

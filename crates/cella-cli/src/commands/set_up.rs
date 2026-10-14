@@ -26,13 +26,15 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use cella_backend::ContainerTarget;
+use cella_config::devcontainer::resolve::ResolvedConfig;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::user_env_probe::UserEnvProbe;
-use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
-use cella_orchestrator::shell_detect::detect_shell;
 
-use super::run_user_commands::{AttachArgs, CompatArgs};
-use super::up::{map_env_object, parse_secrets_file};
+use super::run_user_commands::{
+    AttachArgs, CompatArgs, LifecycleConfigSources, build_lifecycle_env,
+};
+use super::up::parse_secrets_file;
 use crate::backend::BackendArgs;
 
 /// Gating flags for `set-up`. Subset of `run-user-commands` gating: official
@@ -145,30 +147,33 @@ impl SetUpArgs {
             .get("dev.cella.workspace_path")
             .map(PathBuf::from);
 
-        let config = self.read_config(workspace_root.as_deref())?;
-        let metadata = container.labels.get("devcontainer.metadata").cloned();
+        let resolved = self.read_config(workspace_root.as_deref())?;
+        let config = resolved
+            .as_ref()
+            .map_or_else(|| json!({}), |r| r.config.clone());
+        let raw_metadata = container.labels.get("devcontainer.metadata").cloned();
 
-        // Warn early if the label is present but not valid JSON, regardless of
-        // which result flags are passed — don't silently drop it.
-        if let Some(raw) = metadata.as_deref()
-            && serde_json::from_str::<Vec<Value>>(raw).is_err()
-        {
-            tracing::warn!(
-                "devcontainer.metadata label is not valid JSON, treating as empty: {}",
-                raw
-            );
-        }
+        warn_if_invalid_metadata(raw_metadata.as_deref());
 
-        // --container-id is the only resolution path for set-up, which matches
-        // official's `hasIdLabels === false` branch: the on-disk --config is
-        // appended to the baked metadata array.
-        let effective_metadata = cella_backend::lifecycle::effective_lifecycle_metadata(
-            metadata.as_deref(),
+        // Label entries are substituted with the `--config` context, or with
+        // `${localEnv}` alone when there is no config (as the official CLI
+        // does). --container-id is the only resolution path for set-up, which
+        // matches official's `hasIdLabels === false` branch: the on-disk
+        // --config is appended to the baked metadata array.
+        let label_ctx = resolved.as_ref().map_or_else(
+            || SubstitutionContext::local_env_only(std::env::vars().collect()),
+            cella_config::config_map::subst_ctx,
+        );
+        let (metadata, effective_metadata) = super::run_user_commands::substitute_label_metadata(
+            raw_metadata.as_deref(),
+            &label_ctx,
             &config,
             true,
         );
 
-        let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
+        let remote_user =
+            orchestrator::resolve_remote_user(&*client, &container, &config, metadata.as_deref())
+                .await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
         if !self.gate.skip_post_create {
@@ -177,16 +182,21 @@ impl SetUpArgs {
                 None => Vec::new(),
             };
 
-            let lifecycle_env = self
-                .build_lifecycle_env(
-                    &*client,
-                    &container.id,
-                    &remote_user,
-                    &config,
-                    metadata.as_deref(),
-                    &secrets,
-                )
-                .await;
+            let lifecycle_env = build_lifecycle_env(
+                &*client,
+                &container.id,
+                &remote_user,
+                &LifecycleConfigSources {
+                    config: &config,
+                    resolved: resolved.as_ref(),
+                    metadata: metadata.as_deref(),
+                    label_ctx: &label_ctx,
+                },
+                &secrets,
+                &self.remote_env,
+                self.default_user_env_probe,
+            )
+            .await;
 
             let gating = orchestrator::Gating {
                 stop: cella_backend::StopAfter {
@@ -229,6 +239,11 @@ impl SetUpArgs {
             result?;
         }
 
+        Ok(self.success_envelope(&config, metadata.as_deref()))
+    }
+
+    /// Render the success envelope with the requested result sections.
+    fn success_envelope(&self, config: &Value, metadata: Option<&str>) -> String {
         let mut envelope = json!({ "outcome": "success" });
 
         if self.result.include_configuration {
@@ -239,25 +254,25 @@ impl SetUpArgs {
             // `read-configuration`) so the shape matches `up`/`read-configuration`:
             // plural lifecycle arrays + Record-of-arrays customizations.
             //
-            // Use the RAW label, not `effective_metadata`: `build_merged_from_label`
-            // appends the current config itself (in full, since set-up targets by
-            // container-id → `has_id_labels = false`), and `effective_metadata`
-            // has already appended the config's picked lifecycle hooks — passing
-            // it would duplicate them in the plural arrays.
-            let merged = metadata.as_deref().map_or_else(
+            // Use the substituted label, not `effective_metadata`: the merge appends the current config itself (in full, since set-up targets by container-id → `has_id_labels = false`), and `effective_metadata` has already appended the config's picked lifecycle hooks — passing it would duplicate them in the plural arrays.
+            let merged = metadata.map_or_else(
                 || config.clone(),
-                |meta| super::read_configuration::build_merged_from_label(&config, meta, false),
+                |meta| {
+                    super::read_configuration::build_merged_from_substituted_label(
+                        config, meta, false,
+                    )
+                },
             );
             envelope["mergedConfiguration"] = merged;
         }
 
-        Ok(serde_json::to_string(&envelope).expect("BUG: success envelope is not serialisable"))
+        serde_json::to_string(&envelope).expect("BUG: success envelope is not serialisable")
     }
 
     /// Read the devcontainer config. With `--config`, resolve and return it;
     /// if the path does not exist, error per official "Dev container config
-    /// (<path>) not found." When omitted, return an empty object so lifecycle
-    /// is sourced entirely from the container's `devcontainer.metadata` label.
+    /// (<path>) not found." When omitted, return `None` so lifecycle is
+    /// sourced entirely from the container's `devcontainer.metadata` label.
     ///
     /// `workspace_root` is the host-side repo root (from the container's
     /// `dev.cella.workspace_path` label) used as the resolution base for
@@ -266,9 +281,9 @@ impl SetUpArgs {
     fn read_config(
         &self,
         workspace_root: Option<&Path>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<ResolvedConfig>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(config_path) = self.config.as_deref() else {
-            return Ok(json!({}));
+            return Ok(None);
         };
         if !config_path.exists() {
             return Err(format!(
@@ -281,42 +296,26 @@ impl SetUpArgs {
             .map(Path::to_path_buf)
             .or_else(|| config_path.parent().map(Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        Ok(cella_config::devcontainer::resolve::config(&ws, Some(config_path))?.config)
+        Ok(Some(cella_config::devcontainer::resolve::config(
+            &ws,
+            Some(config_path),
+        )?))
     }
+}
 
-    /// Probe user env and build the lifecycle env with the same precedence as
-    /// `run-user-commands`: probed < `--remote-env` < metadata `remoteEnv` <
-    /// config `remoteEnv` < `--secrets-file`.
-    async fn build_lifecycle_env(
-        &self,
-        client: &dyn cella_backend::ContainerBackend,
-        container_id: &str,
-        remote_user: &str,
-        config: &Value,
-        metadata: Option<&str>,
-        secrets: &[String],
-    ) -> Vec<String> {
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(metadata));
-        remote_env.extend(map_env_object(config.get("remoteEnv")));
-
-        let probe_type = config
-            .get("userEnvProbe")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| orchestrator::metadata_user_env_probe(metadata))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.default_user_env_probe);
-        let shell = detect_shell(client, container_id, remote_user).await;
-        let probed =
-            probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
-
-        let mut lifecycle_env = probed.as_ref().map_or_else(
-            || remote_env.clone(),
-            |p| cella_env::user_env_probe::merge_env(p, &remote_env),
+/// Warn early if the label is present but not a JSON array or object,
+/// regardless of which result flags are passed — don't silently drop it.
+fn warn_if_invalid_metadata(raw: Option<&str>) {
+    if let Some(raw) = raw
+        && !matches!(
+            serde_json::from_str::<Value>(raw),
+            Ok(Value::Array(_) | Value::Object(_))
+        )
+    {
+        tracing::warn!(
+            "devcontainer.metadata label is not valid JSON, treating as empty: {}",
+            raw
         );
-        lifecycle_env.extend_from_slice(secrets);
-        lifecycle_env
     }
 }
 
@@ -406,6 +405,47 @@ mod tests {
         assert!(
             missing.is_empty(),
             "`set-up` is missing official flags: {missing:?}"
+        );
+    }
+
+    #[derive(clap::Parser)]
+    struct SetUpHarness {
+        #[command(flatten)]
+        args: SetUpArgs,
+    }
+
+    /// A host value that itself looks like a variable stays literal in set-up's `mergedConfiguration`: the label is substituted exactly once.
+    #[test]
+    fn merged_configuration_substitutes_the_label_once() {
+        use clap::Parser;
+        let SetUpHarness { args } = SetUpHarness::try_parse_from([
+            "set-up",
+            "--container-id",
+            "abc",
+            "--include-merged-configuration",
+        ])
+        .unwrap();
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let ctx = SubstitutionContext::new(
+            Path::new("/ws"),
+            Some("/workspaces/ws"),
+            "the-id",
+            std::collections::HashMap::from([("X".to_string(), literal.to_string())]),
+        );
+        let raw =
+            json!([{"id": "feat", "postCreateCommand": concat!("${localEnv", ":X}")}]).to_string();
+        let config = json!({});
+        let (metadata, _) = super::super::run_user_commands::substitute_label_metadata(
+            Some(&raw),
+            &ctx,
+            &config,
+            true,
+        );
+        let envelope: Value =
+            serde_json::from_str(&args.success_envelope(&config, metadata.as_deref())).unwrap();
+        assert_eq!(
+            envelope["mergedConfiguration"]["postCreateCommands"],
+            json!([literal])
         );
     }
 

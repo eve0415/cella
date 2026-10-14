@@ -14,8 +14,14 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// Expand a leading `~` in a path string to the user's home directory.
+/// Expand a leading `~` (bare, or followed by `/`) in a path string to the
+/// user's home directory. `~user` forms are left unchanged.
 pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~"
+        && let Some(home) = home_dir()
+    {
+        return home;
+    }
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = home_dir()
     {
@@ -46,6 +52,22 @@ mod tests {
             let dir = cella_data_dir().unwrap();
             assert_eq!(dir, PathBuf::from(home).join(".cella"));
         }
+    }
+
+    #[test]
+    fn expand_tilde_bare_tilde_is_home() {
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_tilde("~"), home);
+        }
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_users_literal() {
+        assert_eq!(
+            expand_tilde("~other/ca.pem"),
+            PathBuf::from("~other/ca.pem")
+        );
+        assert_eq!(expand_tilde("a/~/b"), PathBuf::from("a/~/b"));
     }
 
     #[test]
