@@ -29,12 +29,10 @@ use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve::ResolvedConfig;
 use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::user_env_probe::UserEnvProbe;
-use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
-use cella_orchestrator::shell_detect::detect_shell;
 
 use super::run_user_commands::{
-    AttachArgs, CompatArgs, LifecycleConfigSources, lifecycle_remote_env,
+    AttachArgs, CompatArgs, LifecycleConfigSources, build_lifecycle_env,
 };
 use super::up::parse_secrets_file;
 use crate::backend::BackendArgs;
@@ -184,20 +182,21 @@ impl SetUpArgs {
                 None => Vec::new(),
             };
 
-            let lifecycle_env = self
-                .build_lifecycle_env(
-                    &*client,
-                    &container.id,
-                    &remote_user,
-                    &LifecycleConfigSources {
-                        config: &config,
-                        resolved: resolved.as_ref(),
-                        metadata: metadata.as_deref(),
-                        label_ctx: &label_ctx,
-                    },
-                    &secrets,
-                )
-                .await;
+            let lifecycle_env = build_lifecycle_env(
+                &*client,
+                &container.id,
+                &remote_user,
+                &LifecycleConfigSources {
+                    config: &config,
+                    resolved: resolved.as_ref(),
+                    metadata: metadata.as_deref(),
+                    label_ctx: &label_ctx,
+                },
+                &secrets,
+                &self.remote_env,
+                self.default_user_env_probe,
+            )
+            .await;
 
             let gating = orchestrator::Gating {
                 stop: cella_backend::StopAfter {
@@ -310,41 +309,6 @@ impl SetUpArgs {
             &ws,
             Some(config_path),
         )?))
-    }
-
-    /// Probe user env and build the lifecycle env with the same precedence as
-    /// `run-user-commands`: probed < `--remote-env` < metadata `remoteEnv` <
-    /// config `remoteEnv` < `--secrets-file`.
-    async fn build_lifecycle_env(
-        &self,
-        client: &dyn cella_backend::ContainerBackend,
-        container_id: &str,
-        remote_user: &str,
-        sources: &LifecycleConfigSources<'_>,
-        secrets: &[String],
-    ) -> Vec<String> {
-        let LifecycleConfigSources {
-            config, metadata, ..
-        } = *sources;
-        let probe_type = config
-            .get("userEnvProbe")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| orchestrator::metadata_user_env_probe(metadata))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.default_user_env_probe);
-        let shell = detect_shell(client, container_id, remote_user).await;
-        let probed =
-            probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
-
-        let remote_env = lifecycle_remote_env(&self.remote_env, sources, probed.as_ref());
-
-        let mut lifecycle_env = probed.as_ref().map_or_else(
-            || remote_env.clone(),
-            |p| cella_env::user_env_probe::merge_env(p, &remote_env),
-        );
-        lifecycle_env.extend_from_slice(secrets);
-        lifecycle_env
     }
 }
 

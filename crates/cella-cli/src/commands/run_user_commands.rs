@@ -329,20 +329,21 @@ impl RunUserCommandsArgs {
             None => Vec::new(),
         };
 
-        let lifecycle_env = self
-            .build_lifecycle_env(
-                &*client,
-                &container.id,
-                &remote_user,
-                &LifecycleConfigSources {
-                    config: &config,
-                    resolved: resolved.as_ref(),
-                    metadata: metadata.as_deref(),
-                    label_ctx: &label_ctx,
-                },
-                &secrets,
-            )
-            .await;
+        let lifecycle_env = build_lifecycle_env(
+            &*client,
+            &container.id,
+            &remote_user,
+            &LifecycleConfigSources {
+                config: &config,
+                resolved: resolved.as_ref(),
+                metadata: metadata.as_deref(),
+                label_ctx: &label_ctx,
+            },
+            &secrets,
+            &self.remote_env,
+            self.default_user_env_probe,
+        )
+        .await;
 
         let gating = self.build_gating(&config, effective_metadata.as_deref());
         let (sender, renderer) = crate::progress::bridge(&progress);
@@ -408,55 +409,6 @@ impl RunUserCommandsArgs {
         )?))
     }
 
-    /// Probe the user environment and build the lifecycle env with the official
-    /// precedence: probed < `--remote-env` < (config + metadata) `remoteEnv`.
-    ///
-    /// The official `probeRemoteEnv(updatedMergedConfig)` spreads the
-    /// metadata-merged config's `remoteEnv`, not the raw on-disk one. cella's
-    /// `parse_image_metadata` does not expose `remoteEnv`, so the merged
-    /// `remoteEnv` is assembled here from (a) the metadata label's per-entry
-    /// `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config`
-    /// `remoteEnv` layered last — the on-disk user config is the final metadata
-    /// entry in the official merge, so it wins over earlier feature/base entries.
-    ///
-    /// `--secrets-file` entries are layered last of all, so they win over both
-    /// probed and `remoteEnv` values, mirroring `up` and the official
-    /// `runLifecycleHooks(..., secretsP)`.
-    async fn build_lifecycle_env(
-        &self,
-        client: &dyn cella_backend::ContainerBackend,
-        container_id: &str,
-        remote_user: &str,
-        sources: &LifecycleConfigSources<'_>,
-        secrets: &[String],
-    ) -> Vec<String> {
-        let LifecycleConfigSources {
-            config, metadata, ..
-        } = *sources;
-        // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
-        // --config wins (it's in pickUpdateableConfigProperties, appended last in
-        // every branch), then the baked metadata's value, then the CLI default.
-        let probe_type = config
-            .get("userEnvProbe")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| orchestrator::metadata_user_env_probe(metadata))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.default_user_env_probe);
-        let shell = detect_shell(client, container_id, remote_user).await;
-        let probed =
-            probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
-
-        let remote_env = lifecycle_remote_env(&self.remote_env, sources, probed.as_ref());
-
-        let mut lifecycle_env = probed.as_ref().map_or_else(
-            || remote_env.clone(),
-            |p| cella_env::user_env_probe::merge_env(p, &remote_env),
-        );
-        lifecycle_env.extend_from_slice(secrets);
-        lifecycle_env
-    }
-
     /// Build the lifecycle gating from the parity flags and resolved `waitFor`.
     ///
     /// `waitFor` is sourced from the effective metadata array (the baked
@@ -482,6 +434,47 @@ impl RunUserCommandsArgs {
     }
 }
 
+/// Probe the user environment and build the lifecycle env with the official precedence: probed < `--remote-env` < (config + metadata) `remoteEnv`.
+/// Shared by `run-user-commands` and `set-up`.
+///
+/// The official `probeRemoteEnv(updatedMergedConfig)` spreads the metadata-merged config's `remoteEnv`, not the raw on-disk one.
+/// cella's `parse_image_metadata` does not expose `remoteEnv`, so the merged `remoteEnv` is assembled here from (a) the metadata label's per-entry `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config` `remoteEnv` layered last — the on-disk user config is the final metadata entry in the official merge, so it wins over earlier feature/base entries.
+///
+/// `--secrets-file` entries are layered last of all, so they win over both probed and `remoteEnv` values, mirroring `up` and the official `runLifecycleHooks(..., secretsP)`.
+pub(super) async fn build_lifecycle_env(
+    client: &dyn cella_backend::ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    sources: &LifecycleConfigSources<'_>,
+    secrets: &[String],
+    cli_remote_env: &[String],
+    default_user_env_probe: UserEnvProbe,
+) -> Vec<String> {
+    let LifecycleConfigSources {
+        config, metadata, ..
+    } = *sources;
+    // userEnvProbe precedence mirrors official mergeConfiguration: the fresh --config wins (it's in pickUpdateableConfigProperties, appended last in every branch), then the baked metadata's value, then the CLI default.
+    let probe_type = config
+        .get("userEnvProbe")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| orchestrator::metadata_user_env_probe(metadata))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_user_env_probe);
+    let shell = detect_shell(client, container_id, remote_user).await;
+    let probed =
+        probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
+
+    let remote_env = lifecycle_remote_env(cli_remote_env, sources, probed.as_ref());
+
+    let mut lifecycle_env = probed.as_ref().map_or_else(
+        || remote_env.clone(),
+        |p| cella_env::user_env_probe::merge_env(p, &remote_env),
+    );
+    lifecycle_env.extend_from_slice(secrets);
+    lifecycle_env
+}
+
 /// The config sources `build_lifecycle_env` resolves `remoteEnv` from: the
 /// substituted on-disk config, the full resolved config (for the raw remoteEnv
 /// snapshot + substitution inputs), the container's baked metadata label, and
@@ -496,7 +489,7 @@ pub(super) struct LifecycleConfigSources<'a> {
 
 /// The `remoteEnv` layered over the probed env, ordered for `merge_env`'s later-wins insert: `--remote-env`, then the metadata label's, then the on-disk config's last so it wins.
 /// Both `remoteEnv` portions are resolved after the probe so `${containerEnv:VAR}` resolves against the live container env.
-pub(super) fn lifecycle_remote_env(
+fn lifecycle_remote_env(
     cli_remote_env: &[String],
     sources: &LifecycleConfigSources<'_>,
     probed: Option<&std::collections::HashMap<String, String>>,
