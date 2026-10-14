@@ -238,11 +238,16 @@ impl SetUpArgs {
             result?;
         }
 
-        Ok(self.success_envelope(&config, raw_metadata.as_deref()))
+        Ok(self.success_envelope(&config, raw_metadata.as_deref(), &label_ctx))
     }
 
     /// Render the success envelope with the requested result sections.
-    fn success_envelope(&self, config: &Value, raw_metadata: Option<&str>) -> String {
+    fn success_envelope(
+        &self,
+        config: &Value,
+        raw_metadata: Option<&str>,
+        label_ctx: &SubstitutionContext,
+    ) -> String {
         let mut envelope = json!({ "outcome": "success" });
 
         if self.result.include_configuration {
@@ -260,7 +265,11 @@ impl SetUpArgs {
             // it would duplicate them in the plural arrays.
             let merged = raw_metadata.map_or_else(
                 || config.clone(),
-                |meta| super::read_configuration::build_merged_from_label(config, meta, false),
+                |meta| {
+                    super::read_configuration::build_merged_from_label(
+                        config, meta, false, label_ctx,
+                    )
+                },
             );
             envelope["mergedConfiguration"] = merged;
         }
