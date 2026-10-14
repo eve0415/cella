@@ -284,13 +284,17 @@ fn derive_workspace_mount(host_mount_folder: &Path, container_target: &str) -> S
 /// Build the `mergedConfiguration` output for a resolved devcontainer,
 /// matching the official `mergeConfiguration` shape from the devcontainers CLI.
 ///
-/// Reused by `up --include-merged-configuration`.
+/// Used by `up --include-merged-configuration`.
+/// Feature contributions are substituted with the config's context, as in `read-configuration`.
 pub async fn resolve_merged_config(
-    config: &serde_json::Value,
-    config_path: &Path,
+    resolved: &resolve::ResolvedConfig,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let rf = resolve_config_features(config, config_path).await?;
-    Ok(build_merged_output(config, rf.as_ref()))
+    let rf = resolve_config_features(&resolved.config, &resolved.config_path).await?;
+    Ok(build_substituted_merged_output(
+        &resolved.config,
+        rf.as_ref(),
+        &cella_config::config_map::subst_ctx(resolved),
+    ))
 }
 
 /// Resolve the config's features for `mergedConfiguration`/`featuresConfiguration`,
@@ -1486,6 +1490,35 @@ mod tests {
         std::fs::write(dc_dir.join("devcontainer.json"), config_content)
             .expect("write devcontainer.json");
         workspace
+    }
+
+    /// `up --include-merged-configuration` substitutes feature contributions with the config's context, as `read-configuration` does.
+    #[tokio::test]
+    async fn resolve_merged_config_substitutes_feature_contributions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dc = tmp.path().join(".devcontainer");
+        let feature = dc.join("my-feature");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(
+            feature.join("devcontainer-feature.json"),
+            concat!(
+                r#"{"id": "my-feature", "version": "1.0.0", "entrypoint": "/run/${devcontainerId"#,
+                r#"}.sh"}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "ubuntu", "features": {"./my-feature": {}}}"#,
+        )
+        .unwrap();
+        let resolved = resolve::config(tmp.path(), None).unwrap();
+        let out = resolve_merged_config(&resolved).await.unwrap();
+        assert_eq!(
+            out["entrypoints"],
+            json!([format!("/run/{}.sh", resolved.devcontainer_id)])
+        );
     }
 
     #[tokio::test]

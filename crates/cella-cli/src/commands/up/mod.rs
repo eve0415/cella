@@ -1881,13 +1881,8 @@ pub async fn populate_envelope_extras(
         // KNOWN GAP: merged shape diverges from official mergeConfiguration
         // (plural lifecycle arrays, customizations Record); tracked for a
         // follow-up.
-        result.merged_configuration = Some(
-            super::read_configuration::resolve_merged_config(
-                ctx.config(),
-                &ctx.resolved.config_path,
-            )
-            .await?,
-        );
+        result.merged_configuration =
+            Some(super::read_configuration::resolve_merged_config(&ctx.resolved).await?);
     }
     Ok(())
 }
