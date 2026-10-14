@@ -172,7 +172,14 @@ fn resolved_devcontainer_id(
     )
 }
 
-fn spec_devcontainer_id(labels: &BTreeMap<String, String>) -> String {
+/// Compute a spec `devcontainerId` from an arbitrary label set: SHA-256 of the
+/// sorted JSON label object, base-32 encoded, left-padded to 52 chars.
+///
+/// # Panics
+///
+/// Never in practice: a string-to-string map always serializes to JSON.
+#[must_use]
+pub fn spec_devcontainer_id(labels: &BTreeMap<String, String>) -> String {
     let json = serde_json::to_string(labels).expect("serialize labels");
     let hash = Sha256::digest(json.as_bytes());
     let base32 = bigint_to_base32(&hash);

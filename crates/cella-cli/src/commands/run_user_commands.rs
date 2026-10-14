@@ -23,7 +23,9 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use cella_backend::ContainerTarget;
+use cella_config::config_map::metadata_label;
 use cella_config::devcontainer::resolve;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::user_env_probe::UserEnvProbe;
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
@@ -287,7 +289,7 @@ impl RunUserCommandsArgs {
         let config = resolved
             .as_ref()
             .map_or_else(|| json!({}), |r| r.config.clone());
-        let metadata = container.labels.get("devcontainer.metadata").cloned();
+        let workspace_folder = workspace_folder_in_container(&config, &container);
 
         // Official `getImageMetadataFromContainer` branches on `hasIdLabels`: a
         // container matched by `--id-label` / workspace folder (true) is driven
@@ -299,14 +301,26 @@ impl RunUserCommandsArgs {
         // official treats as branch A; matching that exactly would require
         // porting `findContainerAndIdLabels`.)
         let appends_config = self.target.container_id.is_some();
-        let effective_metadata = cella_backend::lifecycle::effective_lifecycle_metadata(
-            metadata.as_deref(),
+        let label_ctx = label_subst_ctx(
+            resolved.as_ref(),
+            &container,
+            &self.target.id_label,
+            &workspace_folder,
+            std::env::vars(),
+        );
+        let (metadata, effective_metadata) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &label_ctx,
             &config,
             appends_config,
         );
 
-        let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
-        let workspace_folder = workspace_folder_in_container(&config, &container);
+        let remote_user =
+            orchestrator::resolve_remote_user(&*client, &container, &config, metadata.as_deref())
+                .await;
 
         // Read --secrets-file up front so a bad file fails before any command
         // runs (mirrors official doRunUserCommands → readSecretsFromFile).
@@ -504,6 +518,49 @@ fn resolve_config_remote_env(
     } else {
         map_env_object(config.get("remoteEnv"))
     }
+}
+
+/// The context that substitutes the container's `devcontainer.metadata` label:
+/// the `--config` context when a config was resolved, else one derived from
+/// the container's identity labels.
+fn label_subst_ctx(
+    resolved: Option<&resolve::ResolvedConfig>,
+    container: &cella_backend::ContainerInfo,
+    id_labels: &[String],
+    container_workspace_folder: &str,
+    env: impl IntoIterator<Item = (String, String)>,
+) -> SubstitutionContext {
+    resolved.map_or_else(
+        || {
+            metadata_label::container_subst_ctx(
+                &container.labels,
+                super::id_label_map(id_labels).as_ref(),
+                Some(container_workspace_folder),
+                env,
+            )
+        },
+        cella_config::config_map::subst_ctx,
+    )
+}
+
+/// Substitute the container's metadata label, then derive the effective
+/// lifecycle metadata from it (appending the config when `appends_config`).
+///
+/// Returns `(metadata, effective_metadata)`. Substituting before appending
+/// keeps the already-substituted config from being substituted twice.
+pub(super) fn substitute_label_metadata(
+    raw_label: Option<&str>,
+    ctx: &SubstitutionContext,
+    config: &Value,
+    appends_config: bool,
+) -> (Option<String>, Option<String>) {
+    let metadata = raw_label.map(|m| metadata_label::substitute_metadata_label(m, ctx));
+    let effective = cella_backend::lifecycle::effective_lifecycle_metadata(
+        metadata.as_deref(),
+        config,
+        appends_config,
+    );
+    (metadata, effective)
 }
 
 /// Render the JSON success envelope (single line). Matches official
@@ -874,6 +931,118 @@ mod tests {
             mounts: Vec::new(),
             backend: cella_backend::BackendKind::Docker,
         }
+    }
+
+    fn identity_labels_with_metadata(metadata: &Value) -> cella_backend::ContainerInfo {
+        container_with_labels(&[
+            ("devcontainer.local_folder", "/ws"),
+            (
+                "devcontainer.config_file",
+                "/ws/.devcontainer/devcontainer.json",
+            ),
+            ("devcontainer.metadata", &metadata.to_string()),
+        ])
+    }
+
+    fn post_create_commands(effective: Option<&str>, config: &Value) -> Vec<Value> {
+        cella_backend::lifecycle::lifecycle_entries_for_phase(
+            effective,
+            config,
+            "postCreateCommand",
+        )
+        .into_iter()
+        .map(|e| e.command)
+        .collect()
+    }
+
+    /// Without `--config`, label lifecycle entries resolve `${localEnv}` and
+    /// `${devcontainerId}` from the container's identity labels.
+    #[test]
+    fn label_lifecycle_is_substituted_without_config() {
+        let container = identity_labels_with_metadata(&json!([{
+            "postCreateCommand": concat!("echo ${localEnv", ":X} ${devcontainerId", "}")
+        }]));
+        let env = std::collections::HashMap::from([("X".to_string(), "hi".to_string())]);
+        let ctx = label_subst_ctx(None, &container, &[], "/workspaces/ws", env);
+        let config = json!({});
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &config,
+            false,
+        );
+        let id = resolve::devcontainer_id(
+            std::path::Path::new("/ws"),
+            std::path::Path::new("/ws/.devcontainer/devcontainer.json"),
+        );
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &config),
+            vec![json!(format!("echo hi {id}"))]
+        );
+    }
+
+    /// `--id-label` drives `${devcontainerId}` in label entries.
+    #[test]
+    fn label_lifecycle_uses_id_labels_for_devcontainer_id() {
+        let container = identity_labels_with_metadata(&json!([{
+            "postCreateCommand": concat!("${devcontainerId", "}")
+        }]));
+        let ctx = label_subst_ctx(
+            None,
+            &container,
+            &["a=1".to_string()],
+            "/workspaces/ws",
+            std::collections::HashMap::new(),
+        );
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &json!({}),
+            false,
+        );
+        let id = resolve::spec_devcontainer_id(&std::collections::BTreeMap::from([(
+            "a".to_string(),
+            "1".to_string(),
+        )]));
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &json!({})),
+            vec![json!(id)]
+        );
+    }
+
+    /// The appended `--config` is already substituted: a literal `${...}` it
+    /// carries must survive, while the same text in a label entry expands.
+    #[test]
+    fn appended_config_is_not_substituted_twice() {
+        let literal = concat!("${localWorkspaceFolder", "}");
+        let container = identity_labels_with_metadata(&json!([{"postCreateCommand": literal}]));
+        let ctx = label_subst_ctx(
+            None,
+            &container,
+            &[],
+            "/workspaces/ws",
+            std::collections::HashMap::new(),
+        );
+        let config = json!({"postCreateCommand": literal});
+        let (_, effective) = substitute_label_metadata(
+            container
+                .labels
+                .get("devcontainer.metadata")
+                .map(String::as_str),
+            &ctx,
+            &config,
+            true,
+        );
+        assert_eq!(
+            post_create_commands(effective.as_deref(), &config),
+            vec![json!("/ws"), json!(literal)]
+        );
     }
 
     #[test]

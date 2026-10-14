@@ -26,6 +26,8 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use cella_backend::ContainerTarget;
+use cella_config::devcontainer::resolve::ResolvedConfig;
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::user_env_probe::UserEnvProbe;
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
@@ -145,12 +147,15 @@ impl SetUpArgs {
             .get("dev.cella.workspace_path")
             .map(PathBuf::from);
 
-        let config = self.read_config(workspace_root.as_deref())?;
-        let metadata = container.labels.get("devcontainer.metadata").cloned();
+        let resolved = self.read_config(workspace_root.as_deref())?;
+        let config = resolved
+            .as_ref()
+            .map_or_else(|| json!({}), |r| r.config.clone());
+        let raw_metadata = container.labels.get("devcontainer.metadata").cloned();
 
         // Warn early if the label is present but not valid JSON, regardless of
         // which result flags are passed — don't silently drop it.
-        if let Some(raw) = metadata.as_deref()
+        if let Some(raw) = raw_metadata.as_deref()
             && serde_json::from_str::<Vec<Value>>(raw).is_err()
         {
             tracing::warn!(
@@ -159,16 +164,25 @@ impl SetUpArgs {
             );
         }
 
-        // --container-id is the only resolution path for set-up, which matches
-        // official's `hasIdLabels === false` branch: the on-disk --config is
-        // appended to the baked metadata array.
-        let effective_metadata = cella_backend::lifecycle::effective_lifecycle_metadata(
-            metadata.as_deref(),
+        // Label entries are substituted with the `--config` context, or with
+        // `${localEnv}` alone when there is no config (as the official CLI
+        // does). --container-id is the only resolution path for set-up, which
+        // matches official's `hasIdLabels === false` branch: the on-disk
+        // --config is appended to the baked metadata array.
+        let label_ctx = resolved.as_ref().map_or_else(
+            || SubstitutionContext::local_env_only(std::env::vars().collect()),
+            cella_config::config_map::subst_ctx,
+        );
+        let (metadata, effective_metadata) = super::run_user_commands::substitute_label_metadata(
+            raw_metadata.as_deref(),
+            &label_ctx,
             &config,
             true,
         );
 
-        let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
+        let remote_user =
+            orchestrator::resolve_remote_user(&*client, &container, &config, metadata.as_deref())
+                .await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
         if !self.gate.skip_post_create {
@@ -229,6 +243,11 @@ impl SetUpArgs {
             result?;
         }
 
+        Ok(self.success_envelope(&config, raw_metadata.as_deref()))
+    }
+
+    /// Render the success envelope with the requested result sections.
+    fn success_envelope(&self, config: &Value, raw_metadata: Option<&str>) -> String {
         let mut envelope = json!({ "outcome": "success" });
 
         if self.result.include_configuration {
@@ -244,20 +263,20 @@ impl SetUpArgs {
             // container-id → `has_id_labels = false`), and `effective_metadata`
             // has already appended the config's picked lifecycle hooks — passing
             // it would duplicate them in the plural arrays.
-            let merged = metadata.as_deref().map_or_else(
+            let merged = raw_metadata.map_or_else(
                 || config.clone(),
-                |meta| super::read_configuration::build_merged_from_label(&config, meta, false),
+                |meta| super::read_configuration::build_merged_from_label(config, meta, false),
             );
             envelope["mergedConfiguration"] = merged;
         }
 
-        Ok(serde_json::to_string(&envelope).expect("BUG: success envelope is not serialisable"))
+        serde_json::to_string(&envelope).expect("BUG: success envelope is not serialisable")
     }
 
     /// Read the devcontainer config. With `--config`, resolve and return it;
     /// if the path does not exist, error per official "Dev container config
-    /// (<path>) not found." When omitted, return an empty object so lifecycle
-    /// is sourced entirely from the container's `devcontainer.metadata` label.
+    /// (<path>) not found." When omitted, return `None` so lifecycle is
+    /// sourced entirely from the container's `devcontainer.metadata` label.
     ///
     /// `workspace_root` is the host-side repo root (from the container's
     /// `dev.cella.workspace_path` label) used as the resolution base for
@@ -266,9 +285,9 @@ impl SetUpArgs {
     fn read_config(
         &self,
         workspace_root: Option<&Path>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<ResolvedConfig>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(config_path) = self.config.as_deref() else {
-            return Ok(json!({}));
+            return Ok(None);
         };
         if !config_path.exists() {
             return Err(format!(
@@ -281,7 +300,10 @@ impl SetUpArgs {
             .map(Path::to_path_buf)
             .or_else(|| config_path.parent().map(Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        Ok(cella_config::devcontainer::resolve::config(&ws, Some(config_path))?.config)
+        Ok(Some(cella_config::devcontainer::resolve::config(
+            &ws,
+            Some(config_path),
+        )?))
     }
 
     /// Probe user env and build the lifecycle env with the same precedence as

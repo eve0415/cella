@@ -4,6 +4,7 @@
 //! `CreateContainerOptions` (backend-agnostic types from `cella-backend`).
 
 pub mod env;
+pub mod metadata_label;
 pub mod mounts;
 pub mod ports;
 pub mod run_args;

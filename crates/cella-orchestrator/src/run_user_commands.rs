@@ -370,11 +370,13 @@ async fn maybe_install_dotfiles(lc_ctx: &LifecycleContext<'_>, input: &RunUserCo
 ///
 /// Mirrors the `up` reuse-path priority: config `remoteUser` > config
 /// `containerUser` > metadata `remoteUser` > metadata `containerUser` > image
-/// `USER` > the `dev.cella.remote_user` label > `root`.
+/// `USER` > the `dev.cella.remote_user` label > `root`. `metadata` is the
+/// container's (substituted) `devcontainer.metadata` label.
 pub async fn resolve_remote_user(
     client: &dyn ContainerBackend,
     container: &cella_backend::ContainerInfo,
     config: &Value,
+    metadata: Option<&str>,
 ) -> String {
     if let Some(u) = config.get("remoteUser").and_then(Value::as_str) {
         return u.to_string();
@@ -383,10 +385,7 @@ pub async fn resolve_remote_user(
         return u.to_string();
     }
 
-    let meta_user = container
-        .labels
-        .get("devcontainer.metadata")
-        .map(|m| cella_features::parse_image_metadata(m).1);
+    let meta_user = metadata.map(|m| cella_features::parse_image_metadata(m).1);
     if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
         return u.to_string();
     }
