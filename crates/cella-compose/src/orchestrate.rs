@@ -503,10 +503,10 @@ async fn resolve_user_and_env(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
+    subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
 ) -> ComposeRuntimeResolution {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     let (image_user, image_meta_user, base_image_security, base_metadata) =
         resolve_compose_image_info(
             client,
@@ -514,7 +514,7 @@ async fn resolve_user_and_env(
             features_build,
             cfg.docker_binaries(),
             progress,
-            &subst_ctx,
+            subst_ctx,
         )
         .await;
     // Runtime security props: prefer the (substituted) resolved-features
@@ -525,7 +525,7 @@ async fn resolve_user_and_env(
         .map(|fb| {
             cella_config::config_map::substitute_feature_config(
                 fb.resolved_features.container_config.clone(),
-                &subst_ctx,
+                subst_ctx,
             )
         })
         .or(base_image_security);
@@ -671,7 +671,7 @@ async fn prepare_and_start(
         security,
         metadata_label,
         feature_entrypoints,
-    } = resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
+    } = resolve_user_and_env(client, ctx, project, features_build.as_ref(), &subst_ctx).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-15. Build override context, UID remap, write override, and start.
