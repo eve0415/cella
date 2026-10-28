@@ -16,6 +16,12 @@ enum Scope {
     /// Only `${localEnv:...}` / `${env:...}`; every other expression is left
     /// as its literal `${...}` text.
     LocalEnvOnly,
+    /// Every supported variable except `${containerEnv:...}`, which is left as
+    /// its literal `${...}` text until a container env is supplied.
+    DeferContainerEnv,
+    /// Only `${containerEnv:...}`; every other expression is left as its
+    /// literal `${...}` text.
+    ContainerEnvOnly,
 }
 
 /// Context for resolving devcontainer variable expressions.
@@ -82,6 +88,32 @@ impl SubstitutionContext {
             devcontainer_id: None,
             container_env: None,
         }
+    }
+
+    /// Create a context that expands only `${containerEnv:...}` against
+    /// `container_env`.
+    ///
+    /// Used to finish entries that were stored with `${containerEnv:...}`
+    /// deferred: everything else in them was already expanded, so it is left
+    /// as is.
+    #[must_use]
+    pub fn container_env_only(container_env: HashMap<String, String>) -> Self {
+        Self {
+            container_env: Some(container_env),
+            scope: Scope::ContainerEnvOnly,
+            ..Self::local_env_only(HashMap::new())
+        }
+    }
+
+    /// Consume this context and return it leaving `${containerEnv:...}` as its
+    /// literal text (default included) while everything else still resolves.
+    ///
+    /// Used where no container env exists yet but the value must be finished
+    /// against the running container later.
+    #[must_use]
+    pub const fn deferring_container_env(mut self) -> Self {
+        self.scope = Scope::DeferContainerEnv;
+        self
     }
 
     /// Consume this context and return it with `${devcontainerId}` resolving to
@@ -186,8 +218,8 @@ impl SubstitutionContext {
 
     /// Whether this context resolves `keyword`, or leaves it literal.
     ///
-    /// A local-env-only context also resolves `${containerEnv:...}` once the
-    /// probed container env has been supplied.
+    /// A local-env-only or deferring context also resolves
+    /// `${containerEnv:...}` once a container env has been supplied.
     fn resolves(&self, keyword: &str) -> bool {
         match self.scope {
             Scope::Full => true,
@@ -196,6 +228,8 @@ impl SubstitutionContext {
                     || (keyword == "containerEnv" && self.container_env.is_some())
                     || (keyword == "devcontainerId" && self.devcontainer_id.is_some())
             }
+            Scope::DeferContainerEnv => keyword != "containerEnv" || self.container_env.is_some(),
+            Scope::ContainerEnvOnly => keyword == "containerEnv",
         }
     }
 
@@ -842,5 +876,69 @@ mod tests {
 
         // No ${containerEnv:…} tokens → both passes must agree
         assert_eq!(first_pass, second_pass);
+    }
+
+    // --- deferring_container_env / container_env_only ---
+
+    #[test]
+    fn deferring_container_env_leaves_container_env_literal() {
+        let ctx = test_ctx().deferring_container_env();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}:/x"),
+            "${containerEnv:PATH}:/x"
+        );
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:MISSING:a:b}"),
+            "${containerEnv:MISSING:a:b}"
+        );
+    }
+
+    #[test]
+    fn deferring_container_env_still_resolves_everything_else() {
+        let ctx = test_ctx().deferring_container_env();
+        assert_eq!(ctx.substitute_str("${localEnv:HOME}/x"), "/home/testuser/x");
+        assert_eq!(
+            ctx.substitute_str("${localWorkspaceFolder}/bin"),
+            "/projects/myapp/bin"
+        );
+        assert_eq!(ctx.substitute_str("${devcontainerId}"), "abc123");
+    }
+
+    #[test]
+    fn deferring_container_env_resolves_once_container_env_supplied() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let ctx = test_ctx()
+            .deferring_container_env()
+            .with_container_env(cenv);
+        assert_eq!(ctx.substitute_str("${containerEnv:PATH}:/x"), "/usr/bin:/x");
+    }
+
+    #[test]
+    fn container_env_only_resolves_container_env() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let ctx = SubstitutionContext::container_env_only(cenv);
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}:/x"),
+            "/usr/bin:/bin:/x"
+        );
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:MISSING:fallback}"),
+            "fallback"
+        );
+        assert_eq!(ctx.substitute_str("${containerEnv:MISSING}"), "");
+    }
+
+    #[test]
+    fn container_env_only_leaves_other_variables_literal() {
+        let ctx = SubstitutionContext::container_env_only(HashMap::new());
+        for input in [
+            "${localEnv:HOME}",
+            "${env:HOME}",
+            "${localWorkspaceFolder}",
+            "${containerWorkspaceFolder}",
+            "${devcontainerId}",
+        ] {
+            assert_eq!(ctx.substitute_str(input), input);
+        }
     }
 }
