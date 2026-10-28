@@ -133,7 +133,9 @@ pub struct UpConfig<'a> {
     /// `Some` when the config was read from disk and has a `remoteEnv` key;
     /// `None` when the config was reconstructed from a container label (already
     /// substituted) or when `remoteEnv` was absent.  Used by the orchestrator
-    /// for the second-pass containerEnv resolution after `userEnvProbe`.
+    /// for the second-pass containerEnv resolution after `userEnvProbe`, and
+    /// to build the `dev.cella.remote_env` label with `${containerEnv:...}`
+    /// kept literal for exec time.
     pub raw_remote_env: Option<&'a serde_json::Value>,
     /// Remote environment entries from the CLI `--remote-env` flag. Applied to
     /// lifecycle command env ONLY (config `remote_env` wins on key collision);

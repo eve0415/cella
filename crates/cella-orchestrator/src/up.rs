@@ -1040,7 +1040,11 @@ impl EnsureUpContext<'_> {
         //   probed < fwd_env < CLI --remote-env < config remoteEnv
         // Merging them into one label would make infra entries (proxy vars,
         // SSH_AUTH_SOCK from env_fwd) incorrectly beat explicit --remote-env.
-        let label_remote_env = self.config.remote_env.to_vec();
+        let label_remote_env = remote_env_label_entries(
+            self.config.remote_env,
+            self.config.raw_remote_env,
+            self.config.resolved,
+        );
         if !label_remote_env.is_empty() {
             labels.insert(
                 "dev.cella.remote_env".to_string(),
@@ -2689,6 +2693,28 @@ fn resolved_remote_env(
     config.remote_env.to_vec()
 }
 
+/// Build the `dev.cella.remote_env` label entries.
+///
+/// `${containerEnv:VAR}` cannot resolve before the container exists, so it is
+/// kept as literal text for `exec`/`shell`/`switch` to finish against the
+/// running container, the way the official CLI re-substitutes at exec time.
+/// Every other variable is expanded now. Configs without a `${containerEnv:`
+/// token (or with no raw snapshot) keep the phase-1 `remote_env` as is.
+fn remote_env_label_entries(
+    remote_env: &[String],
+    raw_remote_env: Option<&serde_json::Value>,
+    resolved: &cella_config::devcontainer::resolve::ResolvedConfig,
+) -> Vec<String> {
+    if let Some(raw) = raw_remote_env
+        && raw.to_string().contains("${containerEnv:")
+    {
+        return cella_config::config_map::subst_ctx(resolved)
+            .deferring_container_env()
+            .substitute_remote_env(raw);
+    }
+    remote_env.to_vec()
+}
+
 /// Populate the container env from the image's own `ENV` if nothing has yet.
 ///
 /// `create_opts.env` is left empty when the config declares no `containerEnv`,
@@ -2822,6 +2848,63 @@ mod tests {
             container_metadata_label(&resolved, None, Some("[{}]"), false),
             "[{}]"
         );
+    }
+
+    fn resolved_with_raw_remote_env(
+        raw: &serde_json::Value,
+    ) -> cella_config::devcontainer::resolve::ResolvedConfig {
+        cella_config::devcontainer::resolve::ResolvedConfig {
+            config: serde_json::json!({}),
+            config_path: std::path::PathBuf::from("/ws/.devcontainer/devcontainer.json"),
+            workspace_root: std::path::PathBuf::from("/nonexistent-cella-ws"),
+            config_hash: String::new(),
+            devcontainer_id: "dcid".to_string(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env: Some(raw.clone()),
+            raw_config: serde_json::json!({ "remoteEnv": raw }),
+            container_identity: None,
+            default_container_workspace_folder: None,
+        }
+    }
+
+    /// Regression: `${containerEnv:PATH}` collapsed to "" at config time, so
+    /// the label carried `PATH=:/x` and `cella shell` lost the image PATH.
+    #[test]
+    fn remote_env_label_entries_keeps_container_env_literal() {
+        let raw = serde_json::json!({
+            "PATH": concat!("${containerEnv", ":PATH}:/x"),
+            "WITH_DEFAULT": concat!("${containerEnv", ":MISSING:a:b}"),
+            "WS": "${localWorkspaceFolder}/bin",
+            "ID": "${devcontainerId}",
+            "HOME_COPY": concat!("${localEnv", ":HOME}"),
+        });
+        let resolved = resolved_with_raw_remote_env(&raw);
+        let phase1 = ["PATH=:/x".to_string()];
+        let mut label = remote_env_label_entries(&phase1, Some(&raw), &resolved);
+        label.sort();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut expected = vec![
+            concat!("PATH=${containerEnv", ":PATH}:/x").to_string(),
+            concat!("WITH_DEFAULT=${containerEnv", ":MISSING:a:b}").to_string(),
+            "WS=/nonexistent-cella-ws/bin".to_string(),
+            "ID=dcid".to_string(),
+            format!("HOME_COPY={home}"),
+        ];
+        expected.sort();
+        assert_eq!(label, expected);
+    }
+
+    #[test]
+    fn remote_env_label_entries_falls_back_without_container_env_or_raw() {
+        let raw = serde_json::json!({ "EDITOR": "${localWorkspaceFolder}" });
+        let resolved = resolved_with_raw_remote_env(&raw);
+        let phase1 = ["EDITOR=phase1".to_string()];
+        assert_eq!(
+            remote_env_label_entries(&phase1, Some(&raw), &resolved),
+            phase1
+        );
+        assert_eq!(remote_env_label_entries(&phase1, None, &resolved), phase1);
     }
 
     /// Attaching to a VS Code or official-CLI container must not leave cella
