@@ -401,8 +401,6 @@ async fn resolve_exec_context(
     // Config remoteEnv (wins over --remote-env) and infra-forwarded env (loses
     // to --remote-env) are stored in separate labels so exec can apply the
     // correct 4-way precedence: probed < fwd_env < CLI < config.
-    let config_remote_env =
-        cella_orchestrator::env_cache::label_remote_env(client, container).await;
     let fwd_env: Vec<String> = container
         .labels
         .get("dev.cella.fwd_env")
@@ -426,7 +424,6 @@ async fn resolve_exec_context(
         &user,
         remote_env,
         fwd_env,
-        config_remote_env,
         default_user_env_probe,
     )
     .await;
@@ -564,7 +561,6 @@ async fn build_exec_env(
     user: &str,
     cli_remote_env: Vec<String>,
     fwd_env: Vec<String>,
-    config_remote_env: Vec<String>,
     default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 ) -> Vec<String> {
     let probe_type =
@@ -572,6 +568,8 @@ async fn build_exec_env(
     let probed = read_probed_env_cache(client, &container.id, user, probe_type)
         .await
         .unwrap_or_default();
+    let config_remote_env =
+        cella_orchestrator::env_cache::label_remote_env(client, container, Some(&probed)).await;
     // cella infra vars (SSH_AUTH_SOCK, AI keys, terminal) are layered on top
     // below — they intentionally win over both remoteEnv sources.
     let mut env = layer_exec_remote_env(&probed, &fwd_env, &cli_remote_env, &config_remote_env);

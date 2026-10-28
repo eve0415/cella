@@ -329,38 +329,67 @@ pub async fn ensure_ssh_auth_sock(
 ///
 /// Mirrors the official CLI, which re-substitutes `${containerEnv:...}` at
 /// exec time against the live container. The container is only inspected
-/// when some entry still carries the token.
-pub async fn label_remote_env(
+/// when some entry still carries the token. When that yields no env, the
+/// `probed` env stands in; with neither, entries still carrying the token are
+/// dropped so the value they would have overridden survives the merge.
+pub async fn label_remote_env<S: std::hash::BuildHasher + Sync>(
     client: &dyn ContainerBackend,
     container: &ContainerInfo,
+    probed: Option<&HashMap<String, String, S>>,
 ) -> Vec<String> {
     let entries: Vec<String> = container
         .labels
         .get("dev.cella.remote_env")
         .and_then(|v| serde_json::from_str(v).ok())
         .unwrap_or_default();
-    if !entries.iter().any(|e| e.contains(CONTAINER_ENV_TOKEN)) {
+    if !entries.iter().any(|e| value_needs_container_env(e)) {
         return entries;
     }
-    let container_env = client
-        .inspect_container_env(&container.id)
-        .await
-        .unwrap_or_else(|e| {
+    let container_env = match client.inspect_container_env(&container.id).await {
+        Ok(env) => env_map(&env),
+        Err(e) => {
             warn!("Could not read container env to resolve remoteEnv: {e}");
-            Vec::new()
-        });
-    expand_container_env(entries, &container_env)
+            HashMap::new()
+        }
+    };
+    if !container_env.is_empty() {
+        return expand_container_env(entries, container_env);
+    }
+    match probed.filter(|env| !env.is_empty()) {
+        Some(env) => expand_container_env(
+            entries,
+            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ),
+        None => entries
+            .into_iter()
+            .filter(|e| !value_needs_container_env(e))
+            .collect(),
+    }
 }
 
-/// Resolve `${containerEnv:...}` in the values of `KEY=value` entries against
-/// `container_env` (also `KEY=value`). Entries without the token pass through.
-fn expand_container_env(entries: Vec<String>, container_env: &[String]) -> Vec<String> {
-    let env: HashMap<String, String> = container_env
+/// Whether the value of a `KEY=value` entry still holds `${containerEnv:...}`.
+fn value_needs_container_env(entry: &str) -> bool {
+    entry
+        .split_once('=')
+        .is_some_and(|(_, value)| value.contains(CONTAINER_ENV_TOKEN))
+}
+
+/// Index `KEY=value` entries by key.
+fn env_map(entries: &[String]) -> HashMap<String, String> {
+    entries
         .iter()
         .filter_map(|e| e.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let ctx = SubstitutionContext::container_env_only(env);
+        .collect()
+}
+
+/// Resolve `${containerEnv:...}` in the values of `KEY=value` entries against
+/// `container_env`. Entries without the token pass through.
+fn expand_container_env(
+    entries: Vec<String>,
+    container_env: HashMap<String, String>,
+) -> Vec<String> {
+    let ctx = SubstitutionContext::container_env_only(container_env);
     entries
         .into_iter()
         .map(|entry| match entry.split_once('=') {
@@ -375,6 +404,14 @@ fn expand_container_env(entries: Vec<String>, container_env: &[String]) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(entries: &[&str]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .filter_map(|e| e.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
 
     fn container_with_remote_env(entries: &[&str]) -> ContainerInfo {
         ContainerInfo {
@@ -402,9 +439,8 @@ mod tests {
     #[test]
     fn expand_container_env_resolves_against_container_env() {
         let entries = vec![concat!("PATH=${containerEnv", ":PATH}:/x").to_string()];
-        let container_env = ["PATH=/usr/bin:/bin".to_string()];
         assert_eq!(
-            expand_container_env(entries, &container_env),
+            expand_container_env(entries, env_of(&["PATH=/usr/bin:/bin"])),
             vec!["PATH=/usr/bin:/bin:/x"]
         );
     }
@@ -415,9 +451,8 @@ mod tests {
     fn expand_container_env_touches_only_container_env() {
         let entries =
             vec![concat!("MIX=${localEnv", ":HOME}|${containerEnv", ":PATH}").to_string()];
-        let container_env = ["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
         assert_eq!(
-            expand_container_env(entries, &container_env),
+            expand_container_env(entries, env_of(&["PATH=/usr/bin", "HOME=/root"])),
             vec![concat!("MIX=${localEnv", ":HOME}|/usr/bin")]
         );
     }
@@ -426,7 +461,7 @@ mod tests {
     fn expand_container_env_uses_default_when_missing() {
         let entries = vec![concat!("TOOL=${containerEnv", ":MISSING:fallback}").to_string()];
         assert_eq!(
-            expand_container_env(entries, &["PATH=/usr/bin".to_string()]),
+            expand_container_env(entries, env_of(&["PATH=/usr/bin"])),
             vec!["TOOL=fallback"]
         );
     }
@@ -439,7 +474,7 @@ mod tests {
             "EMPTY=".to_string(),
         ];
         assert_eq!(
-            expand_container_env(entries.clone(), &["HOME=/root".to_string()]),
+            expand_container_env(entries.clone(), env_of(&["HOME=/root"])),
             entries
         );
     }
@@ -451,18 +486,71 @@ mod tests {
         let backend = backend.with_container_env(vec!["PATH=/usr/bin:/bin".to_string()]);
 
         let plain = container_with_remote_env(&["EDITOR=vim"]);
-        assert_eq!(label_remote_env(&backend, &plain).await, vec!["EDITOR=vim"]);
+        assert_eq!(
+            label_remote_env(&backend, &plain, None::<&HashMap<String, String>>).await,
+            vec!["EDITOR=vim"]
+        );
         assert!(recorded.lock().expect("mutex").is_empty());
 
         let deferred =
             container_with_remote_env(&[concat!("PATH=${containerEnv", ":PATH}:/x"), "EDITOR=vim"]);
+        let probed = env_of(&["PATH=/probed/bin"]);
         assert_eq!(
-            label_remote_env(&backend, &deferred).await,
+            label_remote_env(&backend, &deferred, Some(&probed)).await,
             vec!["PATH=/usr/bin:/bin:/x", "EDITOR=vim"]
         );
         assert_eq!(
             *recorded.lock().expect("mutex"),
             vec!["inspect_container_env c1"]
+        );
+    }
+
+    fn deferred_path_container() -> ContainerInfo {
+        container_with_remote_env(&[concat!("PATH=${containerEnv", ":PATH}:/x"), "EDITOR=vim"])
+    }
+
+    /// A failed inspect must not resolve against an empty env, which would
+    /// reproduce `PATH=:/x`; the probed env stands in.
+    #[tokio::test]
+    async fn label_remote_env_falls_back_to_probed_env_on_inspect_error() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let backend = backend.with_inspect_env_error();
+        let probed = env_of(&["PATH=/usr/bin:/bin"]);
+        assert_eq!(
+            label_remote_env(&backend, &deferred_path_container(), Some(&probed)).await,
+            vec!["PATH=/usr/bin:/bin:/x", "EDITOR=vim"]
+        );
+    }
+
+    /// Apple Container reports no env when `initProcess` is absent; that is
+    /// treated like a failed inspect.
+    #[tokio::test]
+    async fn label_remote_env_falls_back_to_probed_env_on_empty_inspect() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let probed = env_of(&["PATH=/usr/bin:/bin"]);
+        assert_eq!(
+            label_remote_env(&backend, &deferred_path_container(), Some(&probed)).await,
+            vec!["PATH=/usr/bin:/bin:/x", "EDITOR=vim"]
+        );
+    }
+
+    /// With no env to resolve against, the unresolvable entry is dropped so
+    /// the probed PATH is not overridden by `PATH=:/x` or literal text.
+    #[tokio::test]
+    async fn label_remote_env_drops_unresolvable_entries_without_any_env() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let backend = backend.with_inspect_env_error();
+        assert_eq!(
+            label_remote_env(
+                &backend,
+                &deferred_path_container(),
+                None::<&HashMap<String, String>>
+            )
+            .await,
+            vec!["EDITOR=vim"]
         );
     }
 
