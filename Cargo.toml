@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -45,7 +45,7 @@ rust-version = "1.98.1"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "=1.53.3", features = [
+tokio = { version = "=1.54.1", features = [
     "fs",
     "io-std",
     "io-util",
@@ -169,7 +169,7 @@ quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.28.0", features = ["v4"] }
+uuid = { version = "=1.29.0", features = ["v4"] }
 
 # Credential cache memory safety
 zeroize = "=1.9.1"
@@ -179,18 +179,18 @@ zeroize = "=1.9.1"
 # is opt-in, so nothing here adds a C dependency to the static agent binary.
 wayland-server = "=0.31.14"
 # epoll for the server loop; already in the tree via wayland-backend.
-rustix = { version = "=1.1.5", features = ["event"] }
+rustix = { version = "=1.1.6", features = ["event"] }
 wayland-protocols = "=0.32.13"
 wayland-protocols-wlr = "=0.3.12"
 
 # Testing
 tempfile = "=3.27.0"
 wayland-client = "=0.31.15"
-wl-clipboard-rs = "=0.9.4"
+wl-clipboard-rs = "=0.9.5"
 # `image-data` arrives via default features and is required for get_image().
 # `wayland-data-control` is NOT default — without it arboard has no Wayland
 # backend compiled in and silently falls through to X11.
-arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
+arboard = { version = "=3.7.0", features = ["wayland-data-control"] }
 filetime = "=0.2.29"
 insta = { version = "=1.49.0", features = ["json", "yaml", "redactions"] }
 trybuild = "=1.0.122"
