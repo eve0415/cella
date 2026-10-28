@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ContainerInfo, ExecOptions, FileToUpload};
-use cella_config::devcontainer::subst::SubstitutionContext;
+use cella_config::devcontainer::subst::{CONTAINER_ENV_TOKEN, SubstitutionContext};
 use cella_env::platform::DockerRuntime;
 use cella_env::user_env_probe::{
     PROBE_METHODS, ProbeMethod, UserEnvProbe, parse_probed_env, probe_command,
@@ -322,9 +322,6 @@ pub async fn ensure_ssh_auth_sock(
         env.push(format!("SSH_AUTH_SOCK={socket_path}"));
     }
 }
-
-/// Marks a `remoteEnv` value that `cella up` left for exec time to resolve.
-const CONTAINER_ENV_TOKEN: &str = "${containerEnv:";
 
 /// Read the config `remoteEnv` entries stored in the `dev.cella.remote_env`
 /// label, finishing any `${containerEnv:...}` against the container's own

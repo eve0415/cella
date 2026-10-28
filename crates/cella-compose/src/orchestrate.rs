@@ -1886,7 +1886,7 @@ fn strip_container_env_polluted_entries(
         .iter()
         .filter_map(|(k, v)| {
             let s = v.as_str()?;
-            if s.contains("${containerEnv:") {
+            if s.contains(cella_config::devcontainer::subst::CONTAINER_ENV_TOKEN) {
                 Some(k.as_str())
             } else {
                 None

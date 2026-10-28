@@ -11,6 +11,7 @@ use cella_backend::{
     ImageDetails, LifecycleContext, MountConfig, agent_env_vars, container_labels,
     lexical_absolute,
 };
+use cella_config::devcontainer::subst::CONTAINER_ENV_TOKEN;
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
 use crate::error::OrchestratorError;
@@ -2684,7 +2685,7 @@ fn resolved_remote_env(
     probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Vec<String> {
     if let (Some(raw), Some(probed)) = (config.raw_remote_env, probed_env)
-        && raw.to_string().contains("${containerEnv:")
+        && raw.to_string().contains(CONTAINER_ENV_TOKEN)
     {
         let ctx =
             cella_config::config_map::subst_ctx(config.resolved).with_container_env(probed.clone());
@@ -2706,7 +2707,7 @@ fn remote_env_label_entries(
     resolved: &cella_config::devcontainer::resolve::ResolvedConfig,
 ) -> Vec<String> {
     if let Some(raw) = raw_remote_env
-        && raw.to_string().contains("${containerEnv:")
+        && raw.to_string().contains(CONTAINER_ENV_TOKEN)
     {
         return cella_config::config_map::subst_ctx(resolved)
             .deferring_container_env()

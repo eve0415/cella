@@ -8,6 +8,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// The opening of a `${containerEnv:...}` expression, for cheaply checking
+/// whether a value still needs a container env to resolve.
+pub const CONTAINER_ENV_TOKEN: &str = "${containerEnv:";
+
 /// Which variable families a [`SubstitutionContext`] resolves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
@@ -17,7 +21,7 @@ enum Scope {
     /// as its literal `${...}` text.
     LocalEnvOnly,
     /// Every supported variable except `${containerEnv:...}`, which is left as
-    /// its literal `${...}` text until a container env is supplied.
+    /// its literal `${...}` text.
     DeferContainerEnv,
     /// Only `${containerEnv:...}`; every other expression is left as its
     /// literal `${...}` text.
@@ -218,8 +222,8 @@ impl SubstitutionContext {
 
     /// Whether this context resolves `keyword`, or leaves it literal.
     ///
-    /// A local-env-only or deferring context also resolves
-    /// `${containerEnv:...}` once a container env has been supplied.
+    /// A local-env-only context also resolves `${containerEnv:...}` once the
+    /// probed container env has been supplied.
     fn resolves(&self, keyword: &str) -> bool {
         match self.scope {
             Scope::Full => true,
@@ -228,7 +232,7 @@ impl SubstitutionContext {
                     || (keyword == "containerEnv" && self.container_env.is_some())
                     || (keyword == "devcontainerId" && self.devcontainer_id.is_some())
             }
-            Scope::DeferContainerEnv => keyword != "containerEnv" || self.container_env.is_some(),
+            Scope::DeferContainerEnv => keyword != "containerEnv",
             Scope::ContainerEnvOnly => keyword == "containerEnv",
         }
     }
@@ -902,15 +906,6 @@ mod tests {
             "/projects/myapp/bin"
         );
         assert_eq!(ctx.substitute_str("${devcontainerId}"), "abc123");
-    }
-
-    #[test]
-    fn deferring_container_env_resolves_once_container_env_supplied() {
-        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
-        let ctx = test_ctx()
-            .deferring_container_env()
-            .with_container_env(cenv);
-        assert_eq!(ctx.substitute_str("${containerEnv:PATH}:/x"), "/usr/bin:/x");
     }
 
     #[test]
