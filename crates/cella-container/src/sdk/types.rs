@@ -79,6 +79,20 @@ pub struct ContainerConfiguration {
     /// see [`ContainerStatus::networks`] for live address assignments).
     #[serde(default)]
     pub networks: Vec<AttachmentConfiguration>,
+    /// The container's init process, which carries its configured env.
+    #[serde(default)]
+    pub init_process: Option<ProcessConfiguration>,
+}
+
+/// The init process recorded on a container's configuration.
+///
+/// The CLI also reports `executable`, `arguments`, `workingDirectory`, and
+/// `user`; add fields when a consumer appears.
+#[derive(Debug, Deserialize)]
+pub struct ProcessConfiguration {
+    /// `KEY=value` environment the process was started with.
+    #[serde(default)]
+    pub environment: Vec<String>,
 }
 
 /// Image reference recorded on a container's configuration.
@@ -267,6 +281,14 @@ mod tests {
                     }
                 ],
                 "networks": [ { "network": "default" } ],
+                "initProcess": {
+                    "executable": "/bin/sh",
+                    "arguments": [],
+                    "environment": ["PATH=/usr/bin:/bin", "LANG=C"],
+                    "workingDirectory": "/",
+                    "terminal": false,
+                    "user": { "id": { "uid": 0, "gid": 0 } }
+                },
                 "mounts": [
                     {
                         "type": { "virtiofs": {} },
@@ -302,6 +324,11 @@ mod tests {
 
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.networks[0].network.as_deref(), Some("default"));
+
+        assert_eq!(
+            config.init_process.unwrap().environment,
+            vec!["PATH=/usr/bin:/bin", "LANG=C"]
+        );
 
         let mounts = config.mounts.unwrap();
         assert_eq!(mounts.len(), 1);

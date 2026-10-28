@@ -1496,6 +1496,13 @@ mod tests {
             panic!("unexpected detect_container_arch call");
         }
 
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            panic!("unexpected inspect_container_env call");
+        }
+
         fn inspect_image_env<'a>(
             &'a self,
             _: &'a str,

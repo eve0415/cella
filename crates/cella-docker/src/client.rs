@@ -661,6 +661,13 @@ pub mod mock {
             Box::pin(async { Ok("x86_64".to_string()) })
         }
 
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
         fn inspect_image_env<'a>(
             &'a self,
             _image: &'a str,

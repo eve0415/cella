@@ -699,6 +699,10 @@ pub(crate) mod tests {
         recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
         recorded_build_options: Mutex<Option<Vec<String>>>,
         ssh_agent: cella_backend::SshAgentTransport,
+        /// Returned by `inspect_container_env`.
+        container_env: Vec<String>,
+        /// Make `inspect_container_env` fail instead.
+        inspect_env_error: bool,
     }
 
     impl LifecycleMockBackend {
@@ -716,6 +720,8 @@ pub(crate) mod tests {
                 recorded_build_paths: Mutex::new(None),
                 recorded_build_options: Mutex::new(None),
                 ssh_agent: cella_backend::SshAgentTransport::BindMount,
+                container_env: Vec::new(),
+                inspect_env_error: false,
             };
             (backend, recorded)
         }
@@ -725,6 +731,16 @@ pub(crate) mod tests {
             ssh_agent: cella_backend::SshAgentTransport,
         ) -> Self {
             self.ssh_agent = ssh_agent;
+            self
+        }
+
+        pub fn with_container_env(mut self, container_env: Vec<String>) -> Self {
+            self.container_env = container_env;
+            self
+        }
+
+        pub const fn with_inspect_env_error(mut self) -> Self {
+            self.inspect_env_error = true;
             self
         }
 
@@ -928,6 +944,24 @@ pub(crate) mod tests {
             _: &'a str,
         ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
             Box::pin(async { Ok(ImageDetails::default()) })
+        }
+
+        fn inspect_container_env<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            self.recorded
+                .lock()
+                .expect("mutex")
+                .push(format!("inspect_container_env {id}"));
+            let result = if self.inspect_env_error {
+                Err(BackendError::ContainerNotFound {
+                    identifier: id.to_string(),
+                })
+            } else {
+                Ok(self.container_env.clone())
+            };
+            Box::pin(async move { result })
         }
 
         fn inspect_image_env<'a>(

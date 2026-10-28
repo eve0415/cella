@@ -8,6 +8,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// The opening of a `${containerEnv:...}` expression, for cheaply checking
+/// whether a value still needs a container env to resolve.
+pub const CONTAINER_ENV_TOKEN: &str = "${containerEnv:";
+
 /// Which variable families a [`SubstitutionContext`] resolves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
@@ -16,6 +20,12 @@ enum Scope {
     /// Only `${localEnv:...}` / `${env:...}`; every other expression is left
     /// as its literal `${...}` text.
     LocalEnvOnly,
+    /// Every supported variable except `${containerEnv:...}`, which is left as
+    /// its literal `${...}` text.
+    DeferContainerEnv,
+    /// Only `${containerEnv:...}`; every other expression is left as its
+    /// literal `${...}` text.
+    ContainerEnvOnly,
 }
 
 /// Context for resolving devcontainer variable expressions.
@@ -84,6 +94,32 @@ impl SubstitutionContext {
         }
     }
 
+    /// Create a context that expands only `${containerEnv:...}` against
+    /// `container_env`.
+    ///
+    /// Used to finish entries that were stored with `${containerEnv:...}`
+    /// deferred: everything else in them was already expanded, so it is left
+    /// as is.
+    #[must_use]
+    pub fn container_env_only(container_env: HashMap<String, String>) -> Self {
+        Self {
+            container_env: Some(container_env),
+            scope: Scope::ContainerEnvOnly,
+            ..Self::local_env_only(HashMap::new())
+        }
+    }
+
+    /// Consume this context and return it leaving `${containerEnv:...}` as its
+    /// literal text (default included) while everything else still resolves.
+    ///
+    /// Used where no container env exists yet but the value must be finished
+    /// against the running container later.
+    #[must_use]
+    pub const fn deferring_container_env(mut self) -> Self {
+        self.scope = Scope::DeferContainerEnv;
+        self
+    }
+
     /// Consume this context and return it with `${devcontainerId}` resolving to
     /// `devcontainer_id`, including for a local-env-only context.
     #[must_use]
@@ -105,26 +141,29 @@ impl SubstitutionContext {
 
     /// Substitute all `${...}` expressions in a string.
     pub fn substitute_str(&self, input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut rest = input;
+        replace_expressions(input, |expr| self.resolve_expr(expr))
+    }
 
-        while let Some(start) = rest.find("${") {
-            result.push_str(&rest[..start]);
-            let after_open = &rest[start + 2..];
-
-            if let Some(close) = after_open.find('}') {
-                let expr = &after_open[..close];
-                result.push_str(&self.resolve_expr(expr));
-                rest = &after_open[close + 1..];
-            } else {
-                // No matching '}' — pass through literally
-                result.push_str("${");
-                rest = after_open;
+    /// Whether every `${containerEnv:NAME}` in `input` resolves to a value of
+    /// its own: `NAME` is in this context's container env, or the expression
+    /// carries a default. Other expressions are not considered.
+    #[must_use]
+    pub fn container_env_resolvable(&self, input: &str) -> bool {
+        let mut resolvable = true;
+        replace_expressions(input, |expr| {
+            let (keyword, name, default) = split_expr(expr);
+            if keyword == "containerEnv"
+                && default.is_none()
+                && !self
+                    .container_env
+                    .as_ref()
+                    .is_some_and(|env| env.contains_key(name))
+            {
+                resolvable = false;
             }
-        }
-
-        result.push_str(rest);
-        result
+            String::new()
+        });
+        resolvable
     }
 
     /// Recursively substitute string values in a JSON tree.
@@ -196,14 +235,15 @@ impl SubstitutionContext {
                     || (keyword == "containerEnv" && self.container_env.is_some())
                     || (keyword == "devcontainerId" && self.devcontainer_id.is_some())
             }
+            Scope::DeferContainerEnv => keyword != "containerEnv",
+            Scope::ContainerEnvOnly => keyword == "containerEnv",
         }
     }
 
     /// Resolve a single expression (the content between `${` and `}`).
     fn resolve_expr(&self, expr: &str) -> String {
-        // Split into at most 3 parts: keyword, name, default
-        let mut parts = expr.splitn(3, ':');
-        let keyword = parts.next().unwrap_or("");
+        let (keyword, var_name, default) = split_expr(expr);
+        let default = default.unwrap_or("");
 
         if !self.resolves(keyword) {
             return format!("${{{expr}}}");
@@ -213,17 +253,12 @@ impl SubstitutionContext {
             // `${env:VAR}` is the official alias for `${localEnv:VAR}`
             // (the CLI's variableSubstitution.ts has `case 'env'` fall through
             // to the same handler as `localEnv`).
-            "localEnv" | "env" => {
-                let var_name = parts.next().unwrap_or("");
-                let default = parts.next().unwrap_or("");
-                self.local_env
-                    .get(var_name)
-                    .cloned()
-                    .unwrap_or_else(|| default.to_string())
-            }
+            "localEnv" | "env" => self
+                .local_env
+                .get(var_name)
+                .cloned()
+                .unwrap_or_else(|| default.to_string()),
             "containerEnv" => {
-                let var_name = parts.next().unwrap_or("");
-                let default = parts.next().unwrap_or("");
                 // When container_env is populated (second pass after container
                 // start), resolve against the live env. At config-parse time
                 // there is none, so we fall through to `default` or "".
@@ -245,6 +280,39 @@ impl SubstitutionContext {
             _ => format!("${{{expr}}}"),
         }
     }
+}
+
+/// Replace each `${...}` expression in `input` with `on_expr(expr)`, where
+/// `expr` is the text between the braces. An unclosed `${` passes through.
+fn replace_expressions(input: &str, mut on_expr: impl FnMut(&str) -> String) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+
+        if let Some(close) = after_open.find('}') {
+            result.push_str(&on_expr(&after_open[..close]));
+            rest = &after_open[close + 1..];
+        } else {
+            // No matching '}' — pass through literally
+            result.push_str("${");
+            rest = after_open;
+        }
+    }
+
+    result.push_str(rest);
+    result
+}
+
+/// Split an expression into keyword, name, and optional default. The default
+/// keeps any further colons (`${localEnv:VAR:a:b}` defaults to `a:b`).
+fn split_expr(expr: &str) -> (&str, &str, Option<&str>) {
+    let mut parts = expr.splitn(3, ':');
+    let keyword = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    (keyword, name, parts.next())
 }
 
 #[cfg(test)]
@@ -842,5 +910,78 @@ mod tests {
 
         // No ${containerEnv:…} tokens → both passes must agree
         assert_eq!(first_pass, second_pass);
+    }
+
+    // --- deferring_container_env / container_env_only ---
+
+    #[test]
+    fn deferring_container_env_leaves_container_env_literal() {
+        let ctx = test_ctx().deferring_container_env();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}:/x"),
+            "${containerEnv:PATH}:/x"
+        );
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:MISSING:a:b}"),
+            "${containerEnv:MISSING:a:b}"
+        );
+    }
+
+    #[test]
+    fn deferring_container_env_still_resolves_everything_else() {
+        let ctx = test_ctx().deferring_container_env();
+        assert_eq!(ctx.substitute_str("${localEnv:HOME}/x"), "/home/testuser/x");
+        assert_eq!(
+            ctx.substitute_str("${localWorkspaceFolder}/bin"),
+            "/projects/myapp/bin"
+        );
+        assert_eq!(ctx.substitute_str("${devcontainerId}"), "abc123");
+    }
+
+    #[test]
+    fn container_env_only_resolves_container_env() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let ctx = SubstitutionContext::container_env_only(cenv);
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}:/x"),
+            "/usr/bin:/bin:/x"
+        );
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:MISSING:fallback}"),
+            "fallback"
+        );
+        assert_eq!(ctx.substitute_str("${containerEnv:MISSING}"), "");
+    }
+
+    #[test]
+    fn container_env_only_leaves_other_variables_literal() {
+        let ctx = SubstitutionContext::container_env_only(HashMap::new());
+        for input in [
+            "${localEnv:HOME}",
+            "${env:HOME}",
+            "${localWorkspaceFolder}",
+            "${containerWorkspaceFolder}",
+            "${devcontainerId}",
+        ] {
+            assert_eq!(ctx.substitute_str(input), input);
+        }
+    }
+
+    // --- container_env_resolvable ---
+
+    #[test]
+    fn container_env_resolvable_needs_name_or_default() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let ctx = SubstitutionContext::container_env_only(cenv);
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":PATH}:/x")));
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING:vim}")));
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING:}")));
+        assert!(!ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING}")));
+        assert!(!ctx.container_env_resolvable(concat!(
+            "${containerEnv",
+            ":PATH}:${containerEnv",
+            ":MISSING}"
+        )));
+        assert!(ctx.container_env_resolvable(concat!("${localEnv", ":MISSING}")));
     }
 }

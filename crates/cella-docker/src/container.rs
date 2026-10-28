@@ -308,6 +308,16 @@ impl DockerClient {
         }
     }
 
+    /// Get the container's configured environment (`Config.Env`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn inspect_container_env(&self, id: &str) -> Result<Vec<String>, CellaDockerError> {
+        let inspect = self.inner().inspect_container(id, None).await?;
+        Ok(inspect.config.and_then(|c| c.env).unwrap_or_default())
+    }
+
     /// Get detailed container info.
     ///
     /// # Errors

@@ -87,6 +87,17 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn inspect_container_env<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+        Box::pin(async move {
+            DockerClient::inspect_container_env(self, id)
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
     fn list_cella_containers(
         &self,
         running_only: bool,

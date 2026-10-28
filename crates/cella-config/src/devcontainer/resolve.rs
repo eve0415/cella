@@ -410,9 +410,7 @@ pub fn config_with_override(
         });
     }
 
-    // Compute hash of canonical JSON
-    let canonical = serde_json::to_string(&config)?;
-    let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
+    let hash = config_hash(&config, raw_remote_env.as_ref())?;
 
     let typed = match crate::schema::DevContainer::validate(&config, "") {
         Ok(t) => Some(t),
@@ -466,8 +464,8 @@ pub fn from_config_value(
         _ => resolved_devcontainer_id(workspace_root, &config_path, options),
     };
     let default_wf = default_container_workspace_folder(&config, options);
-    let canonical = serde_json::to_string(&config).unwrap_or_default();
-    let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
+    let raw_remote_env = raw_config.get("remoteEnv").cloned();
+    let hash = config_hash(&config, raw_remote_env.as_ref()).unwrap_or_default();
     let typed = crate::schema::DevContainer::validate(&config, "").ok();
 
     ResolvedConfig {
@@ -480,11 +478,37 @@ pub fn from_config_value(
         typed,
         // Taken from the caller's raw snapshot so the post-probe pass can
         // resolve `${containerEnv:VAR}`.
-        raw_remote_env: raw_config.get("remoteEnv").cloned(),
+        raw_remote_env,
         raw_config,
         container_identity,
         default_container_workspace_folder: default_wf,
     }
+}
+
+/// Hash the substituted config for drift detection.
+///
+/// `${containerEnv:...}` collapses to "" in the substituted config, yet the
+/// `dev.cella.remote_env` label keeps it literal, so the raw text of every
+/// `remoteEnv` value carrying it is hashed as well. Otherwise renaming only
+/// the variable would raise no drift and exec would keep the stale label.
+/// Configs without such a value hash exactly the substituted config.
+fn config_hash(
+    config: &serde_json::Value,
+    raw_remote_env: Option<&serde_json::Value>,
+) -> Result<String, serde_json::Error> {
+    let mut canonical = serde_json::to_string(config)?;
+    let deferred: BTreeMap<&str, &str> = raw_remote_env
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
+        .filter(|(_, v)| v.contains(super::subst::CONTAINER_ENV_TOKEN))
+        .collect();
+    if !deferred.is_empty() {
+        canonical.push('\n');
+        canonical.push_str(&serde_json::to_string(&deferred)?);
+    }
+    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
 }
 
 /// Build the context that substitutes a merged config.
@@ -700,6 +724,50 @@ mod tests {
         let r1 = config(tmp1.path(), None).unwrap();
         let r2 = config(tmp2.path(), None).unwrap();
         assert_ne!(r1.config_hash, r2.config_hash);
+    }
+
+    /// Regression: both names collapse to "" in the substituted config, so
+    /// the hash missed the edit while the `dev.cella.remote_env` label kept the old name.
+    #[test]
+    fn resolve_config_hash_changes_with_container_env_name() {
+        let tmp1 = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp1.path(),
+            concat!(
+                r#"{"image": "ubuntu", "remoteEnv": {"P": "${containerEnv"#,
+                r#":ONE}"}}"#
+            ),
+        );
+        let tmp2 = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp2.path(),
+            concat!(
+                r#"{"image": "ubuntu", "remoteEnv": {"P": "${containerEnv"#,
+                r#":TWO}"}}"#
+            ),
+        );
+
+        let r1 = config(tmp1.path(), None).unwrap();
+        let r2 = config(tmp2.path(), None).unwrap();
+        assert_eq!(r1.config, r2.config, "substituted configs are identical");
+        assert_ne!(r1.config_hash, r2.config_hash);
+    }
+
+    #[test]
+    fn from_config_value_hash_matches_file_resolution_with_container_env() {
+        let raw = concat!(r#"{"remoteEnv": {"P": "${containerEnv"#, r#":ONE}/x"}}"#);
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), raw);
+        let from_file = config(tmp.path(), None).unwrap();
+        let from_value = from_config_value(
+            from_file.config.clone(),
+            serde_json::from_str(raw).unwrap(),
+            tmp.path(),
+            from_file.config_path.clone(),
+            None,
+            &ResolveOptions::default(),
+        );
+        assert_eq!(from_file.config_hash, from_value.config_hash);
     }
 
     #[test]

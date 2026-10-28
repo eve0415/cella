@@ -459,6 +459,12 @@ mod tests {
         fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
             panic!("detect_container_arch must not be called in dry-run");
         }
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            panic!("inspect_container_env must not be called in dry-run");
+        }
         fn inspect_image_env<'a>(
             &'a self,
             _image: &'a str,
