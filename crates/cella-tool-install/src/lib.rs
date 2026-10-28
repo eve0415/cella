@@ -554,6 +554,10 @@ pub async fn run_claude_install(
 const NPM_PREFIX_MARKER: &str = "cella-npm-prefix=";
 const NPM_HOME_MARKER: &str = "cella-npm-home=";
 
+/// Working directory for every exec that runs npm.
+/// Without one an exec inherits the container's `WorkingDir` (the workspace folder), and npm reads the user's `package.json` there, so a project `devEngines` mismatch (`EBADDEVENGINES`) fails cella's own global-tool setup.
+const NPM_EXEC_WORKING_DIR: &str = "/";
+
 // A writable HOME may be an intentional container remap; reject an inherited,
 // unusable value before falling back to the passwd home.
 const ENSURE_WRITABLE_NPM_PREFIX_PROGRAM: &str = r#"home="${HOME:-}"
@@ -598,7 +602,7 @@ async fn ensure_writable_npm_prefix(
                 cmd: tool_shell_cmd(probed_env, ENSURE_WRITABLE_NPM_PREFIX_PROGRAM),
                 user: Some(remote_user.to_string()),
                 env: tool_exec_env(probed_env),
-                working_dir: None,
+                working_dir: Some(NPM_EXEC_WORKING_DIR.to_string()),
             },
         )
         .await;
@@ -697,7 +701,7 @@ pub async fn npm_install_global(
                 cmd: tool_shell_cmd(probed_env, &format!("npm install -g {pkg}")),
                 user: Some(remote_user.to_string()),
                 env: tool_exec_env(probed_env),
-                working_dir: None,
+                working_dir: Some(NPM_EXEC_WORKING_DIR.to_string()),
             },
         )
         .await
@@ -3528,6 +3532,7 @@ exit 1
             calls[0].cmd,
             vec!["sh", "-c", ENSURE_WRITABLE_NPM_PREFIX_PROGRAM]
         );
+        assert_eq!(calls[0].working_dir.as_deref(), Some("/"));
 
         let login_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
         assert_eq!(
@@ -3954,6 +3959,7 @@ exit 1
 
         let call = &backend.calls()[0];
         assert_eq!(call.cmd, vec!["sh", "-c", "npm install -g @openai/codex"]);
+        assert_eq!(call.working_dir.as_deref(), Some("/"));
         assert_eq!(
             call.env,
             Some(vec![
@@ -4030,6 +4036,8 @@ exit 1
             format!("NPM_CONFIG_PREFIX={prefix}"),
         ]);
         assert_eq!(calls[install_index].env, expected_env);
+        assert_eq!(calls[prefix_index].working_dir.as_deref(), Some("/"));
+        assert_eq!(calls[install_index].working_dir.as_deref(), Some("/"));
         let probe_index = calls
             .iter()
             .position(|call| call.cmd.iter().any(|part| part == CODEX_SANDBOX_PROBE))
