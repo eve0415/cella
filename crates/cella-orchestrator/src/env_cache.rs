@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use cella_backend::{ContainerBackend, ExecOptions, FileToUpload};
+use cella_backend::{ContainerBackend, ContainerInfo, ExecOptions, FileToUpload};
+use cella_config::devcontainer::subst::SubstitutionContext;
 use cella_env::platform::DockerRuntime;
 use cella_env::user_env_probe::{
     PROBE_METHODS, ProbeMethod, UserEnvProbe, parse_probed_env, probe_command,
@@ -322,9 +323,151 @@ pub async fn ensure_ssh_auth_sock(
     }
 }
 
+/// Marks a `remoteEnv` value that `cella up` left for exec time to resolve.
+const CONTAINER_ENV_TOKEN: &str = "${containerEnv:";
+
+/// Read the config `remoteEnv` entries stored in the `dev.cella.remote_env`
+/// label, finishing any `${containerEnv:...}` against the container's own
+/// configured env.
+///
+/// Mirrors the official CLI, which re-substitutes `${containerEnv:...}` at
+/// exec time against the live container. The container is only inspected
+/// when some entry still carries the token.
+pub async fn label_remote_env(
+    client: &dyn ContainerBackend,
+    container: &ContainerInfo,
+) -> Vec<String> {
+    let entries: Vec<String> = container
+        .labels
+        .get("dev.cella.remote_env")
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    if !entries.iter().any(|e| e.contains(CONTAINER_ENV_TOKEN)) {
+        return entries;
+    }
+    let container_env = client
+        .inspect_container_env(&container.id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Could not read container env to resolve remoteEnv: {e}");
+            Vec::new()
+        });
+    expand_container_env(entries, &container_env)
+}
+
+/// Resolve `${containerEnv:...}` in the values of `KEY=value` entries against
+/// `container_env` (also `KEY=value`). Entries without the token pass through.
+fn expand_container_env(entries: Vec<String>, container_env: &[String]) -> Vec<String> {
+    let env: HashMap<String, String> = container_env
+        .iter()
+        .filter_map(|e| e.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let ctx = SubstitutionContext::container_env_only(env);
+    entries
+        .into_iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((key, value)) if value.contains(CONTAINER_ENV_TOKEN) => {
+                format!("{key}={}", ctx.substitute_str(value))
+            }
+            _ => entry,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container_with_remote_env(entries: &[&str]) -> ContainerInfo {
+        ContainerInfo {
+            id: "c1".to_string(),
+            name: "c1".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels: HashMap::from([(
+                "dev.cella.remote_env".to_string(),
+                serde_json::to_string(entries).expect("serialize"),
+            )]),
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        }
+    }
+
+    /// Regression: the label keeps `${containerEnv:PATH}` and it must resolve
+    /// against the container's own PATH, not be injected as literal text.
+    #[test]
+    fn expand_container_env_resolves_against_container_env() {
+        let entries = vec![concat!("PATH=${containerEnv", ":PATH}:/x").to_string()];
+        let container_env = ["PATH=/usr/bin:/bin".to_string()];
+        assert_eq!(
+            expand_container_env(entries, &container_env),
+            vec!["PATH=/usr/bin:/bin:/x"]
+        );
+    }
+
+    /// Everything but `${containerEnv:...}` was expanded at `up`; whatever is
+    /// left in the value (e.g. text that came from a host env var) stays put.
+    #[test]
+    fn expand_container_env_touches_only_container_env() {
+        let entries =
+            vec![concat!("MIX=${localEnv", ":HOME}|${containerEnv", ":PATH}").to_string()];
+        let container_env = ["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
+        assert_eq!(
+            expand_container_env(entries, &container_env),
+            vec![concat!("MIX=${localEnv", ":HOME}|/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn expand_container_env_uses_default_when_missing() {
+        let entries = vec![concat!("TOOL=${containerEnv", ":MISSING:fallback}").to_string()];
+        assert_eq!(
+            expand_container_env(entries, &["PATH=/usr/bin".to_string()]),
+            vec!["TOOL=fallback"]
+        );
+    }
+
+    #[test]
+    fn expand_container_env_passes_other_entries_through() {
+        let entries = vec![
+            "EDITOR=vim".to_string(),
+            concat!("RAW=${localEnv", ":HOME}").to_string(),
+            "EMPTY=".to_string(),
+        ];
+        assert_eq!(
+            expand_container_env(entries.clone(), &["HOME=/root".to_string()]),
+            entries
+        );
+    }
+
+    #[tokio::test]
+    async fn label_remote_env_inspects_container_only_when_needed() {
+        let (backend, recorded) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let backend = backend.with_container_env(vec!["PATH=/usr/bin:/bin".to_string()]);
+
+        let plain = container_with_remote_env(&["EDITOR=vim"]);
+        assert_eq!(label_remote_env(&backend, &plain).await, vec!["EDITOR=vim"]);
+        assert!(recorded.lock().expect("mutex").is_empty());
+
+        let deferred =
+            container_with_remote_env(&[concat!("PATH=${containerEnv", ":PATH}:/x"), "EDITOR=vim"]);
+        assert_eq!(
+            label_remote_env(&backend, &deferred).await,
+            vec!["PATH=/usr/bin:/bin:/x", "EDITOR=vim"]
+        );
+        assert_eq!(
+            *recorded.lock().expect("mutex"),
+            vec!["inspect_container_env c1"]
+        );
+    }
 
     #[tokio::test]
     async fn runtime_ssh_agent_skips_socket_probe() {

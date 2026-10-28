@@ -401,11 +401,8 @@ async fn resolve_exec_context(
     // Config remoteEnv (wins over --remote-env) and infra-forwarded env (loses
     // to --remote-env) are stored in separate labels so exec can apply the
     // correct 4-way precedence: probed < fwd_env < CLI < config.
-    let config_remote_env: Vec<String> = container
-        .labels
-        .get("dev.cella.remote_env")
-        .and_then(|v| serde_json::from_str(v).ok())
-        .unwrap_or_default();
+    let config_remote_env =
+        cella_orchestrator::env_cache::label_remote_env(client, container).await;
     let fwd_env: Vec<String> = container
         .labels
         .get("dev.cella.fwd_env")

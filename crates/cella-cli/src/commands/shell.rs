@@ -119,11 +119,7 @@ async fn build_shell_env(
     user: &str,
     cella_title: &str,
 ) -> Vec<String> {
-    let label_env: Vec<String> = container
-        .labels
-        .get("dev.cella.remote_env")
-        .and_then(|v| serde_json::from_str(v).ok())
-        .unwrap_or_default();
+    let label_env = cella_orchestrator::env_cache::label_remote_env(client, container).await;
 
     let probe_type = super::resolve_probe_type_from_labels(
         &container.labels,

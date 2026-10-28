@@ -699,6 +699,8 @@ pub(crate) mod tests {
         recorded_build_paths: Mutex<Option<(String, PathBuf)>>,
         recorded_build_options: Mutex<Option<Vec<String>>>,
         ssh_agent: cella_backend::SshAgentTransport,
+        /// Returned by `inspect_container_env`.
+        container_env: Vec<String>,
     }
 
     impl LifecycleMockBackend {
@@ -716,6 +718,7 @@ pub(crate) mod tests {
                 recorded_build_paths: Mutex::new(None),
                 recorded_build_options: Mutex::new(None),
                 ssh_agent: cella_backend::SshAgentTransport::BindMount,
+                container_env: Vec::new(),
             };
             (backend, recorded)
         }
@@ -725,6 +728,11 @@ pub(crate) mod tests {
             ssh_agent: cella_backend::SshAgentTransport,
         ) -> Self {
             self.ssh_agent = ssh_agent;
+            self
+        }
+
+        pub fn with_container_env(mut self, container_env: Vec<String>) -> Self {
+            self.container_env = container_env;
             self
         }
 
@@ -932,9 +940,14 @@ pub(crate) mod tests {
 
         fn inspect_container_env<'a>(
             &'a self,
-            _: &'a str,
+            id: &'a str,
         ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
-            Box::pin(async { Ok(Vec::new()) })
+            self.recorded
+                .lock()
+                .expect("mutex")
+                .push(format!("inspect_container_env {id}"));
+            let env = self.container_env.clone();
+            Box::pin(async move { Ok(env) })
         }
 
         fn inspect_image_env<'a>(
