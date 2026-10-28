@@ -445,8 +445,10 @@ mod tests {
         );
     }
 
-    /// Everything but `${containerEnv:...}` was expanded at `up`; whatever is
-    /// left in the value (e.g. text that came from a host env var) stays put.
+    /// Everything but `${containerEnv:...}` was expanded at `up`, so other
+    /// `${...}` text left in the value (e.g. from a host env var) stays put.
+    /// `${containerEnv:...}` text is resolved wherever it came from, as the
+    /// official CLI's exec-time pass does.
     #[test]
     fn expand_container_env_touches_only_container_env() {
         let entries =

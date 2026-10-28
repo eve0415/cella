@@ -130,10 +130,11 @@ pub struct UpConfig<'a> {
     pub remote_env: &'a [String],
     /// Raw (pre-substitution) `remoteEnv` JSON value from the merged config.
     ///
-    /// `Some` when the config was read from disk and has a `remoteEnv` key;
-    /// `None` when the config was reconstructed from a container label (already
-    /// substituted) or when `remoteEnv` was absent.  Used by the orchestrator
-    /// for the second-pass containerEnv resolution after `userEnvProbe`, and
+    /// `Some` whenever the merged config has a `remoteEnv` key, including a
+    /// config rebuilt from a container's `devcontainer.metadata` label (taken
+    /// from its raw snapshot); `None` when `remoteEnv` is absent.
+    /// Used by the orchestrator for the second-pass containerEnv resolution
+    /// after `userEnvProbe`, and
     /// to build the `dev.cella.remote_env` label with `${containerEnv:...}`
     /// kept literal for exec time.
     pub raw_remote_env: Option<&'a serde_json::Value>,
