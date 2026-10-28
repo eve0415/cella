@@ -141,26 +141,29 @@ impl SubstitutionContext {
 
     /// Substitute all `${...}` expressions in a string.
     pub fn substitute_str(&self, input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut rest = input;
+        replace_expressions(input, |expr| self.resolve_expr(expr))
+    }
 
-        while let Some(start) = rest.find("${") {
-            result.push_str(&rest[..start]);
-            let after_open = &rest[start + 2..];
-
-            if let Some(close) = after_open.find('}') {
-                let expr = &after_open[..close];
-                result.push_str(&self.resolve_expr(expr));
-                rest = &after_open[close + 1..];
-            } else {
-                // No matching '}' — pass through literally
-                result.push_str("${");
-                rest = after_open;
+    /// Whether every `${containerEnv:NAME}` in `input` resolves to a value of
+    /// its own: `NAME` is in this context's container env, or the expression
+    /// carries a default. Other expressions are not considered.
+    #[must_use]
+    pub fn container_env_resolvable(&self, input: &str) -> bool {
+        let mut resolvable = true;
+        replace_expressions(input, |expr| {
+            let (keyword, name, default) = split_expr(expr);
+            if keyword == "containerEnv"
+                && default.is_none()
+                && !self
+                    .container_env
+                    .as_ref()
+                    .is_some_and(|env| env.contains_key(name))
+            {
+                resolvable = false;
             }
-        }
-
-        result.push_str(rest);
-        result
+            String::new()
+        });
+        resolvable
     }
 
     /// Recursively substitute string values in a JSON tree.
@@ -239,9 +242,8 @@ impl SubstitutionContext {
 
     /// Resolve a single expression (the content between `${` and `}`).
     fn resolve_expr(&self, expr: &str) -> String {
-        // Split into at most 3 parts: keyword, name, default
-        let mut parts = expr.splitn(3, ':');
-        let keyword = parts.next().unwrap_or("");
+        let (keyword, var_name, default) = split_expr(expr);
+        let default = default.unwrap_or("");
 
         if !self.resolves(keyword) {
             return format!("${{{expr}}}");
@@ -251,17 +253,12 @@ impl SubstitutionContext {
             // `${env:VAR}` is the official alias for `${localEnv:VAR}`
             // (the CLI's variableSubstitution.ts has `case 'env'` fall through
             // to the same handler as `localEnv`).
-            "localEnv" | "env" => {
-                let var_name = parts.next().unwrap_or("");
-                let default = parts.next().unwrap_or("");
-                self.local_env
-                    .get(var_name)
-                    .cloned()
-                    .unwrap_or_else(|| default.to_string())
-            }
+            "localEnv" | "env" => self
+                .local_env
+                .get(var_name)
+                .cloned()
+                .unwrap_or_else(|| default.to_string()),
             "containerEnv" => {
-                let var_name = parts.next().unwrap_or("");
-                let default = parts.next().unwrap_or("");
                 // When container_env is populated (second pass after container
                 // start), resolve against the live env. At config-parse time
                 // there is none, so we fall through to `default` or "".
@@ -283,6 +280,39 @@ impl SubstitutionContext {
             _ => format!("${{{expr}}}"),
         }
     }
+}
+
+/// Replace each `${...}` expression in `input` with `on_expr(expr)`, where
+/// `expr` is the text between the braces. An unclosed `${` passes through.
+fn replace_expressions(input: &str, mut on_expr: impl FnMut(&str) -> String) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+
+        if let Some(close) = after_open.find('}') {
+            result.push_str(&on_expr(&after_open[..close]));
+            rest = &after_open[close + 1..];
+        } else {
+            // No matching '}' — pass through literally
+            result.push_str("${");
+            rest = after_open;
+        }
+    }
+
+    result.push_str(rest);
+    result
+}
+
+/// Split an expression into keyword, name, and optional default. The default
+/// keeps any further colons (`${localEnv:VAR:a:b}` defaults to `a:b`).
+fn split_expr(expr: &str) -> (&str, &str, Option<&str>) {
+    let mut parts = expr.splitn(3, ':');
+    let keyword = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    (keyword, name, parts.next())
 }
 
 #[cfg(test)]
@@ -935,5 +965,23 @@ mod tests {
         ] {
             assert_eq!(ctx.substitute_str(input), input);
         }
+    }
+
+    // --- container_env_resolvable ---
+
+    #[test]
+    fn container_env_resolvable_needs_name_or_default() {
+        let cenv = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let ctx = SubstitutionContext::container_env_only(cenv);
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":PATH}:/x")));
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING:vim}")));
+        assert!(ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING:}")));
+        assert!(!ctx.container_env_resolvable(concat!("${containerEnv", ":MISSING}")));
+        assert!(!ctx.container_env_resolvable(concat!(
+            "${containerEnv",
+            ":PATH}:${containerEnv",
+            ":MISSING}"
+        )));
+        assert!(ctx.container_env_resolvable(concat!("${localEnv", ":MISSING}")));
     }
 }

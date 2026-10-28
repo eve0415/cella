@@ -330,8 +330,9 @@ pub async fn ensure_ssh_auth_sock(
 /// Mirrors the official CLI, which re-substitutes `${containerEnv:...}` at
 /// exec time against the live container. The container is only inspected
 /// when some entry still carries the token. When that yields no env, the
-/// `probed` env stands in; with neither, entries still carrying the token are
-/// dropped so the value they would have overridden survives the merge.
+/// `probed` env stands in, and an entry is dropped when one of its references
+/// has neither a value there nor a default, so the value it would have
+/// overridden survives the merge.
 pub async fn label_remote_env<S: std::hash::BuildHasher + Sync>(
     client: &dyn ContainerBackend,
     container: &ContainerInfo,
@@ -355,16 +356,29 @@ pub async fn label_remote_env<S: std::hash::BuildHasher + Sync>(
     if !container_env.is_empty() {
         return expand_container_env(entries, container_env);
     }
-    match probed.filter(|env| !env.is_empty()) {
-        Some(env) => expand_container_env(
-            entries,
-            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        ),
-        None => entries
-            .into_iter()
-            .filter(|e| !value_needs_container_env(e))
-            .collect(),
-    }
+    let fallback = probed.map_or_else(HashMap::new, |env| {
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    });
+    expand_or_drop_unresolvable(entries, fallback)
+}
+
+/// Resolve `${containerEnv:...}` entries against a stand-in env, dropping any
+/// entry with a reference that has neither a value there nor a default, so
+/// the lower-precedence layer keeps supplying that key.
+fn expand_or_drop_unresolvable(
+    entries: Vec<String>,
+    fallback: HashMap<String, String>,
+) -> Vec<String> {
+    let ctx = SubstitutionContext::container_env_only(fallback);
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry.split_once('=') {
+            Some((key, value)) if value.contains(CONTAINER_ENV_TOKEN) => ctx
+                .container_env_resolvable(value)
+                .then(|| format!("{key}={}", ctx.substitute_str(value))),
+            _ => Some(entry),
+        })
+        .collect()
 }
 
 /// Whether the value of a `KEY=value` entry still holds `${containerEnv:...}`.
@@ -535,6 +549,48 @@ mod tests {
         assert_eq!(
             label_remote_env(&backend, &deferred_path_container(), Some(&probed)).await,
             vec!["PATH=/usr/bin:/bin:/x", "EDITOR=vim"]
+        );
+    }
+
+    /// A probed env without the referenced name must not turn
+    /// `PATH=${containerEnv:PATH}:/x` into `PATH=:/x`; the entry is dropped.
+    #[tokio::test]
+    async fn label_remote_env_drops_entry_missing_from_probed_env() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let probed = env_of(&["HOME=/root"]);
+        assert_eq!(
+            label_remote_env(&backend, &deferred_path_container(), Some(&probed)).await,
+            vec!["EDITOR=vim"]
+        );
+    }
+
+    /// A default makes the reference resolvable even with no env at all.
+    #[tokio::test]
+    async fn label_remote_env_applies_default_without_any_env() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let container =
+            container_with_remote_env(&[concat!("EDITOR=${containerEnv", ":EDITOR:vim}")]);
+        assert_eq!(
+            label_remote_env(&backend, &container, None::<&HashMap<String, String>>).await,
+            vec!["EDITOR=vim"]
+        );
+    }
+
+    /// One missing reference without a default is enough to drop the entry.
+    #[tokio::test]
+    async fn label_remote_env_drops_mixed_entry_with_one_missing_reference() {
+        let (backend, _) =
+            crate::run_user_commands::tests::LifecycleMockBackend::new(true, "unused");
+        let container = container_with_remote_env(&[
+            concat!("P=${containerEnv", ":PATH}:${containerEnv", ":MISSING}"),
+            "EDITOR=vim",
+        ]);
+        let probed = env_of(&["PATH=/usr/bin"]);
+        assert_eq!(
+            label_remote_env(&backend, &container, Some(&probed)).await,
+            vec!["EDITOR=vim"]
         );
     }
 
