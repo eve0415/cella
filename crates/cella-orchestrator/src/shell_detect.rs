@@ -557,6 +557,12 @@ mod tests {
         fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
             panic!("detect_container_arch should not be called");
         }
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            panic!("inspect_container_env should not be called");
+        }
         fn inspect_image_env<'a>(
             &'a self,
             _image: &'a str,

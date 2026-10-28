@@ -327,6 +327,20 @@ impl ContainerBackend for AppleContainerBackend {
         })
     }
 
+    fn inspect_container_env<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+        Box::pin(async move {
+            let entry = self.cli.inspect(id).await?;
+            Ok(entry
+                .configuration
+                .and_then(|c| c.init_process)
+                .map(|p| p.environment)
+                .unwrap_or_default())
+        })
+    }
+
     fn list_cella_containers(
         &self,
         running_only: bool,
@@ -1773,6 +1787,7 @@ mod tests {
             published_ports: None,
             mounts: None,
             networks: Vec::new(),
+            init_process: None,
         }
     }
 

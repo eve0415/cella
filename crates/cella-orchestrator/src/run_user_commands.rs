@@ -930,6 +930,13 @@ pub(crate) mod tests {
             Box::pin(async { Ok(ImageDetails::default()) })
         }
 
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
         fn inspect_image_env<'a>(
             &'a self,
             _: &'a str,

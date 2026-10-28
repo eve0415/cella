@@ -1186,6 +1186,13 @@ mod tests {
             unimplemented!()
         }
 
+        fn inspect_container_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            unimplemented!()
+        }
+
         fn inspect_image_env<'a>(
             &'a self,
             _: &'a str,

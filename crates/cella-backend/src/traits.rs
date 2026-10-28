@@ -90,6 +90,15 @@ pub trait ContainerBackend: Send + Sync {
         id: &'a str,
     ) -> BoxFuture<'a, Result<ContainerInfo, BackendError>>;
 
+    /// Return the container's own configured environment (`KEY=value`).
+    ///
+    /// This is the env the container was created with (image `ENV` plus
+    /// `containerEnv`), not a probed login-shell environment.
+    fn inspect_container_env<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, BackendError>>;
+
     fn list_cella_containers(
         &self,
         running_only: bool,
