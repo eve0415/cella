@@ -26,6 +26,7 @@ mod port_watcher;
 mod proxy_config;
 mod proxy_http;
 mod reconnecting_client;
+mod respond;
 mod ssh_agent_bridge;
 mod state;
 mod tunnel;

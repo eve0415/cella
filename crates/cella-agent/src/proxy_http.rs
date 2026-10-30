@@ -3,11 +3,12 @@
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::body::Incoming;
+use hyper::client::conn::TrySendError;
 use hyper::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue, UPGRADE};
 use hyper::upgrade::OnUpgrade;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub type BoxBody =
     http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
@@ -105,14 +106,35 @@ fn header_tokens<'a>(
         .filter(|t| !t.is_empty())
 }
 
-/// Return an upstream upgrade response to the client, splicing the two
-/// upgraded connections once the upstream switched protocols.
+/// Offer the upstream WebSocket and nothing else in a forwarded upgrade
+/// request, so it cannot switch the spliced connection to another protocol
+/// such as h2c.
+pub fn offer_only_websocket(headers: &mut HeaderMap) {
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    headers.remove("http2-settings");
+}
+
+/// Return an upstream reply to a WebSocket upgrade request to the client,
+/// splicing the two upgraded connections once the upstream switched to
+/// WebSocket. A reply that does not switch is relayed without its hop-by-hop
+/// headers.
+///
+/// # Errors
+///
+/// Returns [`GatewayError::ClosingBadGateway`] when the upstream switched to
+/// anything other than WebSocket alone; the upstream connection is dropped
+/// unspliced.
 pub fn relay_upgrade(
     client_upgrade: OnUpgrade,
     mut resp: Response<Incoming>,
     host: &str,
-) -> Response<BoxBody> {
-    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+) -> Result<Response<BoxBody>, GatewayError> {
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        strip_hop_by_hop(resp.headers_mut(), false);
+    } else if !is_websocket_switch(&resp) {
+        warn!("Upstream {host} switched to a protocol other than WebSocket");
+        return Err(GatewayError::ClosingBadGateway);
+    } else {
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         let host = host.to_string();
         tokio::spawn(async move {
@@ -130,13 +152,16 @@ pub fn relay_upgrade(
             }
         });
     }
-    resp.map(|body| body.map_err(Into::into).boxed())
+    Ok(resp.map(|body| body.map_err(Into::into).boxed()))
 }
 
 pub fn full(data: &'static str) -> BoxBody {
-    Full::new(Bytes::from(data))
-        .map_err(|never| match never {})
-        .boxed()
+    full_bytes(Bytes::from(data))
+}
+
+/// A complete body holding `data`.
+pub fn full_bytes(data: Bytes) -> BoxBody {
+    Full::new(data).map_err(|never| match never {}).boxed()
 }
 
 /// A plain-text response with the given status.
@@ -154,9 +179,224 @@ pub fn closing_response(status: StatusCode, body: &'static str) -> Response<BoxB
     resp
 }
 
+/// A request handed to [`send_or_reconnect`]: already started on a pooled
+/// upstream connection, or not sent anywhere yet.
+pub enum Pooled<F, B> {
+    /// The future `try_send_request` returned on the pooled connection.
+    Sent(F),
+    /// No pooled connection could take the request.
+    Unsent(Box<Request<B>>),
+}
+
+/// Await a request started on a pooled upstream connection, or send it with
+/// `reconnect` when there was no pooled connection or it closed before the
+/// request went out.
+///
+/// # Errors
+///
+/// Returns the error text when the request failed after it went out, or
+/// whatever `reconnect` returns.
+pub async fn send_or_reconnect<B, F, R, RF>(
+    pooled: Pooled<F, B>,
+    reconnect: R,
+    upstream: &str,
+) -> Result<Response<Incoming>, String>
+where
+    F: Future<Output = Result<Response<Incoming>, TrySendError<Request<B>>>>,
+    R: FnOnce(Request<B>) -> RF,
+    RF: Future<Output = Result<Response<Incoming>, String>>,
+{
+    let req = match pooled {
+        Pooled::Sent(sending) => match await_pooled(sending, upstream).await? {
+            Sent::Answered(resp) => return Ok(resp),
+            Sent::Returned(req) => *req,
+        },
+        Pooled::Unsent(req) => *req,
+    };
+    reconnect(req).await
+}
+
+/// What became of a request started on a pooled upstream connection.
+pub enum Sent<B> {
+    /// The upstream answered.
+    Answered(Response<Incoming>),
+    /// The connection closed before the request went out, so it can be sent
+    /// elsewhere.
+    Returned(Box<Request<B>>),
+}
+
+/// Await a request started on a pooled upstream connection.
+///
+/// # Errors
+///
+/// Returns the error text when the request failed after it went out; such a
+/// request is never handed back for resending.
+pub async fn await_pooled<B, F>(sending: F, upstream: &str) -> Result<Sent<B>, String>
+where
+    F: Future<Output = Result<Response<Incoming>, TrySendError<Request<B>>>>,
+{
+    match sending.await {
+        Ok(resp) => Ok(Sent::Answered(resp)),
+        Err(mut e) => e.take_message().map_or_else(
+            || Err(e.into_error().to_string()),
+            |req| {
+                debug!("Upstream connection to {upstream} closed, reconnecting");
+                Ok(Sent::Returned(Box::new(req)))
+            },
+        ),
+    }
+}
+
+/// The proxy's own reply when an upstream response cannot be relayed.
+#[derive(Debug, Clone, Copy)]
+pub enum GatewayError {
+    /// `502 Bad Gateway`.
+    BadGateway,
+    /// `502 Bad Gateway` that also closes the client connection.
+    ClosingBadGateway,
+}
+
+impl GatewayError {
+    pub fn into_response(self) -> Response<BoxBody> {
+        match self {
+            Self::BadGateway => text_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+            Self::ClosingBadGateway => closing_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+        }
+    }
+}
+
+/// In-memory upstream connections for exercising [`send_or_reconnect`].
+#[cfg(test)]
+pub mod test_upstreams {
+    use std::convert::Infallible;
+    use std::pin::Pin;
+
+    use http_body_util::{Empty, Full};
+    use hyper::body::Bytes;
+    use hyper::client::conn::{http1, http2};
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    pub type Body = Empty<Bytes>;
+
+    /// Body every [`live_h1`] and [`live_h2`] upstream answers with.
+    pub const LIVE_BODY: &str = "reconnected";
+
+    pub fn get() -> Request<Body> {
+        Request::get("http://upstream.test/")
+            .header("host", "upstream.test")
+            .body(Empty::new())
+            .unwrap()
+    }
+
+    fn serve_h1(io: tokio::io::DuplexStream) {
+        let svc = service_fn(|_| async {
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(LIVE_BODY))))
+        });
+        tokio::spawn(
+            hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(io), svc),
+        );
+    }
+
+    fn serve_h2(io: tokio::io::DuplexStream) {
+        let svc = service_fn(|_| async {
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(LIVE_BODY))))
+        });
+        let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        tokio::spawn(async move { builder.serve_connection(TokioIo::new(io), svc).await });
+    }
+
+    /// An HTTP/1.1 sender to a working upstream.
+    pub async fn live_h1() -> http1::SendRequest<Body> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_h1(server);
+        let (sender, conn) = http1::handshake(TokioIo::new(client)).await.unwrap();
+        tokio::spawn(conn);
+        sender
+    }
+
+    /// An HTTP/2 sender to a working upstream.
+    pub async fn live_h2() -> http2::SendRequest<Body> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_h2(server);
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        sender
+    }
+
+    /// An HTTP/1.1 sender that reported ready and whose connection then
+    /// ended, so a request handed to it is returned unsent.
+    pub async fn closed_h1() -> http1::SendRequest<Body> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_h1(server);
+        let (mut sender, conn) = http1::handshake(TokioIo::new(client)).await.unwrap();
+        let conn = tokio::spawn(conn);
+        sender.ready().await.unwrap();
+        conn.abort();
+        assert!(conn.await.is_err_and(|e| e.is_cancelled()));
+        assert!(sender.is_closed());
+        sender
+    }
+
+    /// An HTTP/1.1 sender ready for a request, and its connection, which runs
+    /// only when the caller polls it. Dropping the connection after a request
+    /// was handed to the sender returns that request unsent.
+    pub async fn unspawned_h1() -> (
+        http1::SendRequest<Body>,
+        Pin<Box<impl Future<Output = hyper::Result<()>>>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_h1(server);
+        let (mut sender, conn) = http1::handshake(TokioIo::new(client)).await.unwrap();
+        let mut conn = Box::pin(conn);
+        tokio::select! {
+            biased;
+            ready = sender.ready() => ready.unwrap(),
+            ended = &mut conn => panic!("connection ended before it was ready: {ended:?}"),
+        }
+        (sender, conn)
+    }
+
+    /// Like [`unspawned_h1`], over HTTP/2.
+    pub async fn unspawned_h2() -> (
+        http2::SendRequest<Body>,
+        Pin<Box<impl Future<Output = hyper::Result<()>>>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_h2(server);
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(client))
+            .await
+            .unwrap();
+        assert!(sender.is_ready());
+        (sender, Box::pin(conn))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
+
+    use super::test_upstreams::{LIVE_BODY, closed_h1, get, live_h1};
     use super::*;
+
+    /// The plain-HTTP path pools bare HTTP/1.1 senders.
+    #[tokio::test]
+    async fn resends_on_new_connection_when_pooled_h1_closed_after_ready() {
+        let mut pooled = closed_h1().await;
+        let sending = Pooled::Sent(pooled.try_send_request(get()));
+        let reconnect = |req| async move {
+            let mut sender = live_h1().await;
+            sender.send_request(req).await.map_err(|e| e.to_string())
+        };
+        let resp = send_or_reconnect(sending, reconnect, "upstream.test")
+            .await
+            .expect("request was not resent");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, LIVE_BODY);
+    }
 
     #[test]
     fn detects_websocket_upgrade_request() {

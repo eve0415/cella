@@ -11,9 +11,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::config::{NetworkConfig, NetworkMode, NetworkRule, ResponseSpec, RuleAction};
 
 /// Evaluates network rules against request URLs.
+///
+/// A verdict names a rule's configured responses or response headers by
+/// index only; the matcher keeps none of them, so whoever serves them holds
+/// the one copy (see [`RuleMatcher::with_payloads`]).
 pub struct RuleMatcher {
     mode: NetworkMode,
     rules: Vec<CompiledRule>,
+}
+
+/// The configured responses and response headers of a matcher's rules, moved
+/// out of its config, each at the index the matcher's verdicts carry.
+#[derive(Debug, Default)]
+pub struct RulePayloads {
+    /// Per `respond` rule, at its [`RespondIndex`], its responses in serving
+    /// order.
+    pub responses: Vec<Vec<ResponseSpec>>,
+    /// Per `allow` rule with response headers, at its [`HeadersIndex`].
+    pub headers: Vec<Vec<(String, String)>>,
+}
+
+/// The next index of each kind a rule compiled into a matcher takes.
+#[derive(Default)]
+struct NextIndices {
+    respond: usize,
+    headers: usize,
 }
 
 struct CompiledRule {
@@ -65,9 +87,10 @@ impl RuleVerdict {
 /// What the proxy does with a request.
 #[derive(Debug, Clone)]
 pub enum VerdictAction {
-    /// Forward upstream, setting these headers on the response.
+    /// Forward upstream, setting the rule's response headers, if it has any,
+    /// on the response.
     Allow {
-        response_headers: Option<Arc<[(String, String)]>>,
+        response_headers: Option<HeadersIndex>,
     },
     /// Refuse the request.
     Block,
@@ -75,35 +98,62 @@ pub enum VerdictAction {
     Respond(Arc<RespondRule>),
 }
 
-/// The responses of one `respond` rule and how many have been served.
+/// Position of a `respond` rule's responses in [`RulePayloads::responses`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RespondIndex(usize);
+
+impl RespondIndex {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Position of an `allow` rule's header list in [`RulePayloads::headers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadersIndex(usize);
+
+impl HeadersIndex {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// One `respond` rule's place among the configured responses and how many it
+/// has served. The responses themselves are in [`RulePayloads::responses`].
 ///
 /// The counter is shared by every request that hits the rule, so a sequence
 /// advances across connections.
 #[derive(Debug)]
 pub struct RespondRule {
-    responses: Vec<ResponseSpec>,
+    index: RespondIndex,
+    /// How many responses the rule has; never zero.
+    responses: usize,
     served: AtomicUsize,
 }
 
 impl RespondRule {
     /// `None` for an empty list, which has nothing to serve.
-    fn new(responses: &[ResponseSpec]) -> Option<Self> {
+    fn new(index: RespondIndex, responses: &[ResponseSpec]) -> Option<Self> {
         (!responses.is_empty()).then(|| Self {
-            responses: responses.to_vec(),
+            index,
+            responses: responses.len(),
             served: AtomicUsize::new(0),
         })
     }
 
-    /// The response to serve now: responses go out in order and the last one
-    /// repeats.
-    pub fn next(&self) -> &ResponseSpec {
-        let served = self.served.fetch_add(1, Ordering::Relaxed);
-        &self.responses[served.min(self.responses.len() - 1)]
+    /// Position of this rule's responses in [`RulePayloads::responses`].
+    #[must_use]
+    pub const fn index(&self) -> RespondIndex {
+        self.index
     }
 
-    /// Every configured response, in serving order.
-    pub fn responses(&self) -> &[ResponseSpec] {
-        &self.responses
+    /// Position among this rule's responses of the one to serve now:
+    /// responses go out in order and the last one repeats.
+    pub fn next_index(&self) -> usize {
+        let served = self.served.fetch_add(1, Ordering::Relaxed);
+        served.min(self.responses - 1)
     }
 }
 
@@ -115,15 +165,43 @@ impl RuleMatcher {
 
     /// Build a matcher from config with a source label for all rules.
     pub fn with_source(config: &NetworkConfig, source: &str) -> Self {
+        let mut next = NextIndices::default();
         let rules = config
             .rules
             .iter()
-            .map(|r| compile_rule(r, source))
+            .map(|rule| compile_rule(rule, source, compile_action(rule, &mut next)))
             .collect();
         Self {
             mode: config.mode,
             rules,
         }
+    }
+
+    /// Build a matcher from `config`, moving the configured responses and
+    /// response headers out to the caller, each at the index the matcher's
+    /// verdicts carry for it.
+    pub fn with_payloads(config: NetworkConfig) -> (Self, RulePayloads) {
+        let matcher = Self::new(&config);
+        let mut payloads = RulePayloads::default();
+        // `with_source` compiled one rule per config rule, in order.
+        for (compiled, rule) in matcher.rules.iter().zip(config.rules) {
+            match &compiled.action {
+                VerdictAction::Respond(r) => {
+                    place(&mut payloads.responses, r.index().get(), rule.responses);
+                }
+                VerdictAction::Allow {
+                    response_headers: Some(index),
+                } => {
+                    let headers = rule.response_headers.into_iter().collect();
+                    place(&mut payloads.headers, index.get(), headers);
+                }
+                VerdictAction::Allow {
+                    response_headers: None,
+                }
+                | VerdictAction::Block => {}
+            }
+        }
+        (matcher, payloads)
     }
 
     /// Evaluate whether a request to the given domain and path is allowed.
@@ -235,6 +313,39 @@ impl RuleMatcher {
     }
 }
 
+/// Build the verdict action a match on `rule` returns, giving its responses
+/// or response headers the next index of their kind.
+///
+/// A `respond` rule with no responses has nothing to serve and blocks;
+/// config validation rejects it before it gets here.
+fn compile_action(rule: &NetworkRule, next: &mut NextIndices) -> VerdictAction {
+    match rule.action {
+        RuleAction::Block => VerdictAction::Block,
+        RuleAction::Allow => VerdictAction::Allow {
+            response_headers: (!rule.response_headers.is_empty()).then(|| {
+                let index = HeadersIndex(next.headers);
+                next.headers += 1;
+                index
+            }),
+        },
+        RuleAction::Respond => {
+            let index = RespondIndex(next.respond);
+            RespondRule::new(index, &rule.responses).map_or(VerdictAction::Block, |r| {
+                next.respond += 1;
+                VerdictAction::Respond(Arc::new(r))
+            })
+        }
+    }
+}
+
+/// Put `item` at `index` in `list`, growing it as needed.
+fn place<T: Default>(list: &mut Vec<T>, index: usize, item: T) {
+    if list.len() <= index {
+        list.resize_with(index + 1, T::default);
+    }
+    list[index] = item;
+}
+
 impl CompiledRule {
     /// Verdict for a request this rule matched.
     fn verdict(&self) -> RuleVerdict {
@@ -274,7 +385,7 @@ fn split_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
+fn compile_rule(rule: &NetworkRule, source: &str, action: VerdictAction) -> CompiledRule {
     let domain_parts = parse_domain_pattern(&rule.domain);
     let path_patterns = rule.paths.iter().map(|p| parse_path_pattern(p)).collect();
 
@@ -292,7 +403,7 @@ fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
     CompiledRule {
         domain_parts,
         path_patterns,
-        action: compile_action(rule),
+        action,
         needs_mitm: rule.needs_mitm(),
         source: source.to_string(),
         pattern_display,
@@ -323,28 +434,6 @@ const fn canonical_ipv6(addr: Ipv6Addr) -> IpAddr {
     match addr.to_ipv4_mapped() {
         Some(v4) => IpAddr::V4(v4),
         None => IpAddr::V6(addr),
-    }
-}
-
-/// Build the verdict action a match on `rule` returns.
-///
-/// A `respond` rule with no responses has nothing to serve and blocks;
-/// config validation rejects it before it gets here.
-fn compile_action(rule: &NetworkRule) -> VerdictAction {
-    match rule.action {
-        RuleAction::Block => VerdictAction::Block,
-        RuleAction::Allow => VerdictAction::Allow {
-            response_headers: (!rule.response_headers.is_empty()).then(|| {
-                rule.response_headers
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect()
-            }),
-        },
-        RuleAction::Respond => RespondRule::new(&rule.responses)
-            .map_or(VerdictAction::Block, |r| {
-                VerdictAction::Respond(Arc::new(r))
-            }),
     }
 }
 
@@ -948,17 +1037,12 @@ mod tests {
         )]);
 
         let v = matcher.evaluate("api.anthropic.com", "/v1/messages");
-        let VerdictAction::Respond(rule) = &v.action else {
-            panic!("expected a respond verdict, got {:?}", v.action);
-        };
-        assert!(!v.is_allowed());
-        assert_eq!(
-            rule.responses()
-                .iter()
-                .map(|r| r.status)
-                .collect::<Vec<_>>(),
-            [529, 200]
+        assert!(
+            matches!(v.action, VerdictAction::Respond(_)),
+            "{:?}",
+            v.action
         );
+        assert!(!v.is_allowed());
         assert_eq!(
             v.reason,
             "responded by rule: api.anthropic.com /v1/messages (respond)"
@@ -972,13 +1056,24 @@ mod tests {
         );
     }
 
+    fn matcher_with_payloads(rules: Vec<NetworkRule>) -> (RuleMatcher, RulePayloads) {
+        RuleMatcher::with_payloads(NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules,
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn respond_rule_serves_in_order_then_repeats_last() {
-        let matcher = matcher_for(vec![respond_rule("api.example.com", &[], &[529, 529, 200])]);
+        let (matcher, payloads) =
+            matcher_with_payloads(vec![respond_rule("api.example.com", &[], &[529, 529, 200])]);
 
         let served: Vec<u16> = (0..4)
             .map(|_| match matcher.evaluate("api.example.com", "/").action {
-                VerdictAction::Respond(rule) => rule.next().status,
+                VerdictAction::Respond(rule) => {
+                    payloads.responses[rule.index().get()][rule.next_index()].status
+                }
                 other => panic!("expected a respond verdict, got {other:?}"),
             })
             .collect();
@@ -987,7 +1082,7 @@ mod tests {
 
     #[test]
     fn allow_verdict_carries_response_headers() {
-        let matcher = matcher_for(vec![NetworkRule {
+        let (matcher, payloads) = matcher_with_payloads(vec![NetworkRule {
             domain: "api.example.com".to_string(),
             action: RuleAction::Allow,
             response_headers: [("x-test-run".to_string(), "1".to_string())].into(),
@@ -1002,9 +1097,80 @@ mod tests {
             panic!("expected allow with headers, got {:?}", v.action);
         };
         assert_eq!(
-            headers.as_ref(),
+            payloads.headers[headers.get()],
             [("x-test-run".to_string(), "1".to_string())]
         );
+    }
+
+    #[test]
+    fn payloads_move_out_whole_responses() {
+        let busy = ResponseSpec {
+            status: 529,
+            headers: [("retry-after".to_string(), "0".to_string())].into(),
+            body: "busy".to_string(),
+        };
+        let rule = NetworkRule {
+            responses: vec![busy.clone(), response(200)],
+            ..respond_rule("api.example.com", &[], &[])
+        };
+        let (matcher, payloads) = matcher_with_payloads(vec![rule]);
+
+        let VerdictAction::Respond(rule) = matcher.evaluate("api.example.com", "/").action else {
+            panic!("expected a respond verdict");
+        };
+        assert_eq!(
+            payloads.responses[rule.index().get()],
+            [busy, response(200)]
+        );
+    }
+
+    fn allow_rule_with_header(domain: &str, name: &str) -> NetworkRule {
+        NetworkRule {
+            domain: domain.to_string(),
+            action: RuleAction::Allow,
+            response_headers: [(name.to_string(), "1".to_string())].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verdicts_index_their_rules_responses_and_headers() {
+        let (matcher, payloads) = matcher_with_payloads(vec![
+            allow_rule_with_header("a.example", "x-a"),
+            respond_rule("r.example", &[], &[529]),
+            NetworkRule {
+                domain: "plain.example".to_string(),
+                action: RuleAction::Allow,
+                ..Default::default()
+            },
+            allow_rule_with_header("b.example", "x-b"),
+            respond_rule("s.example", &[], &[418]),
+        ]);
+
+        for (domain, status) in [("r.example", 529), ("s.example", 418)] {
+            let VerdictAction::Respond(rule) = matcher.evaluate(domain, "/").action else {
+                panic!("expected a respond verdict for {domain}");
+            };
+            let indexed = &payloads.responses[rule.index().get()];
+            assert_eq!(indexed[0].status, status, "{domain}");
+        }
+        for (domain, name) in [("a.example", "x-a"), ("b.example", "x-b")] {
+            let VerdictAction::Allow {
+                response_headers: Some(index),
+            } = matcher.evaluate(domain, "/").action
+            else {
+                panic!("expected allow with headers for {domain}");
+            };
+            assert_eq!(payloads.headers[index.get()][0].0, name);
+        }
+        assert!(matches!(
+            matcher.evaluate("plain.example", "/").action,
+            VerdictAction::Allow {
+                response_headers: None
+            }
+        ));
+        assert_eq!(payloads.responses.len(), 2);
+        assert_eq!(payloads.headers.len(), 2);
     }
 
     #[test]

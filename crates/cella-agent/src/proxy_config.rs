@@ -3,14 +3,18 @@
 //! Deserializes the proxy config passed via `--proxy-config` JSON argument
 //! and builds the rule matcher for request evaluation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
-use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
+use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, ResponseSpec, RuleAction};
 use cella_network::rules::RuleMatcher;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
+use tracing::warn;
+
+use crate::respond::PreparedRules;
 
 /// A credential-protected domain route.
 #[derive(Debug, Clone)]
@@ -26,6 +30,13 @@ pub struct AgentProxyConfig {
 
     /// Rule matcher for evaluating requests.
     pub matcher: RuleMatcher,
+
+    /// The matcher's configured responses and response headers, parsed once.
+    pub prepared_rules: PreparedRules,
+
+    /// How long a `respond` rule reads the request body before answering;
+    /// past it the body is left unread and the connection closes.
+    pub respond_drain_timeout: Duration,
 
     /// Upstream proxy URL (if chaining through a corporate proxy).
     pub upstream_proxy: Option<String>,
@@ -76,24 +87,12 @@ impl AgentProxyConfig {
                 "allowlist" => NetworkMode::Allowlist,
                 _ => NetworkMode::Denylist,
             },
-            rules: raw
-                .rules
-                .into_iter()
-                .map(|r| NetworkRule {
-                    domain: r.domain,
-                    paths: r.paths,
-                    action: if r.action == "allow" {
-                        RuleAction::Allow
-                    } else {
-                        RuleAction::Block
-                    },
-                    ..Default::default()
-                })
-                .collect(),
+            rules: raw.rules.into_iter().map(RuleJson::into_rule).collect(),
             ..Default::default()
         };
 
-        let matcher = RuleMatcher::new(&net_config);
+        let (matcher, payloads) = RuleMatcher::with_payloads(net_config);
+        let prepared_rules = PreparedRules::new(payloads);
 
         // Open log file.
         let log_file = open_log_file(raw.log_path.as_deref());
@@ -115,6 +114,8 @@ impl AgentProxyConfig {
         Ok(Self {
             listen_port: raw.listen_port,
             matcher,
+            prepared_rules,
+            respond_drain_timeout: Duration::from_secs(10),
             upstream_proxy: raw.upstream_proxy,
             ca_cert_pem: raw.ca_cert_pem,
             ca_key_pem: raw.ca_key_pem,
@@ -137,34 +138,28 @@ impl AgentProxyConfig {
 
     /// Log an allowed request to the proxy log file.
     pub fn log_allowed(&self, domain: &str, path: &str) {
-        let Ok(mut guard) = self.log_file.lock() else {
-            return;
-        };
-        let Some(ref mut file) = *guard else {
-            return;
-        };
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let _ = writeln!(file, "{timestamp}\tALLOWED\t{domain}\t{path}");
+        self.write_log_line(format_args!("ALLOWED\t{domain}\t{path}"));
     }
 
     /// Log a blocked request to the proxy log file.
     pub fn log_blocked(&self, domain: &str, path: &str, reason: &str) {
-        let Ok(mut guard) = self.log_file.lock() else {
-            return;
-        };
-        let Some(ref mut file) = *guard else {
-            return;
-        };
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let _ = writeln!(file, "{timestamp}\tBLOCKED\t{domain}\t{path}\t{reason}");
+        self.write_log_line(format_args!("BLOCKED\t{domain}\t{path}\t{reason}"));
+    }
+
+    /// Log a request answered by a `respond` rule to the proxy log file.
+    pub fn log_responded(&self, domain: &str, path: &str, status: u16, rule: &str) {
+        self.write_log_line(format_args!(
+            "RESPONDED\t{domain}\t{path}\t{status}\t{rule}"
+        ));
     }
 
     /// Log an error (e.g. TLS handshake failure) to the proxy log file.
     pub fn log_error(&self, domain: &str, error: &str) {
+        self.write_log_line(format_args!("ERROR\t{domain}\t{error}"));
+    }
+
+    /// Append `{timestamp}\t{entry}` to the proxy log file, if one is open.
+    fn write_log_line(&self, entry: std::fmt::Arguments<'_>) {
         let Ok(mut guard) = self.log_file.lock() else {
             return;
         };
@@ -174,7 +169,7 @@ impl AgentProxyConfig {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let _ = writeln!(file, "{timestamp}\tERROR\t{domain}\t{error}");
+        let _ = writeln!(file, "{timestamp}\t{entry}");
     }
 
     /// Returns `true` the first time a domain is seen (caller should log the warning).
@@ -229,6 +224,36 @@ struct RuleJson {
     #[serde(default)]
     paths: Vec<String>,
     action: String,
+    #[serde(default)]
+    responses: Vec<ResponseSpec>,
+    #[serde(default)]
+    response_headers: BTreeMap<String, String>,
+}
+
+impl RuleJson {
+    /// Convert to a rule. An action this agent does not know blocks, so a
+    /// newer host config fails closed.
+    fn into_rule(self) -> NetworkRule {
+        let action = match self.action.as_str() {
+            "allow" => RuleAction::Allow,
+            "block" => RuleAction::Block,
+            "respond" => RuleAction::Respond,
+            other => {
+                warn!(
+                    "Unknown network rule action {other:?} for {}; treating it as block",
+                    self.domain
+                );
+                RuleAction::Block
+            }
+        };
+        NetworkRule {
+            domain: self.domain,
+            paths: self.paths,
+            action,
+            responses: self.responses,
+            response_headers: self.response_headers,
+        }
+    }
 }
 
 /// A credential route in the JSON config.
@@ -241,6 +266,7 @@ struct CredentialRouteJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_network::rules::VerdictAction;
 
     fn make_json(mode: &str, rules: &str, extras: &str) -> String {
         format!(r#"{{"listen_port":8080,"mode":"{mode}","rules":[{rules}]{extras}}}"#)
@@ -486,6 +512,81 @@ mod tests {
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\tALLOWED\texample.com\t/api/v1"));
+    }
+
+    #[test]
+    fn from_json_unknown_action_blocks() {
+        let json = make_json(
+            "denylist",
+            r#"{"domain":"new.com","action":"redirect"}"#,
+            "",
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        let v = config.matcher.evaluate("new.com", "/");
+        assert!(matches!(v.action, VerdictAction::Block));
+    }
+
+    #[test]
+    fn from_json_respond_rule_serves_its_responses() {
+        let rules = r#"{"domain":"api.example.com","action":"respond","responses":[{"status":529,"headers":{"retry-after":"0"},"body":"busy"},{"status":200}]}"#;
+        let json = make_json("denylist", rules, "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        let v = config.matcher.evaluate("api.example.com", "/v1/messages");
+        assert!(
+            matches!(v.action, VerdictAction::Respond(_)),
+            "expected a respond verdict, got {:?}",
+            v.action
+        );
+
+        let rule: RuleJson = serde_json::from_str(rules).unwrap();
+        let [first, second] = rule.into_rule().responses.try_into().unwrap();
+        assert_eq!(first.status, 529);
+        assert_eq!(first.headers["retry-after"], "0");
+        assert_eq!(first.body, "busy");
+        assert_eq!(second.status, 200);
+        assert!(second.headers.is_empty());
+        assert!(second.body.is_empty());
+    }
+
+    #[test]
+    fn from_json_allow_rule_carries_response_headers() {
+        let rules = r#"{"domain":"api.example.com","action":"allow","response_headers":{"x-test-run":"1"}}"#;
+        let json = make_json("allowlist", rules, "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        let v = config.matcher.evaluate("api.example.com", "/");
+        assert!(
+            matches!(
+                v.action,
+                VerdictAction::Allow {
+                    response_headers: Some(_)
+                }
+            ),
+            "expected allow with headers, got {:?}",
+            v.action
+        );
+
+        let rule: RuleJson = serde_json::from_str(rules).unwrap();
+        assert_eq!(
+            rule.into_rule().response_headers,
+            BTreeMap::from([("x-test-run".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn log_responded_writes_tab_separated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let json = make_json(
+            "denylist",
+            "",
+            &format!(r#","log_path":"{}""#, path.display()),
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        config.log_responded("api.example.com", "/v1/messages", 529, "rule display");
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\tRESPONDED\tapi.example.com\t/v1/messages\t529\trule display\n"));
     }
 
     #[test]

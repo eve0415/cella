@@ -1167,8 +1167,8 @@ async fn plain_http_non_websocket_upgrade_is_forwarded_without_upgrade_headers()
     upstream.task.abort();
 }
 
-/// Upstream that answers a WebSocket upgrade with `101` and then echoes
-/// bytes.
+/// Upstream that records request heads, answers upgrade requests, and echoes
+/// bytes after a `101`.
 struct WebSocketUpstream {
     addr: SocketAddr,
     task: JoinHandle<()>,
@@ -1414,6 +1414,37 @@ async fn start_tls_upstream(
     domain: &str,
     handler: fn() -> (u16, Vec<u8>),
 ) -> TlsUpstreamServer {
+    start_tls_upstream_with_headers(ca, domain, handler, "").await
+}
+
+/// Like [`start_tls_upstream`], with `extra_headers` (complete `name: value\r\n`
+/// lines) added to every response.
+async fn start_tls_upstream_with_headers(
+    ca: &TestCa,
+    domain: &str,
+    handler: fn() -> (u16, Vec<u8>),
+    extra_headers: &'static str,
+) -> TlsUpstreamServer {
+    serve_tls_upstream(ca, domain, handler, extra_headers, false).await
+}
+
+/// Like [`start_tls_upstream`], but closes each connection after one
+/// response without announcing it in a `Connection` header.
+async fn start_closing_tls_upstream(
+    ca: &TestCa,
+    domain: &str,
+    handler: fn() -> (u16, Vec<u8>),
+) -> TlsUpstreamServer {
+    serve_tls_upstream(ca, domain, handler, "", true).await
+}
+
+async fn serve_tls_upstream(
+    ca: &TestCa,
+    domain: &str,
+    handler: fn() -> (u16, Vec<u8>),
+    extra_headers: &'static str,
+    close_after_response: bool,
+) -> TlsUpstreamServer {
     let (certs, key) = generate_server_cert(ca, domain);
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1449,13 +1480,17 @@ async fn start_tls_upstream(
                     }
                     let (status, body) = handler();
                     let resp = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n",
+                        "HTTP/1.1 {status} OK\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                         body.len()
                     );
                     if tls.write_all(resp.as_bytes()).await.is_err() {
                         return;
                     }
                     if tls.write_all(&body).await.is_err() {
+                        return;
+                    }
+                    if close_after_response {
+                        let _ = tls.shutdown().await;
                         return;
                     }
                 }
@@ -2057,6 +2092,1161 @@ async fn mitm_blocks_upgrade_on_blocked_path() {
         resp_str.contains("403"),
         "expected 403 for blocked path, got {resp_str:?}"
     );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+const WEBSOCKET_SWITCH: &str =
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+const H2C_SWITCH: &str =
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+
+/// TLS upstream on keep-alive connections that answers a request carrying
+/// `Upgrade` with `upgrade_reply`, echoing bytes after it when it is a `101`,
+/// and any other request with `200` and body `no upgrade`.
+async fn start_recording_tls_upstream(
+    ca: &TestCa,
+    domain: &str,
+    upgrade_reply: &'static str,
+) -> WebSocketUpstream {
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let heads: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let spliced = Arc::new(AtomicUsize::new(0));
+    let (heads_in, spliced_in) = (heads.clone(), spliced.clone());
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, heads, spliced) =
+                (acceptor.clone(), heads_in.clone(), spliced_in.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                loop {
+                    let mut head = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if tls.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    if let Ok(mut heads) = heads.lock() {
+                        heads.push(head.clone());
+                    }
+                    let reply = if head.lines().any(|l| l.starts_with("upgrade:")) {
+                        upgrade_reply
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nno upgrade"
+                    };
+                    if tls.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if reply.starts_with("HTTP/1.1 101") {
+                        break;
+                    }
+                }
+                let mut buf = [0_u8; 1024];
+                while let Ok(n) = tls.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    spliced.fetch_add(n, Ordering::SeqCst);
+                    if tls.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    WebSocketUpstream {
+        addr,
+        task,
+        heads,
+        spliced,
+    }
+}
+
+/// Start a [`start_recording_tls_upstream`] on `localhost` and a MITM proxy
+/// blocking `/blocked/**` there, and open a client TLS connection to the
+/// upstream through the proxy.
+async fn start_mitm_upgrade_proxy(
+    log_path: &Path,
+    upgrade_reply: &'static str,
+) -> (
+    WebSocketUpstream,
+    ForwardProxyHandle,
+    tokio_rustls::client::TlsStream<TcpStream>,
+) {
+    let ca = test_ca();
+    let upstream = start_recording_tls_upstream(ca, "localhost", upgrade_reply).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/blocked/**"], "block")],
+        log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+    let tls = connect_mitm_tls(proxy.local_addr, "localhost", upstream.addr.port(), ca).await;
+    (upstream, proxy, tls)
+}
+
+/// Send `request` on an open connection and read one response.
+async fn exchange<S>(stream: &mut S, request: &[u8]) -> String
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    stream.write_all(request).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_http_response(stream),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn mitm_non_websocket_upgrade_is_forwarded_without_upgrade_headers() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let (upstream, proxy, mut tls) = start_mitm_upgrade_proxy(&log_path, H2C_SWITCH).await;
+
+    // HTTP2-Settings is not listed in Connection, so only the explicit
+    // removal keeps it from the upstream.
+    let resp = exchange(
+        &mut tls,
+        b"GET /h2c HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\
+          HTTP2-Settings: AAA\r\n\r\n",
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 200") && resp.ends_with("no upgrade"),
+        "response was {resp:?}"
+    );
+    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    assert_eq!(heads.len(), 1, "heads were {heads:?}");
+    for name in ["upgrade", "http2-settings"] {
+        assert!(
+            !heads[0].contains(name),
+            "{name} reached upstream: {heads:?}"
+        );
+    }
+
+    // The connection was not spliced, so a later request is still evaluated.
+    let blocked = exchange(
+        &mut tls,
+        b"GET /blocked/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .await;
+    assert!(
+        blocked.starts_with("HTTP/1.1 403"),
+        "response was {blocked:?}"
+    );
+    assert_eq!(upstream.spliced.load(Ordering::SeqCst), 0);
+    let heads = upstream.heads.lock().map(|h| h.len()).unwrap_or_default();
+    assert_eq!(heads, 1);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_websocket_upgrade_offers_only_websocket_upstream() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let (upstream, proxy, mut tls) = start_mitm_upgrade_proxy(&log_path, WEBSOCKET_SWITCH).await;
+
+    // HTTP2-Settings is not listed in Connection, so only the explicit
+    // removal keeps it from the upstream.
+    let resp = exchange(
+        &mut tls,
+        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+          Upgrade: websocket, h2c\r\nHTTP2-Settings: AAA\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 101"), "response was {resp:?}");
+    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    assert_eq!(heads.len(), 1, "heads were {heads:?}");
+    let upgrade_lines: Vec<&str> = heads[0]
+        .lines()
+        .filter(|l| l.starts_with("upgrade:"))
+        .collect();
+    assert_eq!(upgrade_lines, ["upgrade: websocket"]);
+    assert!(
+        !heads[0].contains("http2-settings"),
+        "HTTP2-Settings reached the upstream: {heads:?}"
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_upgrade_to_other_protocol_is_not_relayed() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let (upstream, proxy, mut tls) = start_mitm_upgrade_proxy(&log_path, H2C_SWITCH).await;
+
+    let resp = exchange(
+        &mut tls,
+        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 502"), "response was {resp:?}");
+
+    // Bytes written after the refusal must never reach the upstream.
+    let _ = tls
+        .write_all(b"GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(upstream.spliced.load(Ordering::SeqCst), 0);
+    let heads = upstream.heads.lock().map(|h| h.len()).unwrap_or_default();
+    assert_eq!(heads, 1);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_upgrade_refusal_drops_hop_by_hop_headers() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let refusal = "HTTP/1.1 426 Upgrade Required\r\nConnection: x-hop\r\nX-Hop: 1\r\n\
+                   Keep-Alive: timeout=5\r\nX-Kept: 1\r\nContent-Length: 0\r\n\r\n";
+    let (upstream, proxy, mut tls) = start_mitm_upgrade_proxy(&log_path, refusal).await;
+
+    let resp = exchange(
+        &mut tls,
+        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 426"), "response was {resp:?}");
+    for name in ["x-hop", "keep-alive"] {
+        assert!(
+            header_values(&resp, name).is_empty(),
+            "relayed {name}: {resp:?}"
+        );
+    }
+    assert_eq!(header_values(&resp, "x-kept"), ["1"]);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_obs_text_token_lines_are_rejected() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let (upstream, proxy, mut tls) = start_mitm_upgrade_proxy(&log_path, H2C_SWITCH).await;
+
+    let token_lines: [&[u8]; 2] = [
+        b"Connection: HTTP2-Settings, \xff\r\nHTTP2-Settings: AAA\r\n",
+        b"Connection: Upgrade\r\nUpgrade: \xffh2c\r\n",
+    ];
+    for lines in token_lines {
+        let request = [
+            b"GET /x HTTP/1.1\r\nHost: localhost\r\n".as_slice(),
+            lines,
+            b"\r\n",
+        ]
+        .concat();
+        let resp = exchange(&mut tls, &request).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 400"),
+            "{}: response was {resp:?}",
+            lines.escape_ascii()
+        );
+    }
+    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    assert!(heads.is_empty(), "heads were {heads:?}");
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+// ---- respond rules and response headers ----
+
+fn respond_rule(domain: &str, paths: &[&str], responses: &[Value]) -> Value {
+    let mut rule = rule(domain, paths, "respond");
+    rule["responses"] = Value::from(responses.to_vec());
+    rule
+}
+
+fn allow_rule_with_headers(domain: &str, headers: &[(&str, &str)]) -> Value {
+    let mut rule = rule(domain, &[], "allow");
+    rule["response_headers"] = headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), Value::from(*value)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    rule
+}
+
+/// Every value of header `name` in a raw HTTP/1.1 response.
+fn header_values(response: &str, name: &str) -> Vec<String> {
+    response
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim().to_string())
+        .collect()
+}
+
+/// A loopback port nothing listens on.
+async fn unused_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// CONNECT through the proxy and complete TLS with its MITM certificate.
+async fn connect_mitm_tls(
+    proxy_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    ca: &TestCa,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    connect_mitm_tls_alpn(proxy_addr, host, port, ca, b"http/1.1").await
+}
+
+/// Like [`connect_mitm_tls`], offering only `alpn`.
+async fn connect_mitm_tls_alpn(
+    proxy_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    ca: &TestCa,
+    alpn: &[u8],
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let connect_req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    stream.write_all(connect_req.as_bytes()).await.unwrap();
+    let connect_resp = read_http_response(&mut stream).await.unwrap_or_default();
+    assert!(
+        connect_resp.starts_with("HTTP/1.1 200"),
+        "CONNECT failed: {connect_resp:?}"
+    );
+
+    let cert_der = CertificateDer::from(
+        ca.params
+            .clone()
+            .self_signed(&ca.key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    );
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add(cert_der).unwrap();
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![alpn.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+    connector.connect(server_name, stream).await.unwrap()
+}
+
+/// POST `body_len` bytes to `path` on an open keep-alive connection and read
+/// the response.
+async fn post_keepalive<S>(stream: &mut S, host: &str, path: &str, body_len: usize) -> String
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&vec![b'x'; body_len]).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_http_response(stream),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn plain_http_respond_serves_configured_response() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_upstream_server().await;
+    let response = serde_json::json!({
+        "status": 529,
+        "headers": {"content-type": "application/json", "retry-after": "0"},
+        "body": r#"{"type":"error"}"#,
+    });
+    let config_json = proxy_config_json(
+        "denylist",
+        &[respond_rule("127.0.0.1", &["/v1/messages"], &[response])],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_http_request(proxy.local_addr, upstream.addr, "/v1/messages").await;
+    assert!(resp.starts_with("HTTP/1.1 529"), "response was {resp:?}");
+    assert_eq!(header_values(&resp, "content-type"), ["application/json"]);
+    assert_eq!(header_values(&resp, "retry-after"), ["0"]);
+    let request_ids = header_values(&resp, "request-id");
+    assert_eq!(request_ids.len(), 1, "response was {resp:?}");
+    assert!(request_ids[0].starts_with("req_cella_"), "{request_ids:?}");
+    assert!(
+        resp.ends_with(r#"{"type":"error"}"#),
+        "response was {resp:?}"
+    );
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn plain_http_respond_sends_configured_request_id_once() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_upstream_server().await;
+    let response = serde_json::json!({
+        "status": 200,
+        "headers": {"Request-Id": "req_fixed_123"},
+    });
+    let config_json = proxy_config_json(
+        "denylist",
+        &[respond_rule("127.0.0.1", &[], &[response])],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_http_request(proxy.local_addr, upstream.addr, "/v1/messages").await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "response was {resp:?}");
+    assert_eq!(header_values(&resp, "request-id"), ["req_fixed_123"]);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+/// Start the forward proxy with a `respond` drain timeout of `timeout`.
+async fn start_proxy_with_drain_timeout(
+    config_json: &str,
+    timeout: std::time::Duration,
+) -> ForwardProxyHandle {
+    let mut config = AgentProxyConfig::from_json(config_json).expect("parse proxy config");
+    config.respond_drain_timeout = timeout;
+    forward_proxy::start_forward_proxy(Arc::new(config))
+        .await
+        .expect("start forward proxy")
+}
+
+/// A config answering every request to 127.0.0.1 with `529 busy`.
+fn busy_respond_config(log_path: &Path) -> String {
+    let response = serde_json::json!({"status": 529, "body": "busy"});
+    proxy_config_json(
+        "denylist",
+        &[respond_rule("127.0.0.1", &[], &[response])],
+        log_path,
+    )
+}
+
+#[tokio::test]
+async fn plain_http_respond_answers_expect_continue_without_the_body() {
+    let log_dir = TempDir::new().unwrap();
+    let proxy = start_proxy(&busy_respond_config(&log_dir.path().join("proxy.log"))).await;
+    let port = unused_port().await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let head = format!(
+        "POST http://127.0.0.1:{port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nExpect: 100-Continue\r\nContent-Length: 100\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stream.read_to_end(&mut raw),
+    )
+    .await;
+    let resp = String::from_utf8_lossy(&raw).into_owned();
+    assert!(read.is_ok(), "connection still open; read {resp:?}");
+    assert!(resp.starts_with("HTTP/1.1 529"), "response was {resp:?}");
+    assert!(!resp.contains("100 Continue"), "response was {resp:?}");
+    assert_eq!(header_values(&resp, "connection"), ["close"]);
+    assert!(resp.ends_with("busy"), "response was {resp:?}");
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn plain_http_respond_answers_a_stalled_body_after_the_drain_timeout() {
+    let log_dir = TempDir::new().unwrap();
+    let proxy = start_proxy_with_drain_timeout(
+        &busy_respond_config(&log_dir.path().join("proxy.log")),
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    let port = unused_port().await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let head = format!(
+        "POST http://127.0.0.1:{port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 1000\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&[b'x'; 10]).await.unwrap();
+
+    let mut first = [0_u8; 1];
+    let early = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        stream.read(&mut first),
+    )
+    .await;
+    assert!(early.is_err(), "answered before the drain timeout");
+
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        stream.read_to_end(&mut raw),
+    )
+    .await;
+    let resp = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        read.is_ok(),
+        "not answered and closed by 1 s; read {resp:?}"
+    );
+    assert!(resp.starts_with("HTTP/1.1 529"), "response was {resp:?}");
+    assert_eq!(header_values(&resp, "connection"), ["close"]);
+    assert!(resp.ends_with("busy"), "response was {resp:?}");
+
+    proxy.task.abort();
+}
+
+/// A client that sends part of a body and goes away receives nothing, so it
+/// takes no step of the sequence: the next request still gets the first.
+#[tokio::test]
+async fn plain_http_respond_request_dropped_mid_body_takes_no_step() {
+    let log_dir = TempDir::new().unwrap();
+    let responses = [
+        serde_json::json!({"status": 529, "body": "busy"}),
+        serde_json::json!({"status": 200, "body": "ok"}),
+    ];
+    let config_json = proxy_config_json(
+        "denylist",
+        &[respond_rule("127.0.0.1", &[], &responses)],
+        &log_dir.path().join("proxy.log"),
+    );
+    // Short enough that a disconnect the drain missed would still produce a
+    // response, and take a step, before the next request.
+    let proxy =
+        start_proxy_with_drain_timeout(&config_json, std::time::Duration::from_millis(300)).await;
+    let port = unused_port().await;
+
+    let mut dropped = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let head = format!(
+        "POST http://127.0.0.1:{port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 1000\r\n\r\n"
+    );
+    dropped.write_all(head.as_bytes()).await.unwrap();
+    dropped.write_all(&[b'x'; 10]).await.unwrap();
+    // Let the proxy match the request and start draining, then go away and
+    // let the drain end, by the disconnect or else by its timeout.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    drop(dropped);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let target = SocketAddr::from(([127, 0, 0, 1], port));
+    let second = proxy_http_request(proxy.local_addr, target, "/v1/messages").await;
+    assert!(
+        second.starts_with("HTTP/1.1 529"),
+        "response was {second:?}"
+    );
+    let third = proxy_http_request(proxy.local_addr, target, "/v1/messages").await;
+    assert!(third.starts_with("HTTP/1.1 200"), "response was {third:?}");
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn plain_http_respond_to_head_advertises_the_body_length() {
+    let log_dir = TempDir::new().unwrap();
+    let proxy = start_proxy(&busy_respond_config(&log_dir.path().join("proxy.log"))).await;
+    let port = unused_port().await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let head = format!(
+        "HEAD http://127.0.0.1:{port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stream.read_to_end(&mut raw),
+    )
+    .await;
+    let resp = String::from_utf8_lossy(&raw).into_owned();
+    assert!(read.is_ok(), "connection still open; read {resp:?}");
+    assert!(resp.starts_with("HTTP/1.1 529"), "response was {resp:?}");
+    assert_eq!(header_values(&resp, "content-length"), ["4"]);
+    assert!(
+        resp.ends_with("\r\n\r\n"),
+        "HEAD response carried a body: {resp:?}"
+    );
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn plain_http_allow_injects_response_headers() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_upstream_server().await;
+    let config_json = proxy_config_json(
+        "denylist",
+        &[allow_rule_with_headers("127.0.0.1", &[("x-test-run", "1")])],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_http_request(proxy.local_addr, upstream.addr, "/anything").await;
+    assert!(
+        resp.starts_with("HTTP/1.1 200") && resp.contains("upstream ok"),
+        "response was {resp:?}"
+    );
+    assert_eq!(header_values(&resp, "x-test-run"), ["1"]);
+    assert!(header_values(&resp, "request-id").is_empty());
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_respond_needs_no_upstream_listener() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let port = unused_port().await;
+    let response = serde_json::json!({"status": 200, "body": "mocked"});
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[respond_rule("localhost", &[], &[response])],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(proxy.local_addr, "localhost", port, "/v1/x", ca)
+        .await
+        .unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200") && resp.ends_with("mocked"),
+        "response was {resp:?}"
+    );
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_respond_to_head_over_h2_advertises_the_body_length() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let port = unused_port().await;
+    let response = serde_json::json!({
+        "status": 200,
+        "headers": {"content-type": "text/plain"},
+        "body": "mocked",
+    });
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[respond_rule("localhost", &[], &[response])],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let tls = connect_mitm_tls_alpn(proxy.local_addr, "localhost", port, ca, b"h2").await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let head = hyper::Request::head("https://localhost/v1/x")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(head).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "text/plain");
+    assert_eq!(resp.headers()["content-length"], "6");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "HEAD response carried a body: {body:?}");
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_respond_sequence_over_keepalive_post() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let port = unused_port().await;
+    let responses = [
+        serde_json::json!({"status": 529, "body": "overloaded"}),
+        serde_json::json!({"status": 529, "body": "overloaded"}),
+        serde_json::json!({"status": 200, "body": "done"}),
+    ];
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[respond_rule("localhost", &["/v1/messages"], &responses)],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut tls = connect_mitm_tls(proxy.local_addr, "localhost", port, ca).await;
+    let mut statuses = Vec::new();
+    let mut request_ids = Vec::new();
+    for _ in 0..3 {
+        let resp = post_keepalive(&mut tls, "localhost", "/v1/messages", 256 * 1024).await;
+        statuses.push(resp.lines().next().unwrap_or_default().to_string());
+        request_ids.push(header_values(&resp, "request-id"));
+    }
+    assert!(statuses[0].starts_with("HTTP/1.1 529"), "{statuses:?}");
+    assert!(statuses[1].starts_with("HTTP/1.1 529"), "{statuses:?}");
+    assert!(statuses[2].starts_with("HTTP/1.1 200"), "{statuses:?}");
+    assert_eq!(request_ids[0].len(), 1, "{request_ids:?}");
+    assert_eq!(request_ids[1].len(), 1, "{request_ids:?}");
+    assert!(
+        request_ids[0][0].starts_with("req_cella_"),
+        "{request_ids:?}"
+    );
+    assert_ne!(request_ids[0], request_ids[1]);
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("RESPONDED\tlocalhost\t/v1/messages\t529\t"),
+        "log was {log:?}"
+    );
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_allow_injects_and_overrides_response_headers() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_tls_upstream_with_headers(
+        ca,
+        "localhost",
+        simple_200_handler,
+        "x-test-run: upstream\r\nx-upstream: kept\r\n",
+    )
+    .await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[allow_rule_with_headers(
+            "localhost",
+            &[("x-test-run", "1"), ("x-added", "yes")],
+        )],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/anything",
+        ca,
+    )
+    .await
+    .unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200") && resp.ends_with("upstream ok"),
+        "response was {resp:?}"
+    );
+    assert_eq!(header_values(&resp, "x-test-run"), ["1"]);
+    assert_eq!(header_values(&resp, "x-added"), ["yes"]);
+    assert_eq!(header_values(&resp, "x-upstream"), ["kept"]);
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn plain_http_proxy_502_carries_no_response_headers() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let port = unused_port().await;
+    let config_json = proxy_config_json(
+        "denylist",
+        &[allow_rule_with_headers("127.0.0.1", &[("x-test-run", "1")])],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let unreachable = SocketAddr::from(([127, 0, 0, 1], port));
+    let resp = proxy_http_request(proxy.local_addr, unreachable, "/anything").await;
+    assert!(resp.starts_with("HTTP/1.1 502"), "response was {resp:?}");
+    assert!(
+        header_values(&resp, "x-test-run").is_empty(),
+        "response was {resp:?}"
+    );
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_proxy_502_carries_no_response_headers() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let port = unused_port().await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[allow_rule_with_headers("localhost", &[("x-test-run", "1")])],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(proxy.local_addr, "localhost", port, "/x", ca)
+        .await
+        .unwrap();
+    assert!(resp.starts_with("HTTP/1.1 502"), "response was {resp:?}");
+    assert!(
+        header_values(&resp, "x-test-run").is_empty(),
+        "response was {resp:?}"
+    );
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_strips_upstream_hop_by_hop_response_headers() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_tls_upstream_with_headers(
+        ca,
+        "localhost",
+        simple_200_handler,
+        "Connection: close, x-hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\nX-Kept: 1\r\n",
+    )
+    .await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut tls = connect_mitm_tls(proxy.local_addr, "localhost", upstream.addr.port(), ca).await;
+    for i in 0..2 {
+        let req = format!("GET /req/{i} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_http_response(&mut tls),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.ends_with("upstream ok"),
+            "request {i} got {resp:?}"
+        );
+        for name in ["connection", "x-hop", "keep-alive"] {
+            assert!(
+                header_values(&resp, name).is_empty(),
+                "request {i} relayed {name}: {resp:?}"
+            );
+        }
+        assert_eq!(header_values(&resp, "x-kept"), ["1"]);
+    }
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+/// A request after the upstream closed its connection goes out on a fresh
+/// one. A connection closing just as a request is handed to it is a race over
+/// real sockets; the `mitm::tests::resends_*` tests cover that resend.
+#[tokio::test]
+async fn mitm_opens_a_fresh_connection_after_upstream_closes() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_closing_tls_upstream(ca, "localhost", simple_200_handler).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut tls = connect_mitm_tls(proxy.local_addr, "localhost", upstream.addr.port(), ca).await;
+    for i in 0..2 {
+        let req = format!("GET /req/{i} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_http_response(&mut tls),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.ends_with("upstream ok"),
+            "request {i} got {resp:?}"
+        );
+        // Let the proxy see the upstream close before the next request.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn connect_respond_rule_without_mitm_blocks_tunnel() {
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_upstream_server().await;
+    let response = serde_json::json!({"status": 529});
+    // No CA material, so the respond rule cannot be applied by decrypting.
+    let config_json = proxy_config_json(
+        "denylist",
+        &[respond_rule("127.0.0.1", &["/v1/messages"], &[response])],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_and_tunnel(proxy.local_addr, upstream.addr, "/v1/messages").await;
+    assert!(
+        resp.starts_with("HTTP/1.1 403"),
+        "respond rule without MITM must block the CONNECT, got {resp:?}"
+    );
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("BLOCKED\t127.0.0.1\t/\trespond rule requires TLS interception"),
+        "log was {log:?}"
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+/// HTTP/1.1 TLS upstream that answers `/stream` with its headers and half its
+/// body, sending the rest only once `release` is notified; any other path
+/// gets `other` straight away. `accepted` counts the connections it accepts.
+async fn start_held_stream_tls_upstream(
+    ca: &TestCa,
+    domain: &str,
+    release: Arc<tokio::sync::Notify>,
+    accepted: Arc<AtomicUsize>,
+) -> TlsUpstreamServer {
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                while let Some(head) = read_http_response(&mut tls).await {
+                    let request_line = head.lines().next().unwrap_or_default().to_string();
+                    if request_line.contains("/stream ") {
+                        let first = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+                        tls.write_all(first.as_bytes()).await.unwrap();
+                        tls.flush().await.unwrap();
+                        release.notified().await;
+                        tls.write_all(b"world").await.unwrap();
+                    } else {
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nother";
+                        tls.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                    tls.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    TlsUpstreamServer { addr, task }
+}
+
+#[tokio::test]
+async fn mitm_h2_stream_is_not_held_up_by_open_h1_response() {
+    use std::time::Duration;
+
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let upstream = start_held_stream_tls_upstream(ca, "localhost", release.clone(), accepted).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let port = upstream.addr.port();
+    let tls = connect_mitm_tls_alpn(proxy.local_addr, "localhost", port, ca, b"h2").await;
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let get = |path: &str| {
+        hyper::Request::get(format!("https://localhost{path}"))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+
+    // Stream 1's headers are in while its body is still open upstream.
+    let streaming = tokio::time::timeout(
+        Duration::from_secs(5),
+        sender.clone().send_request(get("/stream")),
+    )
+    .await
+    .expect("stream 1 headers timed out")
+    .unwrap();
+    assert_eq!(streaming.status(), 200);
+
+    let other = tokio::time::timeout(Duration::from_secs(5), async {
+        let resp = sender.send_request(get("/other")).await.unwrap();
+        resp.into_body().collect().await.unwrap().to_bytes()
+    })
+    .await
+    .expect("stream 2 waited for stream 1's open response");
+    assert_eq!(&other[..], b"other");
+
+    release.notify_one();
+    let body = tokio::time::timeout(Duration::from_secs(5), streaming.into_body().collect())
+        .await
+        .expect("stream 1 body timed out")
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"helloworld");
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_caps_upstream_connections_per_client_connection() {
+    use std::time::Duration;
+
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        start_held_stream_tls_upstream(ca, "localhost", release.clone(), accepted.clone()).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let port = upstream.addr.port();
+    let tls = connect_mitm_tls_alpn(proxy.local_addr, "localhost", port, ca, b"h2").await;
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let get = |path: &str| {
+        hyper::Request::get(format!("https://localhost{path}"))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+
+    // The first connection plus eight extra ones, each busy with an open
+    // response that is kept until the end.
+    let mut open = Vec::new();
+    for _ in 0..9 {
+        let resp =
+            tokio::time::timeout(Duration::from_secs(5), sender.send_request(get("/stream")))
+                .await
+                .expect("response headers timed out")
+                .unwrap();
+        assert_eq!(resp.status(), 200);
+        open.push(resp);
+    }
+
+    // The next two requests wait for one of them to come free, and then take
+    // turns on it.
+    let mut waiting = Box::pin(async {
+        let first = sender.send_request(get("/other"));
+        let second = sender.send_request(get("/other"));
+        tokio::join!(first, second)
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+            .await
+            .is_err(),
+        "requests did not wait for a busy connection to come free"
+    );
+    release.notify_one();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("waiting requests were not sent once a connection came free");
+    for resp in [first.unwrap(), second.unwrap()] {
+        assert_eq!(resp.status(), 200);
+        let body = tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect())
+            .await
+            .expect("body timed out")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"other");
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 9);
+    assert_eq!(open.len(), 9);
 
     proxy.task.abort();
     upstream.task.abort();

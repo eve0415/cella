@@ -13,7 +13,7 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{HOST, HeaderValue, UPGRADE};
+use hyper::header::{HOST, HeaderValue};
 use hyper::http::uri::{PathAndQuery, Scheme};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
@@ -28,9 +28,10 @@ use cella_network::rules::canonical_ipv6_literal;
 
 use crate::proxy_config::AgentProxyConfig;
 use crate::proxy_http::{
-    BoxBody, closing_response, has_invalid_token_lines, is_websocket_switch, is_websocket_upgrade,
-    relay_upgrade, strip_hop_by_hop, text_response,
+    BoxBody, GatewayError, Pooled, closing_response, has_invalid_token_lines, is_websocket_upgrade,
+    offer_only_websocket, relay_upgrade, send_or_reconnect, strip_hop_by_hop, text_response,
 };
+use crate::respond::{self, Channel, Decision};
 
 /// Most upstream connections one client connection keeps open at once.
 const MAX_POOLED_UPSTREAMS: usize = 8;
@@ -134,8 +135,9 @@ async fn handle_connection(stream: TcpStream, config: Arc<AgentProxyConfig>) {
 
 /// Handle CONNECT tunneling (for HTTPS).
 ///
-/// Domain rules are evaluated before the tunnel is established. Domains with
-/// path-level rules or credential routing go to MITM TLS interception.
+/// Domain rules are evaluated before the tunnel is established. Domains whose
+/// rules need decrypted traffic (path patterns, `respond`, response headers)
+/// or credential routing go to MITM TLS interception.
 /// Refusals close the connection, since hyper would otherwise keep it open
 /// after a non-2xx CONNECT reply.
 async fn handle_connect(
@@ -178,12 +180,14 @@ async fn handle_connect(
     }
 
     // When MITM is unavailable, evaluate domain-level rules only — path
-    // rules are skipped entirely rather than matched against a fake path.
+    // rules are skipped entirely rather than matched against a fake path,
+    // and a `respond` rule for the domain blocks the tunnel.
     let verdict = if needs_mitm {
         if config.warn_no_mitm_once(&host) {
             warn!(
-                "CONNECT to {host}: path-level rules exist but MITM is unavailable; \
-                 path blocking disabled (requires TLS interception)"
+                "CONNECT to {host}: path, respond or response-header rules need TLS \
+                 interception but MITM is unavailable; path rules and response headers \
+                 are not applied, and respond rules block the domain"
             );
         }
         config.matcher.evaluate_domain_only(&host)
@@ -281,23 +285,21 @@ async fn handle_plain(
         return text_response(StatusCode::BAD_REQUEST, "Bad Request");
     };
 
-    let path = strip_query(req.uri().path());
-    let verdict = config.matcher.evaluate(&target.host, path);
-    if !verdict.is_allowed() {
-        info!("BLOCKED HTTP {} - {}", req.uri(), verdict.reason);
-        config.log_blocked(&target.host, path, &verdict.reason);
-        return text_response(StatusCode::FORBIDDEN, "Forbidden");
-    }
-
-    config.log_allowed(&target.host, path);
+    let (req, response_headers) =
+        match respond::decide(req, &target.host, config, Channel::PlainHttp).await {
+            Decision::Done(resp) => return resp,
+            Decision::Forward(req, response_headers) => (req, response_headers),
+        };
 
     // Only WebSocket upgrades are spliced. Any other upgrade (such as h2c) is
     // forwarded as an ordinary request with its upgrade headers stripped, so
     // later requests on the connection still go through the rules.
-    if is_websocket_upgrade(&req) {
-        return forward_plain_upgrade(req, &target, config).await;
-    }
-    forward_plain(req, &target, config, pool).await
+    let forwarded = if is_websocket_upgrade(&req) {
+        forward_plain_upgrade(req, &target, config).await
+    } else {
+        forward_plain(req, &target, config, pool).await
+    };
+    respond::forwarded_response(forwarded, response_headers, &target.host, config)
 }
 
 /// Rewrite a client request for the upstream.
@@ -341,20 +343,34 @@ async fn forward_plain(
     target: &PlainTarget,
     config: &AgentProxyConfig,
     pool: &Mutex<UpstreamPool>,
-) -> Response<BoxBody> {
+) -> Result<Response<BoxBody>, GatewayError> {
     let req = prepare_plain_request(req, target, config, false);
     let key = target.key();
-    let pooled = take_ready_sender(pool, &key).await;
+    let mut pooled = take_ready_sender(pool, &key).await;
+    let sending = match pooled.as_mut() {
+        Some(sender) => Pooled::Sent(sender.try_send_request(req)),
+        None => Pooled::Unsent(Box::new(req)),
+    };
 
-    match send_plain(pooled, req, target, config).await {
-        Ok((sender, mut resp)) => {
-            pool.lock().await.put(key, sender);
+    let mut fresh = None;
+    let fresh_slot = &mut fresh;
+    let reconnect = move |req| async move {
+        let mut sender = connect_plain_upstream(target, config).await?;
+        let sent = sender.send_request(req);
+        *fresh_slot = Some(sender);
+        sent.await.map_err(|e| e.to_string())
+    };
+    match send_or_reconnect(sending, reconnect, &target.host_header).await {
+        Ok(mut resp) => {
+            if let Some(sender) = fresh.or(pooled) {
+                pool.lock().await.put(key, sender);
+            }
             strip_hop_by_hop(resp.headers_mut(), false);
-            resp.map(|body| body.map_err(Into::into).boxed())
+            Ok(resp.map(|body| body.map_err(Into::into).boxed()))
         }
         Err(e) => {
             warn!("Upstream request to {} failed: {e}", target.host_header);
-            text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+            Err(GatewayError::BadGateway)
         }
     }
 }
@@ -367,35 +383,6 @@ async fn take_ready_sender(
     let mut sender = pool.lock().await.take(key)?;
     sender.ready().await.ok()?;
     Some(sender)
-}
-
-/// Send on the pooled sender, reconnecting once if the upstream closed the
-/// connection before the request went out.
-async fn send_plain(
-    pooled: Option<SendRequest<Incoming>>,
-    req: Request<Incoming>,
-    target: &PlainTarget,
-    config: &AgentProxyConfig,
-) -> Result<(SendRequest<Incoming>, Response<Incoming>), String> {
-    let req = match pooled {
-        Some(mut sender) => match sender.try_send_request(req).await {
-            Ok(resp) => return Ok((sender, resp)),
-            Err(mut e) => match e.take_message() {
-                Some(req) => {
-                    debug!(
-                        "Pooled upstream {} closed, reconnecting",
-                        target.host_header
-                    );
-                    req
-                }
-                None => return Err(e.into_error().to_string()),
-            },
-        },
-        None => req,
-    };
-    let mut sender = connect_plain_upstream(target, config).await?;
-    let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
-    Ok((sender, resp))
 }
 
 async fn connect_plain_upstream(
@@ -423,33 +410,19 @@ async fn forward_plain_upgrade(
     mut req: Request<Incoming>,
     target: &PlainTarget,
     config: &AgentProxyConfig,
-) -> Response<BoxBody> {
+) -> Result<Response<BoxBody>, GatewayError> {
     let client_upgrade = hyper::upgrade::on(&mut req);
     let mut req = prepare_plain_request(req, target, config, true);
-    // Offer the upstream WebSocket and nothing else, so it cannot switch the
-    // spliced connection to another protocol such as h2c.
-    req.headers_mut()
-        .insert(UPGRADE, HeaderValue::from_static("websocket"));
-    req.headers_mut().remove("http2-settings");
+    offer_only_websocket(req.headers_mut());
     let resp = match connect_plain_upstream(target, config).await {
         Ok(mut sender) => sender.send_request(req).await.map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
     match resp {
-        Ok(resp)
-            if resp.status() == StatusCode::SWITCHING_PROTOCOLS && !is_websocket_switch(&resp) =>
-        {
-            // Dropping the response drops the upstream connection unspliced.
-            warn!(
-                "Upstream {} switched to a protocol other than WebSocket",
-                target.host_header
-            );
-            closing_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
-        }
         Ok(resp) => relay_upgrade(client_upgrade, resp, &target.host_header),
         Err(e) => {
             warn!("Upgrade request to {} failed: {e}", target.host_header);
-            text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+            Err(GatewayError::BadGateway)
         }
     }
 }
