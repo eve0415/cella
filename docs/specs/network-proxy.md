@@ -382,33 +382,21 @@ When `enabled` is `false`, no proxy environment variables are injected into the 
 
 ## Rule Merging
 
-When both `cella.toml` and `devcontainer.json` define network configuration, they are merged:
+Network configuration is part of the cella config, which is assembled from up to three layers before it is deserialized:
 
-### Mode
+1. `~/.cella/config.{toml,json}` (global, lowest priority)
+2. `customizations.cella` in the resolved devcontainer configuration
+3. `.devcontainer/cella.{toml,json}` in the workspace (project, highest priority)
 
-`cella.toml` wins if it explicitly sets a mode (the `mode` field is present in the TOML). If `cella.toml` does not set a mode (the field is absent, not just defaulted), the `devcontainer.json` mode is used.
+`~/.cella/config.*` is the global cella config and is unrelated to `~/.config/cella/global.jsonc`, which is a global devcontainer.json layer merged into the devcontainer configuration before `customizations.cella` is read from it.
 
-The `Network` settings type tracks `mode` as `Option<NetworkMode>` to distinguish "not set" (`None`) from "explicitly set to denylist" (`Some(Denylist)`).
+The layers are deep-merged field by field as JSON values:
 
-### Proxy Settings
+- Objects merge key by key, so `[network.proxy]` fields set in different layers combine and a higher layer replaces only the keys it sets.
+- Scalars such as `mode` are replaced by the highest layer that sets them.
+- Arrays are concatenated with the higher layer's items first, so `network.rules` lists the project `cella.toml` rules first, then the `customizations.cella` rules, then the `~/.cella/config.*` rules.
 
-`cella.toml` wins entirely if its proxy section has any explicit value:
-
-- `http` is `Some`
-- `https` is `Some`
-- `no_proxy` is `Some`
-- `ca_cert` is `Some`
-- `enabled` is `false`
-
-If none of these conditions hold, the `devcontainer.json` proxy settings are used.
-
-### Rules
-
-Rules from both sources are combined (union). Each rule is labeled with its source (`"cella.toml"` or `"devcontainer.json"`) for diagnostics.
-
-If the same exact domain string appears in both sources, the `cella.toml` rule takes precedence and the `devcontainer.json` rule is dropped. Domain comparison is exact string match (not case-insensitive or glob-aware).
-
-In the merged rule set, `devcontainer.json` rules (minus duplicates) appear first, followed by all `cella.toml` rules. Combined with first-match-wins evaluation, this means exact-string dedup is the sole mechanism that gives `cella.toml` precedence. For overlapping glob patterns that differ as strings (e.g., `*.example.com` in devcontainer.json vs. `api.example.com` in cella.toml), the devcontainer.json rule is evaluated first and wins if it matches. This is a sharp edge: project-level overrides via `cella.toml` require the exact same domain string as the `devcontainer.json` rule they intend to replace.
+Rules are not deduplicated. Combined with first-match-wins evaluation, a project rule takes precedence over any lower-layer rule that matches the same request, whether or not the domain strings are identical.
 
 ## CLI Interface
 
@@ -508,7 +496,7 @@ Depends on: [IPC Protocol § Transport Upgrade: HTTP/2](ipc-protocol.md#transpor
 Different network policies apply to different containers within a workspace:
 
 - **Config:** `network.containers.<name>.mode` and `network.containers.<name>.rules` override the global network config for specific containers.
-- **Rule merging:** Per-container rules are merged with global rules, with per-container taking precedence. The merge follows the same union-with-dedup logic as cella.toml/devcontainer.json merging.
+- **Rule merging:** Per-container rules are placed ahead of the workspace rules, so first-match-wins evaluation gives them precedence, the same way project `cella.toml` rules precede lower layers (see [Rule Merging](#rule-merging)).
 - **Implementation:** The agent receives its container-specific merged rule set via `CELLA_PROXY_CONFIG`. No runtime rule resolution is needed.
 
 ## QUIC/HTTP/3 Interception

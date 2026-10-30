@@ -63,11 +63,11 @@ action = "allow"
 
 ### Merge behavior
 
-When both sources define network config, they are merged as follows:
+cella merges its config from `~/.cella/config.toml` (global), `customizations.cella` in `devcontainer.json`, and `.devcontainer/cella.toml` (project), in increasing order of priority:
 
-- **Mode**: `cella.toml` wins if it explicitly sets a mode; otherwise `devcontainer.json`'s mode is used.
-- **Proxy settings**: `cella.toml` wins entirely if it sets any explicit proxy values (http, https, no_proxy, ca_cert, or enabled=false).
-- **Rules**: union of both sources. If the same exact domain string appears in both, the `cella.toml` rule takes precedence and the `devcontainer.json` rule is dropped.
+- **Mode** and other single values: the highest-priority source that sets them wins.
+- **Proxy settings**: merged field by field, so a `cella.toml` that sets only `http` keeps the `no_proxy` from `devcontainer.json`.
+- **Rules**: all rules are kept, with `cella.toml` rules first, then `devcontainer.json` rules, then global rules. The first matching rule wins, so a `cella.toml` rule overrides any lower-priority rule that matches the same request.
 
 ## Modes
 

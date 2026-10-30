@@ -68,12 +68,6 @@ impl RuleMatcher {
         }
     }
 
-    /// Build a matcher from rules that already have source labels.
-    pub fn from_labeled_rules(mode: NetworkMode, rules: &[(NetworkRule, String)]) -> Self {
-        let rules = rules.iter().map(|(r, src)| compile_rule(r, src)).collect();
-        Self { mode, rules }
-    }
-
     /// Evaluate whether a request to the given domain and path is allowed.
     ///
     /// Domain matching is case-insensitive. Path matching is case-sensitive.

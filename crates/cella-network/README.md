@@ -20,7 +20,6 @@ Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-d
 - `RuleMatcher` -- evaluates request URLs against compiled rules, returns a `RuleVerdict`
 - `ProxyEnvVars` -- resolved proxy environment variables for container injection
 - `CaCertificate` -- generated or loaded CA certificate and private key pair
-- `MergedNetworkConfig` -- result of merging configs from multiple sources with labeled rules
 
 ### Modules
 
@@ -29,7 +28,6 @@ Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-d
 | `config` | Configuration types (`NetworkConfig`, `ProxyConfig`, `NetworkRule`, `NetworkMode`, `RuleAction`), deserialization from TOML and JSON |
 | `rules` | Glob-based rule matching engine; `*` matches one segment, `**` matches zero or more (paths only); domain matching is case-insensitive, path matching is case-sensitive |
 | `ca` | CA certificate generation via `rcgen`, host CA bundle detection via `rustls-native-certs`, stored at `~/.cella/proxy/` |
-| `merge` | Union merge of rules from `devcontainer.json` and `cella.toml`; `cella.toml` wins on per-domain conflicts |
 | `proxy_env` | Auto-detection of `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` from host environment, env pair generation for containers and Docker builds |
 
 ## Crate Dependencies
@@ -44,7 +42,7 @@ Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-d
 cargo test -p cella-network
 ```
 
-Unit tests cover TOML/JSON deserialization of full and minimal configs, domain glob matching (exact, wildcard subdomain, wildcard middle segment, case insensitivity), path glob matching (`*` single segment, `**` zero-or-more with memoization for pathological patterns), rule evaluation in both denylist and allowlist modes, proxy env var detection and safety entry deduplication, CA certificate generation and reload, and config merge precedence logic.
+Unit tests cover TOML/JSON deserialization of full and minimal configs, domain glob matching (exact, wildcard subdomain, wildcard middle segment, case insensitivity), path glob matching (`*` single segment, `**` zero-or-more with memoization for pathological patterns), rule evaluation in both denylist and allowlist modes, proxy env var detection and safety entry deduplication, and CA certificate generation and reload.
 
 ## Development
 
