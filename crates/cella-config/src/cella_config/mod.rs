@@ -69,6 +69,8 @@ impl CellaConfig {
         // Substitute each file layer on its own, before merging: the
         // `customizations.cella` layer comes from the already-substituted
         // devcontainer config and must not be substituted a second time.
+        // Relative `body_file` paths resolve against the directory of the file
+        // that declared them, which is lost once the layers are merged.
         let ctx = resolved.map_or_else(
             || SubstitutionContext::local_env_only(std::env::vars().collect()),
             crate::config_map::subst_ctx,
@@ -78,6 +80,7 @@ impl CellaConfig {
                 let mut layer = load_layer(dir, stem)?;
                 if let Some(value) = layer.as_mut() {
                     ctx.substitute_value(value);
+                    absolutize_body_files(value, dir);
                 }
                 Ok(layer)
             };
@@ -102,6 +105,7 @@ impl CellaConfig {
             && let Some(cella_customizations) =
                 rc.config.get("customizations").and_then(|c| c.get("cella"))
         {
+            reject_respond_fields(cella_customizations)?;
             layers.push(cella_customizations.clone());
         }
 
@@ -125,6 +129,79 @@ impl CellaConfig {
 
         serde_json::from_value(merged).map_err(|e| CellaConfigError::Deserialization { source: e })
     }
+}
+
+/// The `network.rules` array of a config layer, if it has one.
+fn layer_rules(layer: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    layer.pointer("/network/rules")?.as_array()
+}
+
+/// Rewrite each relative `network.rules[].responses[].body_file` in a file
+/// layer to an absolute path against `base` (the directory holding that
+/// file), expanding a leading `~` first.
+fn absolutize_body_files(layer: &mut serde_json::Value, base: &Path) {
+    let Some(rules) = layer
+        .pointer_mut("/network/rules")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let body_files = rules
+        .iter_mut()
+        .filter_map(|rule| rule.get_mut("responses")?.as_array_mut())
+        .flatten()
+        .filter_map(|response| response.get_mut("body_file"));
+    for body_file in body_files {
+        let Some(path) = body_file.as_str() else {
+            continue;
+        };
+        // `Path::join` returns an absolute path unchanged.
+        let path = base.join(cella_env::paths::expand_tilde(path));
+        *body_file = serde_json::Value::String(path.to_string_lossy().into_owned());
+    }
+}
+
+/// Reject `respond` rules, `responses` and `response_headers` in the
+/// `customizations.cella` layer: that layer is a merge of several files, so a
+/// relative `body_file` in it has no reliable base, and cella-specific policy
+/// belongs in the cella config files.
+fn reject_respond_fields(layer: &serde_json::Value) -> Result<(), CellaConfigError> {
+    let Some(rules) = layer_rules(layer) else {
+        return Ok(());
+    };
+    for rule in rules {
+        let Some(obj) = rule.as_object() else {
+            continue;
+        };
+        let field = if obj.get("action").and_then(serde_json::Value::as_str) == Some("respond") {
+            "\"action\": \"respond\""
+        } else if obj.contains_key("responses") {
+            "responses"
+        } else if obj.contains_key("response_headers") {
+            "response_headers"
+        } else {
+            continue;
+        };
+        let domain = obj
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<no domain>");
+        let paths: Vec<String> = obj
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Err(CellaConfigError::RespondFieldInCustomizations {
+            rule: cella_network::config::rule_label(domain, &paths),
+            field: field.to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -440,6 +517,174 @@ mod tests {
             cfg.network.proxy.ca_cert.as_deref(),
             Some(format!("{basename}.pem").as_str())
         );
+    }
+
+    /// A resolved config whose paths point into `ws`, as `cella up` builds it.
+    fn make_resolved_at(config: Value, ws: &Path) -> crate::devcontainer::resolve::ResolvedConfig {
+        let mut resolved = make_resolved(config);
+        resolved.config_path = ws.join(".devcontainer").join("devcontainer.json");
+        resolved.workspace_root = ws.to_path_buf();
+        resolved
+    }
+
+    const RESPOND_RULE_TOML: &str = r#"
+[[network.rules]]
+domain = "api.example.com"
+paths = ["/v1/messages"]
+action = "respond"
+
+[[network.rules.responses]]
+status = 200
+body_file = "fixtures/message.json"
+"#;
+
+    fn first_body_file(cfg: &CellaConfig) -> &Path {
+        cfg.network.rules[0].responses[0]
+            .body_file
+            .as_deref()
+            .unwrap()
+    }
+
+    #[test]
+    fn project_body_file_resolves_against_devcontainer_dir() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(devcontainer.join("fixtures")).unwrap();
+        std::fs::write(devcontainer.join("cella.toml"), RESPOND_RULE_TOML).unwrap();
+        std::fs::write(devcontainer.join("fixtures/message.json"), "{}").unwrap();
+        let resolved = make_resolved_at(json!({"image": "ubuntu"}), ws.path());
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        assert_eq!(
+            first_body_file(&cfg),
+            devcontainer.join("fixtures/message.json")
+        );
+        let net = cfg
+            .network
+            .to_network_config(cella_network::NetworkRulePolicy::Enforce)
+            .unwrap();
+        assert_eq!(net.rules[0].responses[0].body, "{}");
+    }
+
+    #[test]
+    fn global_body_file_resolves_against_global_dir() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(global.path().join("config.toml"), RESPOND_RULE_TOML).unwrap();
+        let resolved = make_resolved_at(json!({"image": "ubuntu"}), ws.path());
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        assert_eq!(
+            first_body_file(&cfg),
+            global.path().join("fixtures/message.json")
+        );
+    }
+
+    #[test]
+    fn absolute_body_file_is_kept() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            global.path().join("config.toml"),
+            RESPOND_RULE_TOML.replace("fixtures/message.json", "/srv/fixtures/message.json"),
+        )
+        .unwrap();
+        let cfg = CellaConfig::load_with_global(ws.path(), None, Some(global.path())).unwrap();
+        assert_eq!(
+            first_body_file(&cfg),
+            Path::new("/srv/fixtures/message.json")
+        );
+    }
+
+    #[test]
+    fn tilde_body_file_expands_to_home() {
+        let Some(home) = cella_env::paths::home_dir() else {
+            return;
+        };
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            global.path().join("config.toml"),
+            RESPOND_RULE_TOML.replace("fixtures/message.json", "~/fixtures/message.json"),
+        )
+        .unwrap();
+        let cfg = CellaConfig::load_with_global(ws.path(), None, Some(global.path())).unwrap();
+        assert_eq!(first_body_file(&cfg), home.join("fixtures/message.json"));
+    }
+
+    #[test]
+    fn body_file_is_substituted_before_it_is_made_absolute() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(
+            devcontainer.join("cella.toml"),
+            RESPOND_RULE_TOML.replace(
+                "fixtures/message.json",
+                "${localWorkspaceFolder}/fixtures/message.json",
+            ),
+        )
+        .unwrap();
+        let resolved = make_resolved_at(json!({"image": "ubuntu"}), ws.path());
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        let body_file = first_body_file(&cfg);
+        assert!(body_file.is_absolute(), "{}", body_file.display());
+        assert!(body_file.ends_with("fixtures/message.json"));
+        assert!(
+            !body_file.starts_with(&devcontainer),
+            "an already-absolute substituted path must not be joined to .devcontainer: {}",
+            body_file.display()
+        );
+    }
+
+    #[test]
+    fn respond_fields_in_customizations_are_rejected() {
+        let rules = [
+            json!({"domain": "api.example.com", "paths": ["/v1/messages"], "action": "respond"}),
+            json!({"domain": "api.example.com", "action": "block", "responses": [{"status": 200}]}),
+            json!({"domain": "api.example.com", "action": "allow", "response_headers": {"x-a": "1"}}),
+        ];
+        for (rule, field) in
+            rules
+                .into_iter()
+                .zip(["\"action\": \"respond\"", "responses", "response_headers"])
+        {
+            let ws = TempDir::new().unwrap();
+            let global = TempDir::new().unwrap();
+            let resolved = make_resolved_at(
+                json!({"customizations": {"cella": {"network": {"rules": [rule]}}}}),
+                ws.path(),
+            );
+            let err =
+                CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path()))
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CellaConfigError::RespondFieldInCustomizations { field: ref f, .. } if f == field
+                ),
+                "{field}: {err}"
+            );
+            assert!(err.to_string().contains(".devcontainer/cella.toml"));
+        }
+    }
+
+    #[test]
+    fn plain_rules_in_customizations_are_accepted() {
+        let ws = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        let resolved = make_resolved_at(
+            json!({"customizations": {"cella": {"network": {"rules": [
+                {"domain": "api.example.com", "action": "block"}
+            ]}}}}),
+            ws.path(),
+        );
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        assert_eq!(cfg.network.rules.len(), 1);
     }
 
     #[test]

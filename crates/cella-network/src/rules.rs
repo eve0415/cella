@@ -220,6 +220,7 @@ fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
     let action_str = match rule.action {
         RuleAction::Block => "block",
         RuleAction::Allow => "allow",
+        RuleAction::Respond => "respond",
     };
     let pattern_display = if rule.paths.is_empty() {
         format!("{} ({})", rule.domain, action_str)
@@ -507,6 +508,7 @@ mod tests {
                 domain: "*.Example.COM".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -601,6 +603,7 @@ mod tests {
                 domain: "*.prod.internal".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -621,6 +624,7 @@ mod tests {
                 domain: "registry.npmjs.org".to_string(),
                 paths: vec![],
                 action: RuleAction::Allow,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -641,6 +645,7 @@ mod tests {
                 domain: "api.example.com".to_string(),
                 paths: vec!["/v1/admin/*".to_string(), "/internal/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -665,11 +670,13 @@ mod tests {
                     domain: "*.prod.internal".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "api.example.com".to_string(),
                     paths: vec!["/admin/**".to_string()],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -690,11 +697,13 @@ mod tests {
                     domain: "api.example.com".to_string(),
                     paths: vec!["/public/**".to_string()],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "api.example.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -718,6 +727,7 @@ mod tests {
                 domain: "*.prod.internal".to_string(),
                 paths: vec!["/admin/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -754,6 +764,7 @@ mod tests {
                 domain: "example.com".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -771,6 +782,7 @@ mod tests {
                 domain: "example.com".to_string(),
                 paths: vec!["/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -791,16 +803,19 @@ mod tests {
                     domain: "evil.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "mixed.com".to_string(),
                     paths: vec!["/secret/**".to_string()],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "mixed.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()

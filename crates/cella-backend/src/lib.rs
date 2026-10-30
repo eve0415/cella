@@ -8,6 +8,8 @@ pub mod network;
 pub mod progress;
 pub mod resolve;
 pub mod secret_mask;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod traits;
 pub mod types;
 pub mod uid_image;

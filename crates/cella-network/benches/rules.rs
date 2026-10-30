@@ -40,6 +40,7 @@ fn build_config(rules: usize) -> NetworkConfig {
                 domain,
                 paths,
                 action: RuleAction::Block,
+                ..Default::default()
             }
         })
         .collect();
@@ -97,6 +98,7 @@ fn evaluate_path_star_only(bencher: divan::Bencher, rules: usize) {
         domain: "star.example.com".to_owned(),
         paths: vec!["/v1/*/items".to_owned(), "/api/*".to_owned()],
         action: RuleAction::Block,
+        ..Default::default()
     });
     let matcher = RuleMatcher::new(&config);
     bencher.bench(|| {

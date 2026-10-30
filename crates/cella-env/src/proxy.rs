@@ -64,6 +64,7 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig, credentials_protect
                 "action": match r.action {
                     cella_network::RuleAction::Block => "block",
                     cella_network::RuleAction::Allow => "allow",
+                    cella_network::RuleAction::Respond => "respond",
                 },
             });
             if !r.paths.is_empty() {
@@ -73,9 +74,7 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig, credentials_protect
         })
         .collect();
 
-    let has_path_rules = config.rules.iter().any(|r| !r.paths.is_empty());
-    let needs_mitm = has_path_rules || credentials_protect;
-    let (ca_cert_pem, ca_key_pem) = if needs_mitm {
+    let (ca_cert_pem, ca_key_pem) = if config.needs_mitm(credentials_protect) {
         match cella_network::ca::ensure_ca() {
             Ok(ca) => (Some(ca.cert_pem), Some(ca.key_pem)),
             Err(e) => {
@@ -224,6 +223,7 @@ mod tests {
                 domain: "*.evil.com".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
         };
 
@@ -249,11 +249,13 @@ mod tests {
                     domain: "registry.npmjs.org".to_string(),
                     paths: vec![],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "github.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
             ],
         };
@@ -278,6 +280,7 @@ mod tests {
                 domain: "api.example.com".to_string(),
                 paths: vec!["/v1/admin/*".to_string(), "/internal/*".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
         };
 

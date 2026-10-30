@@ -28,6 +28,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+cella-backend = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

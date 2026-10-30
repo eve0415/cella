@@ -33,6 +33,7 @@ fn build_config(rules: usize) -> NetworkConfig {
                 domain,
                 paths,
                 action: RuleAction::Block,
+                ..Default::default()
             }
         })
         .collect();

@@ -9,9 +9,12 @@ pub mod ca;
 pub mod config;
 pub mod proxy_env;
 pub mod rules;
+pub mod validate;
 
 pub use config::{
-    NetworkConfig, NetworkMode, NetworkRule, NetworkRulePolicy, ProxyConfig, RuleAction,
+    NetworkConfig, NetworkMode, NetworkRule, NetworkRulePolicy, ProxyConfig, ResponseSpec,
+    RuleAction, status_forbids_body,
 };
 pub use proxy_env::ProxyEnvVars;
 pub use rules::RuleMatcher;
+pub use validate::NetworkConfigError;

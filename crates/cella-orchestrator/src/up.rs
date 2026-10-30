@@ -13,7 +13,7 @@ use cella_backend::{
 };
 use cella_config::devcontainer::subst::CONTAINER_ENV_TOKEN;
 
-use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
+use crate::config::{HostRequirementPolicy, ImageStrategy, UpConfig};
 use crate::error::OrchestratorError;
 use crate::forward_ports::forward_port_number;
 use cella_backend::EXPECTED_CONTAINER_MISSING;
@@ -115,6 +115,9 @@ struct EnsureUpContext<'a> {
     config: &'a UpConfig<'a>,
     hooks: &'a dyn UpHooks,
     progress: ProgressSender,
+    /// Proxy forwarding built from the network rules, which are validated
+    /// before any container work.
+    proxy_fwd: cella_env::ProxyForwardingConfig,
 }
 
 struct ImageConfig {
@@ -1605,27 +1608,16 @@ impl EnsureUpContext<'_> {
         &self,
         config: &serde_json::Value,
         remote_user: &str,
-        settings: &cella_config::CellaConfig,
     ) -> cella_env::EnvForwarding {
-        let net_config = settings.network.to_network_config();
-        let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
-
-        let managed_agent = self.client.capabilities().managed_agent;
-        let proxy_fwd = Some(cella_env::ProxyForwardingConfig::resolve(
-            net_config,
-            skip_rules,
-            settings.credentials.protect,
-            managed_agent,
-        ));
         let mut env_fwd = cella_env::prepare_env_forwarding(
             config,
             remote_user,
             &self.config.resolved.workspace_root,
-            proxy_fwd.as_ref(),
+            Some(&self.proxy_fwd),
             self.client.capabilities().ssh_agent,
         );
 
-        if !managed_agent {
+        if !self.client.capabilities().managed_agent {
             env_fwd
                 .post_start
                 .git_config_commands
@@ -1660,7 +1652,7 @@ impl EnsureUpContext<'_> {
             Some(self.config.resolved),
         )?;
         let managed_agent = self.client.capabilities().managed_agent;
-        let mut env_fwd = self.resolve_env_forwarding(config, &remote_user, &settings);
+        let mut env_fwd = self.resolve_env_forwarding(config, &remote_user);
 
         if settings.credentials.protect && managed_agent {
             crate::credential_protect::inject_routes_into_proxy_config(
@@ -2373,6 +2365,30 @@ pub async fn ensure_up(
     hooks: &dyn UpHooks,
     progress: ProgressSender,
 ) -> Result<UpResult, OrchestratorError> {
+    Box::pin(ensure_up_with_global_dir(
+        client, config, hooks, progress, None,
+    ))
+    .await
+}
+
+/// [`ensure_up`] with the global cella config read from `global_dir`
+/// (`None`: the user's own).
+async fn ensure_up_with_global_dir(
+    client: &dyn ContainerBackend,
+    config: &UpConfig<'_>,
+    hooks: &dyn UpHooks,
+    progress: ProgressSender,
+    global_dir: Option<&std::path::Path>,
+) -> Result<UpResult, OrchestratorError> {
+    // Validate the network rules before anything else, so an invalid rule
+    // aborts container reuse and a fresh build alike.
+    let proxy_fwd = crate::compose_up::build_proxy_forwarding_config(
+        config.resolved,
+        client.capabilities().managed_agent,
+        config.network_rule_policy,
+        global_dir,
+    )?;
+
     if config.resolved.config.get("hostRequirements").is_some() {
         let result = crate::host_requirements::validate(
             &config.resolved.config,
@@ -2398,6 +2414,7 @@ pub async fn ensure_up(
         config,
         hooks,
         progress,
+        proxy_fwd,
     }
     .ensure_up()
     .await
@@ -2822,6 +2839,8 @@ mod tests {
     use super::*;
 
     use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
+
+    use crate::config::NetworkRulePolicy;
 
     /// With no features and no base label, the generated label records the raw
     /// config, not the substituted one.
@@ -3315,5 +3334,128 @@ mod tests {
             cf,
             "devcontainer.config_file=/tmp/b/.devcontainer/devcontainer.json"
         );
+    }
+
+    const INVALID_RESPOND_RULE: &str =
+        "[[network.rules]]\ndomain = \"api.example.com\"\naction = \"respond\"\n";
+
+    const MISSING_BODY_FILE_RULE: &str = "[[network.rules]]\ndomain = \"api.example.com\"\n\
+         action = \"respond\"\n[[network.rules.responses]]\nstatus = 200\n\
+         body_file = \"/nonexistent/cella-test/missing.json\"\n";
+
+    /// An image-based workspace whose `.devcontainer/cella.toml` is `cella_toml`.
+    fn image_workspace(
+        ws: &std::path::Path,
+        cella_toml: &str,
+    ) -> cella_config::devcontainer::resolve::ResolvedConfig {
+        let devcontainer = ws.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(devcontainer.join("cella.toml"), cella_toml).unwrap();
+        cella_config::devcontainer::resolve::ResolvedConfig {
+            config: serde_json::json!({ "image": "ubuntu" }),
+            config_path: devcontainer.join("devcontainer.json"),
+            workspace_root: ws.to_path_buf(),
+            config_hash: String::new(),
+            devcontainer_id: "dcid".to_string(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env: None,
+            raw_config: serde_json::json!({ "image": "ubuntu" }),
+            container_identity: None,
+            default_container_workspace_folder: None,
+        }
+    }
+
+    /// Run `ensure_up` against a [`RecordingBackend`] in an image workspace
+    /// whose `cella.toml` is `cella_toml`, with an empty global config dir.
+    /// Returns the error and the runtime calls made before it.
+    ///
+    /// [`RecordingBackend`]: cella_backend::testing::RecordingBackend
+    async fn ensure_up_error(
+        cella_toml: &str,
+        policy: NetworkRulePolicy,
+    ) -> (OrchestratorError, Vec<&'static str>) {
+        let ws = tempfile::TempDir::new().unwrap();
+        let global = tempfile::TempDir::new().unwrap();
+        let resolved = image_workspace(ws.path(), cella_toml);
+        let no_labels = std::collections::HashMap::new();
+        let no_mounts = Vec::new();
+        let config = UpConfig {
+            resolved: &resolved,
+            container_name: "cella-test",
+            remote_env: &[],
+            raw_remote_env: None,
+            cli_remote_env: &[],
+            workspace_folder_from_config: None,
+            default_workspace_folder: "/workspaces/test",
+            extra_labels: &no_labels,
+            id_labels: &[],
+            image_strategy: ImageStrategy::Cached,
+            remove_existing_container: false,
+            skip_checksum: true,
+            host_requirement_policy: HostRequirementPolicy::Warn,
+            network_rule_policy: policy,
+            pull_policy: None,
+            build_secrets: Vec::new(),
+            extra_networks: Vec::new(),
+            mount_flags: crate::config::MountFlags {
+                additional_cli_mounts: &no_mounts,
+                workspace_mount_consistency: None,
+                mount_workspace_git_root: false,
+                mount_git_worktree_common_dir: false,
+            },
+            lifecycle_secrets: &[],
+            user_env_probe: cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell,
+            lifecycle_gate: LifecycleGate::default(),
+            expect_existing_container: false,
+            build_tuning: crate::config::BuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::Detect,
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::On,
+            metadata_options: crate::config::MetadataOptions::default(),
+            dotfiles: crate::config::DotfilesConfig::default(),
+            lockfile_policy: cella_features::LockfilePolicy::NoLockfile,
+        };
+        let backend = cella_backend::testing::RecordingBackend::default();
+        let (tx, _) = tokio::sync::mpsc::channel(64);
+        let result = ensure_up_with_global_dir(
+            &backend,
+            &config,
+            &NoOpHooks,
+            ProgressSender::new(tx, false),
+            Some(global.path()),
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("up cannot succeed without a container runtime");
+        };
+        (err, backend.calls())
+    }
+
+    #[tokio::test]
+    async fn invalid_network_rule_aborts_up_before_the_runtime() {
+        let (err, calls) = ensure_up_error(INVALID_RESPOND_RULE, NetworkRulePolicy::Enforce).await;
+        assert!(err.to_string().contains("api.example.com"), "{err}");
+        assert!(
+            calls.is_empty(),
+            "an invalid rule must abort before reuse, pull, or build: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_network_rule_keeps_its_diagnostic_code_in_up() {
+        use miette::Diagnostic;
+
+        let (err, _) = ensure_up_error(INVALID_RESPOND_RULE, NetworkRulePolicy::Enforce).await;
+        assert_eq!(
+            err.code().map(|code| code.to_string()).as_deref(),
+            Some("cella::network::missing_responses"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_network_rules_do_not_read_body_file_in_up() {
+        let (err, calls) = ensure_up_error(MISSING_BODY_FILE_RULE, NetworkRulePolicy::Skip).await;
+        assert_eq!(calls.first(), Some(&"find_container_by_label"), "{err}");
     }
 }

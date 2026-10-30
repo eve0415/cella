@@ -87,6 +87,7 @@ impl AgentProxyConfig {
                     } else {
                         RuleAction::Block
                     },
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()

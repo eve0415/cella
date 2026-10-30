@@ -685,7 +685,40 @@ pub fn boxed_err_to_report(err: Box<dyn std::error::Error + Send + Sync>) -> mie
 
     impl miette::Diagnostic for Adapter {}
 
-    miette::Report::new(Adapter(err))
+    match cella_config_report(err) {
+        Ok(report) => report,
+        Err(err) => miette::Report::new(Adapter(err)),
+    }
+}
+
+/// A cella config error — returned bare (`cella network status`/`test`) or
+/// inside an `up` or compose `up` failure — as a report that keeps its
+/// diagnostic code and help; any other error is handed back.
+fn cella_config_report(
+    err: Box<dyn std::error::Error + Send + Sync>,
+) -> Result<miette::Report, Box<dyn std::error::Error + Send + Sync>> {
+    use cella_config::cella_config::CellaConfigError;
+    use cella_orchestrator::OrchestratorError;
+    use cella_orchestrator::compose_up::ComposeUpError;
+
+    let err = match err.downcast::<CellaConfigError>() {
+        Ok(config) => return Ok(miette::Report::new(*config)),
+        Err(err) => err,
+    };
+    let err: Box<dyn std::error::Error + Send + Sync> = match err.downcast::<OrchestratorError>() {
+        Ok(err) => match *err {
+            OrchestratorError::CellaConfig(config) => return Ok(miette::Report::new(config)),
+            other => Box::new(other),
+        },
+        Err(err) => err,
+    };
+    match err.downcast::<ComposeUpError>() {
+        Ok(err) => match *err {
+            ComposeUpError::CellaConfig(config) => Ok(miette::Report::new(config)),
+            ComposeUpError::Other(other) => Err(other),
+        },
+        Err(err) => Err(err),
+    }
 }
 
 /// Emit a warning if a container lacks the `dev.cella.backend` label.
@@ -1113,6 +1146,109 @@ async fn restart_agents_in_all_containers(client: &dyn cella_backend::ContainerB
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    // ── boxed_err_to_report ─────────────────────────────────────────
+
+    fn missing_responses() -> cella_config::cella_config::CellaConfigError {
+        cella_network::NetworkConfigError::MissingResponses {
+            rule: "api.example.com".to_string(),
+        }
+        .into()
+    }
+
+    fn respond_field_in_customizations() -> cella_config::cella_config::CellaConfigError {
+        cella_config::cella_config::CellaConfigError::RespondFieldInCustomizations {
+            rule: "api.example.com".to_string(),
+            field: "responses".to_string(),
+        }
+    }
+
+    /// The report as the CLI's graphical handler prints it, without colour.
+    fn rendered(err: Box<dyn std::error::Error + Send + Sync>) -> String {
+        let report = boxed_err_to_report(err);
+        let mut out = String::new();
+        miette::GraphicalReportHandler::new_themed(miette::GraphicalTheme::unicode_nocolor())
+            .with_width(400)
+            .render_report(&mut out, &*report)
+            .unwrap();
+        out
+    }
+
+    fn up_error(
+        config: cella_config::cella_config::CellaConfigError,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(cella_orchestrator::OrchestratorError::from(config))
+    }
+
+    fn compose_up_error(
+        config: cella_config::cella_config::CellaConfigError,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(cella_orchestrator::compose_up::ComposeUpError::from(config))
+    }
+
+    const MISSING_RESPONSES_CODE: &str = "cella::network::missing_responses";
+    const RESPOND_FIELD_HELP: &str = "are cella config file settings";
+
+    #[test]
+    fn up_config_error_renders_its_code() {
+        let out = rendered(up_error(missing_responses()));
+        assert!(out.contains(MISSING_RESPONSES_CODE), "{out}");
+    }
+
+    #[test]
+    fn up_config_error_renders_its_help() {
+        let out = rendered(up_error(respond_field_in_customizations()));
+        assert!(out.contains(RESPOND_FIELD_HELP), "{out}");
+    }
+
+    #[test]
+    fn compose_up_config_error_renders_its_code() {
+        let out = rendered(compose_up_error(missing_responses()));
+        assert!(out.contains(MISSING_RESPONSES_CODE), "{out}");
+    }
+
+    #[test]
+    fn compose_up_config_error_renders_its_help() {
+        let out = rendered(compose_up_error(respond_field_in_customizations()));
+        assert!(out.contains(RESPOND_FIELD_HELP), "{out}");
+    }
+
+    /// The error `cella network status`/`test` return when converting the
+    /// network settings fails: a bare `CellaConfigError` boxed by `?`.
+    fn network_command_error(
+        network: &cella_config::settings::network::Network,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        let convert = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            network.to_network_config(cella_network::NetworkRulePolicy::Enforce)?;
+            Ok(())
+        };
+        convert().unwrap_err()
+    }
+
+    #[test]
+    fn network_command_config_error_renders_its_code() {
+        let network: cella_config::settings::network::Network =
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "domain": "api.example.com", "action": "respond" }]
+            }))
+            .unwrap();
+        let out = rendered(network_command_error(&network));
+        assert!(out.contains(MISSING_RESPONSES_CODE), "{out}");
+    }
+
+    #[test]
+    fn bare_config_error_renders_its_help() {
+        let out = rendered(Box::new(respond_field_in_customizations()));
+        assert!(out.contains(RESPOND_FIELD_HELP), "{out}");
+    }
+
+    #[test]
+    fn other_compose_up_error_renders_its_message() {
+        let out = rendered(Box::new(
+            cella_orchestrator::compose_up::ComposeUpError::Other("compose failed".into()),
+        ));
+        assert!(out.contains("compose failed"), "{out}");
+    }
 
     #[test]
     fn id_label_map_is_none_without_labels() {

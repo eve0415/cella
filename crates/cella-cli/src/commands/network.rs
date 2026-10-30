@@ -59,7 +59,9 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_root = std::env::current_dir()?;
     let resolved = cella_config::devcontainer::resolve::config(&workspace_root, None).ok();
     let settings = cella_config::CellaConfig::load(&workspace_root, resolved.as_ref())?;
-    let net_config = settings.network.to_network_config();
+    let net_config = settings
+        .network
+        .to_network_config(cella_network::NetworkRulePolicy::Enforce)?;
 
     if !net_config.proxy.enabled {
         println!("Proxy: disabled");
@@ -107,6 +109,7 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let action = match rule.action {
             cella_network::RuleAction::Block => "block",
             cella_network::RuleAction::Allow => "allow",
+            cella_network::RuleAction::Respond => "respond",
         };
         if rule.paths.is_empty() {
             println!("  {action}: {}", rule.domain);
@@ -122,7 +125,9 @@ fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync
     let workspace_root = std::env::current_dir()?;
     let resolved = cella_config::devcontainer::resolve::config(&workspace_root, None).ok();
     let settings = cella_config::CellaConfig::load(&workspace_root, resolved.as_ref())?;
-    let net_config = settings.network.to_network_config();
+    let net_config = settings
+        .network
+        .to_network_config(cella_network::NetworkRulePolicy::Enforce)?;
 
     if !net_config.has_rules() {
         println!("No blocking rules configured. All traffic is allowed.");
