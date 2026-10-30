@@ -389,11 +389,7 @@ fn compile_rule(rule: &NetworkRule, source: &str, action: VerdictAction) -> Comp
     let domain_parts = parse_domain_pattern(&rule.domain);
     let path_patterns = rule.paths.iter().map(|p| parse_path_pattern(p)).collect();
 
-    let action_str = match rule.action {
-        RuleAction::Block => "block",
-        RuleAction::Allow => "allow",
-        RuleAction::Respond => "respond",
-    };
+    let action_str = rule.action.as_str();
     let pattern_display = if rule.paths.is_empty() {
         format!("{} ({})", rule.domain, action_str)
     } else {

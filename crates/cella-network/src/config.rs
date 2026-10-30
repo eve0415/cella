@@ -155,6 +155,18 @@ pub enum RuleAction {
     Respond,
 }
 
+impl RuleAction {
+    /// The lowercase name used in config files, the agent protocol and CLI
+    /// output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Allow => "allow",
+            Self::Respond => "respond",
+        }
+    }
+}
+
 /// A response synthesized by a `respond` rule.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ResponseSpec {
@@ -310,6 +322,13 @@ response_headers = { x-test-run = "1" }
         assert_eq!(config.rules[1].response_headers["x-test-run"], "1");
         assert!(config.rules[1].responses.is_empty());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn rule_action_as_str_names_every_variant() {
+        assert_eq!(RuleAction::Block.as_str(), "block");
+        assert_eq!(RuleAction::Allow.as_str(), "allow");
+        assert_eq!(RuleAction::Respond.as_str(), "respond");
     }
 
     fn domain_rule(action: RuleAction) -> NetworkRule {

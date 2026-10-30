@@ -101,11 +101,7 @@ fn build_agent_proxy_config_json_with_ca(
 fn rule_json(r: &NetworkRule) -> serde_json::Value {
     let mut rule = serde_json::json!({
         "domain": r.domain,
-        "action": match r.action {
-            cella_network::RuleAction::Block => "block",
-            cella_network::RuleAction::Allow => "allow",
-            cella_network::RuleAction::Respond => "respond",
-        },
+        "action": r.action.as_str(),
     });
     if !r.paths.is_empty() {
         rule["paths"] = serde_json::json!(r.paths);

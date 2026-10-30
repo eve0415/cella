@@ -7,7 +7,7 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http_body_util::BodyExt;
@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use cella_network::rules::canonical_ipv6_literal;
+use cella_network::authority::{HostPort, parse_connect_target, parse_plain_authority};
 
 use crate::proxy_config::AgentProxyConfig;
 use crate::proxy_http::{
@@ -147,7 +147,8 @@ async fn handle_connect(
     let Some((host, port)) = req
         .uri()
         .authority()
-        .and_then(|a| parse_host_port(a.as_str()))
+        .and_then(|a| parse_connect_target(a.as_str()).ok())
+        .map(|target| (target.host, target.port))
     else {
         return closing_response(StatusCode::BAD_REQUEST, "Bad Request");
     };
@@ -245,15 +246,13 @@ impl PlainTarget {
         if uri.scheme() != Some(&Scheme::HTTP) {
             return None;
         }
-        let authority = uri.authority()?.as_str();
-        let host_and_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
         let HostPort {
             host,
             written,
             port,
-        } = parse_authority(host_and_port, 80)?;
+        } = parse_plain_authority(uri.authority()?.as_str()).ok()?;
         let written = written.to_ascii_lowercase();
-        let host_header = if port == 80 {
+        let host_header = if port == cella_network::authority::HTTP_DEFAULT_PORT {
             written
         } else {
             format!("{written}:{port}")
@@ -484,93 +483,6 @@ async fn connect_via_upstream_proxy(
     Ok(proxy_stream)
 }
 
-/// Strip query string and fragment from a URL path before rule evaluation.
-pub fn strip_query(path: &str) -> &str {
-    let end = path
-        .find('?')
-        .unwrap_or(path.len())
-        .min(path.find('#').unwrap_or(path.len()));
-    &path[..end]
-}
-
-/// Parse `host:port` from a CONNECT target, defaulting to port 443.
-///
-/// The host is the canonical one [`parse_authority`] returns. A target with
-/// userinfo is rejected: it would be matched as part of the host and must
-/// not reach the log.
-fn parse_host_port(target: &str) -> Option<(String, u16)> {
-    if target.contains('@') {
-        return None;
-    }
-    parse_authority(target, 443).map(|hp| (hp.host, hp.port))
-}
-
-/// A parsed `host[:port]`.
-struct HostPort<'a> {
-    /// Lowercased host for rule matching, credential lookup, the pool key,
-    /// and connecting. A bracketed IPv6 literal is in canonical form without
-    /// brackets, or dotted IPv4 when it is IPv4-mapped (`::ffff:a.b.c.d`).
-    host: String,
-    /// Host as written, with an IPv6 literal in brackets.
-    written: &'a str,
-    port: u16,
-}
-
-/// Parse `host[:port]`, defaulting the port to `default_port` when none is
-/// given or the port after `:` is empty (RFC 3986 §3.2.3).
-///
-/// Returns `None` when the host is empty, a port is given but is not a
-/// decimal `u16`, a bracketed host is not an IPv6 address (a zone ID
-/// included), or the host is the unspecified address (`0.0.0.0`, `::`, or
-/// `::ffff:0.0.0.0`), which connects to this machine whatever the rules say
-/// about loopback.
-fn parse_authority(authority: &str, default_port: u16) -> Option<HostPort<'_>> {
-    let (written, port) = split_host_port(authority)?;
-    if written.is_empty() {
-        return None;
-    }
-    let port = match port {
-        None | Some("") => default_port,
-        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok()?,
-        Some(_) => return None,
-    };
-    let host = if written.starts_with('[') {
-        canonical_ipv6_literal(written)?
-    } else {
-        written.to_ascii_lowercase()
-    };
-    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
-        return None;
-    }
-    Some(HostPort {
-        host,
-        written,
-        port,
-    })
-}
-
-/// Split `host[:port]` into the host as written, IPv6 brackets included,
-/// and the port text when one is present.
-///
-/// Returns `None` for an unterminated bracket, text after `]` other than a
-/// port, or an unbracketed host containing `:`.
-fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
-    if authority.starts_with('[') {
-        let (host, after) = authority.split_at(authority.find(']')? + 1);
-        let port = if after.is_empty() {
-            None
-        } else {
-            Some(after.strip_prefix(':')?)
-        };
-        return Some((host, port));
-    }
-    match authority.split_once(':') {
-        Some((_, port)) if port.contains(':') => None,
-        Some((host, port)) => Some((host, Some(port))),
-        None => Some((authority, None)),
-    }
-}
-
 /// `host:port` as written in an authority: an IPv6 literal goes in brackets.
 fn host_port(host: &str, port: u16) -> String {
     if host.contains(':') {
@@ -597,47 +509,6 @@ fn parse_proxy_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_connect_target() {
-        let (host, port) = parse_host_port("example.com:443").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn parse_connect_target_no_port() {
-        let (host, port) = parse_host_port("example.com").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn parse_connect_target_ipv6_literal() {
-        assert_eq!(parse_host_port("[::1]:443"), Some(("::1".to_string(), 443)));
-        assert_eq!(
-            parse_host_port("[2001:DB8::1]:8443"),
-            Some(("2001:db8::1".to_string(), 8443))
-        );
-        assert_eq!(
-            parse_host_port("[0:0:0:0:0:0:0:1]:443"),
-            Some(("::1".to_string(), 443))
-        );
-        assert_eq!(
-            parse_host_port("[::ffff:127.0.0.1]:443"),
-            Some(("127.0.0.1".to_string(), 443))
-        );
-        assert_eq!(
-            parse_host_port("[::127.0.0.1]:443"),
-            Some(("::7f00:1".to_string(), 443))
-        );
-        assert!(parse_host_port("[::1%25eth0]:443").is_none());
-        assert!(parse_host_port("[not-an-ip]:443").is_none());
-        assert_eq!(parse_host_port("[::1]"), Some(("::1".to_string(), 443)));
-        assert!(parse_host_port("[::1").is_none());
-        assert!(parse_host_port("[::1]443").is_none());
-        assert!(parse_host_port("::1:443").is_none());
-    }
 
     #[test]
     fn plain_target_unbrackets_ipv6_host() {
@@ -681,20 +552,11 @@ mod tests {
             assert_eq!(target.port, 80, "{uri}");
             assert_eq!(target.host_header, host_header, "{uri}");
         }
-        assert_eq!(
-            parse_host_port("example.com:"),
-            Some(("example.com".to_string(), 443))
-        );
-        assert_eq!(parse_host_port("[::1]:"), Some(("::1".to_string(), 443)));
     }
 
     #[test]
     fn unspecified_address_is_rejected() {
         for target in ["[::]", "[0::0]", "[::ffff:0.0.0.0]", "0.0.0.0"] {
-            assert!(
-                parse_host_port(&format!("{target}:443")).is_none(),
-                "{target}"
-            );
             let uri: Uri = format!("http://{target}:80/").parse().unwrap();
             assert!(PlainTarget::from_uri(&uri).is_none(), "{target}");
         }
@@ -702,22 +564,8 @@ mod tests {
 
     #[test]
     fn empty_host_is_rejected() {
-        for target in [":443", ":", ""] {
-            assert!(parse_host_port(target).is_none(), "{target:?}");
-        }
         let uri: Uri = "http://:8080/x".parse().unwrap();
         assert!(PlainTarget::from_uri(&uri).is_none());
-    }
-
-    #[test]
-    fn parse_host_port_rejects_userinfo() {
-        assert!(parse_host_port("u:secret@example.com:443").is_none());
-        assert!(parse_host_port("u@example.com").is_none());
-    }
-
-    #[test]
-    fn parse_host_port_rejects_signed_port() {
-        assert!(parse_host_port("example.com:+443").is_none());
     }
 
     #[test]
@@ -743,16 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_query_removes_query_string() {
-        assert_eq!(strip_query("/api/v1?foo=bar"), "/api/v1");
-        assert_eq!(strip_query("/api/v1#section"), "/api/v1");
-        assert_eq!(strip_query("/api/v1?foo=bar#section"), "/api/v1");
-        assert_eq!(strip_query("/api/v1#section?foo=bar"), "/api/v1");
-        assert_eq!(strip_query("/api/v1"), "/api/v1");
-        assert_eq!(strip_query("/"), "/");
-    }
-
-    #[test]
     fn parse_proxy_url_with_path() {
         assert_eq!(
             parse_proxy_url("http://proxy:3128/"),
@@ -761,24 +599,6 @@ mod tests {
     }
 
     // --- Additional edge case tests ---
-
-    #[test]
-    fn parse_host_port_non_standard() {
-        let (host, port) = parse_host_port("myhost:8443").unwrap();
-        assert_eq!(host, "myhost");
-        assert_eq!(port, 8443);
-    }
-
-    #[test]
-    fn parse_host_port_invalid_port() {
-        assert!(parse_host_port("myhost:notaport").is_none());
-    }
-
-    #[test]
-    fn parse_host_port_port_overflow() {
-        // u16 max is 65535
-        assert!(parse_host_port("myhost:99999").is_none());
-    }
 
     #[test]
     fn parse_proxy_url_no_scheme() {
@@ -799,30 +619,5 @@ mod tests {
             parse_proxy_url("http://proxy:3128/some/path"),
             Some("proxy:3128".to_string())
         );
-    }
-
-    #[test]
-    fn strip_query_empty_path() {
-        assert_eq!(strip_query(""), "");
-    }
-
-    #[test]
-    fn strip_query_only_question_mark() {
-        assert_eq!(strip_query("?"), "");
-    }
-
-    #[test]
-    fn strip_query_only_hash() {
-        assert_eq!(strip_query("#"), "");
-    }
-
-    #[test]
-    fn strip_query_path_with_both() {
-        assert_eq!(strip_query("/page?q=1#top"), "/page");
-    }
-
-    #[test]
-    fn strip_query_hash_before_question() {
-        assert_eq!(strip_query("/page#section?q=1"), "/page");
     }
 }

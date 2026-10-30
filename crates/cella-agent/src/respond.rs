@@ -12,7 +12,6 @@ use hyper::header::{CONNECTION, CONTENT_LENGTH, EXPECT, HeaderMap, HeaderName, H
 use hyper::{Method, Request, Response, StatusCode, Version};
 use tracing::{debug, info, warn};
 
-use crate::forward_proxy::strip_query;
 use crate::proxy_config::AgentProxyConfig;
 use crate::proxy_http::{BoxBody, GatewayError, closing_response, full_bytes, text_response};
 
@@ -75,7 +74,7 @@ pub async fn decide<B>(
 where
     B: Body + Unpin,
 {
-    let path = strip_query(req.uri().path());
+    let path = req.uri().path();
     let verdict = config.matcher.evaluate(host, path);
     match verdict.action {
         VerdictAction::Allow { response_headers } => {
@@ -115,7 +114,7 @@ where
 {
     let (parts, body) = req.into_parts();
     let read = discard_body(&parts.headers, body, config.respond_drain_timeout).await;
-    let path = strip_query(parts.uri.path());
+    let path = parts.uri.path();
     let mut resp = if read == BodyRead::Failed {
         debug!("Request body for {host}{path} failed; answered 400 instead of the rule");
         text_response(StatusCode::BAD_REQUEST, "Bad Request")

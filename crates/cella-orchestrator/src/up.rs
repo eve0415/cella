@@ -1626,6 +1626,28 @@ impl EnsureUpContext<'_> {
         env_fwd
     }
 
+    /// Inject credential routes into the proxy config, warning about each rule
+    /// a route keeps from applying.
+    fn route_credentials(
+        &self,
+        settings: &cella_config::CellaConfig,
+        env_fwd: &mut cella_env::EnvForwarding,
+    ) {
+        let routes = crate::credential_protect::inject_routes_into_proxy_config(
+            settings,
+            self.config.container_name,
+            env_fwd,
+        );
+        let rules = self
+            .proxy_fwd
+            .full_config
+            .as_ref()
+            .map_or(&[][..], |c| c.rules.as_slice());
+        for warning in crate::credential_protect::shadowed_rule_warnings(rules, &routes) {
+            self.progress.warn(&warning);
+        }
+    }
+
     fn resolve_image_config(
         &self,
         img_name: &str,
@@ -1655,11 +1677,7 @@ impl EnsureUpContext<'_> {
         let mut env_fwd = self.resolve_env_forwarding(config, &remote_user);
 
         if settings.credentials.protect && managed_agent {
-            crate::credential_protect::inject_routes_into_proxy_config(
-                &settings,
-                self.config.container_name,
-                &mut env_fwd,
-            );
+            self.route_credentials(&settings, &mut env_fwd);
         }
 
         let mut labels = self.build_labels(
