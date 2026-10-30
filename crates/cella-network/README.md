@@ -6,9 +6,9 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-network provides the configuration types, rule engine, and CA infrastructure for controlling network access inside dev containers. It supports two blocking modes: denylist (block matching traffic, allow everything else) and allowlist (allow matching traffic, block everything else). Rules use glob patterns for both domain and path matching, enabling fine-grained control like blocking `*.prod.internal` or only `/admin/**` paths on a specific API domain.
+cella-network provides the configuration types, rule engine, and CA infrastructure for controlling network access inside dev containers. It supports two blocking modes: denylist (block matching traffic, allow everything else) and allowlist (allow matching traffic, block everything else). Rules use glob patterns for both domain and path matching, enabling fine-grained control like blocking `*.prod.internal` or only `/admin/**` paths on a specific API domain. A rule can also answer matching requests with configured responses (`respond`) or add headers to upstream responses (`response_headers` on an `allow` rule).
 
-Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-detected from the host and forwarded into containers with safety entries to prevent proxy loops. When path-level blocking rules are active, the crate generates a self-signed CA certificate for MITM TLS interception, stored at `~/.cella/proxy/`. Configuration merges from `devcontainer.json` customizations and `cella.toml`, with `cella.toml` taking precedence on conflicts.
+Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-detected from the host and forwarded into containers with safety entries to prevent proxy loops. When a rule needs TLS interception (path patterns, `respond`, or `response_headers`) or credential protection is on, the crate generates a self-signed CA certificate for MITM TLS interception, stored at `~/.cella/proxy/`. Configuration merges from `devcontainer.json` customizations and `cella.toml`, with `cella.toml` taking precedence on conflicts.
 
 ## Architecture
 
@@ -16,8 +16,9 @@ Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-d
 
 - `NetworkConfig` -- top-level configuration loaded from `cella.toml` or `customizations.cella.network`
 - `NetworkMode` -- blocking disposition: `Denylist` (default) or `Allowlist`
-- `NetworkRule` -- a domain glob pattern with optional path patterns and an action (block/allow)
-- `RuleMatcher` -- evaluates request URLs against compiled rules, returns a `RuleVerdict`
+- `NetworkRule` -- a domain glob pattern with optional path patterns and an action (block/allow/respond), plus `responses` for `respond` and `response_headers` for `allow`
+- `ResponseSpec` -- one configured response of a `respond` rule, with its body already resolved
+- `RuleMatcher` -- evaluates request URLs against compiled rules, returns a `RuleVerdict` whose `VerdictAction` is allow (with optional response headers), block, or respond
 - `ProxyEnvVars` -- resolved proxy environment variables for container injection
 - `CaCertificate` -- generated or loaded CA certificate and private key pair
 
@@ -25,7 +26,8 @@ Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are auto-d
 
 | Module | Purpose |
 |--------|---------|
-| `config` | Configuration types (`NetworkConfig`, `ProxyConfig`, `NetworkRule`, `NetworkMode`, `RuleAction`), deserialization from TOML and JSON |
+| `config` | Configuration types (`NetworkConfig`, `ProxyConfig`, `NetworkRule`, `NetworkMode`, `RuleAction`, `ResponseSpec`), deserialization from TOML and JSON, `NetworkConfig::needs_mitm` |
+| `validate` | `NetworkConfig::validate`: host-side checks for `respond` rules and `response_headers` (statuses, header names and values, forbidden framing headers) |
 | `rules` | Glob-based rule matching engine; `*` matches one segment, `**` matches zero or more (paths only); domain matching is case-insensitive, path matching is case-sensitive |
 | `ca` | CA certificate generation via `rcgen`, host CA bundle detection via `rustls-native-certs`, stored at `~/.cella/proxy/` |
 | `proxy_env` | Auto-detection of `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` from host environment, env pair generation for containers and Docker builds |

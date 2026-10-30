@@ -761,6 +761,7 @@ Credential domains are routed through the agent's MITM proxy. The proxy spec (se
 
 **Credential-domain-specific behavior:**
 - When a request matches a credential route, the agent opens a credential tunnel to the daemon instead of forwarding the request upstream
+- The credential route is checked before network rules are evaluated, so network rules, including `respond` rules and `response_headers`, have no effect on a credential domain
 - The MITM proxy terminates TLS from the container process, reads the plaintext HTTP request, and tunnels it over the framed protocol
 - If the credential tunnel is unavailable (daemon unreachable, nonce validation fails), the request returns HTTP 502 with body `"Credential proxy unavailable"`
 - There is no fallback to direct pass-through — this is fail-closed by design
