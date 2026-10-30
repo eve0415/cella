@@ -34,12 +34,7 @@ impl NetworkConfig {
     /// CA) for this config: some rule inspects paths, synthesizes responses,
     /// or injects response headers, or credential protection is on.
     pub fn needs_mitm(&self, credentials_protect: bool) -> bool {
-        credentials_protect
-            || self.rules.iter().any(|r| {
-                !r.paths.is_empty()
-                    || r.action == RuleAction::Respond
-                    || !r.response_headers.is_empty()
-            })
+        credentials_protect || self.rules.iter().any(NetworkRule::needs_mitm)
     }
 }
 
@@ -126,6 +121,14 @@ impl NetworkRule {
     /// its path patterns when it has any.
     pub fn label(&self) -> String {
         rule_label(&self.domain, &self.paths)
+    }
+
+    /// Whether applying this rule needs the request decrypted: it inspects
+    /// paths, answers with a configured response, or sets response headers.
+    pub fn needs_mitm(&self) -> bool {
+        !self.paths.is_empty()
+            || self.action == RuleAction::Respond
+            || !self.response_headers.is_empty()
     }
 }
 

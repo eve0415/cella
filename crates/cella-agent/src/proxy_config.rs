@@ -257,11 +257,11 @@ mod tests {
 
         // evil.com should be blocked in denylist mode.
         let v = config.matcher.evaluate("evil.com", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
 
         // Other domains should be allowed in denylist mode.
         let v = config.matcher.evaluate("good.com", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]
@@ -270,11 +270,11 @@ mod tests {
         let config = AgentProxyConfig::from_json(&json).unwrap();
 
         let v = config.matcher.evaluate("good.com", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
 
         // Non-allowed domains should be blocked in allowlist mode.
         let v = config.matcher.evaluate("other.com", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
     }
 
     #[test]
@@ -376,7 +376,7 @@ mod tests {
         let config = AgentProxyConfig::from_json(&json).unwrap();
         // With denylist and no rules, everything is allowed.
         let v = config.matcher.evaluate("anything.com", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]
@@ -386,11 +386,11 @@ mod tests {
         let config = AgentProxyConfig::from_json(&json).unwrap();
 
         let v = config.matcher.evaluate("evil.com", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
         let v = config.matcher.evaluate("bad.org", "/secret");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
         let v = config.matcher.evaluate("bad.org", "/public");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]
@@ -403,9 +403,9 @@ mod tests {
         let config = AgentProxyConfig::from_json(&json).unwrap();
         // Should behave as denylist.
         let v = config.matcher.evaluate("evil.com", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
         let v = config.matcher.evaluate("good.com", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]

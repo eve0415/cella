@@ -151,7 +151,7 @@ async fn handle_connect(
     };
 
     let is_credential_domain = config.credential_route_for_domain(&host).is_some();
-    let needs_path_inspection = config.matcher.domain_needs_path_inspection(&host);
+    let needs_mitm = config.matcher.domain_needs_mitm(&host);
     let has_mitm = config.ca_cert_pem.is_some() && config.ca_key_pem.is_some();
 
     if is_credential_domain && !has_mitm {
@@ -164,7 +164,7 @@ async fn handle_connect(
         );
     }
 
-    if (is_credential_domain || needs_path_inspection) && has_mitm {
+    if (is_credential_domain || needs_mitm) && has_mitm {
         let config = config.clone();
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
@@ -179,7 +179,7 @@ async fn handle_connect(
 
     // When MITM is unavailable, evaluate domain-level rules only — path
     // rules are skipped entirely rather than matched against a fake path.
-    let verdict = if needs_path_inspection {
+    let verdict = if needs_mitm {
         if config.warn_no_mitm_once(&host) {
             warn!(
                 "CONNECT to {host}: path-level rules exist but MITM is unavailable; \
@@ -190,7 +190,7 @@ async fn handle_connect(
     } else {
         config.matcher.evaluate(&host, "/")
     };
-    if !verdict.allowed {
+    if !verdict.is_allowed() {
         info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
         config.log_blocked(&host, "/", &verdict.reason);
         return closing_response(StatusCode::FORBIDDEN, "Forbidden");
@@ -283,7 +283,7 @@ async fn handle_plain(
 
     let path = strip_query(req.uri().path());
     let verdict = config.matcher.evaluate(&target.host, path);
-    if !verdict.allowed {
+    if !verdict.is_allowed() {
         info!("BLOCKED HTTP {} - {}", req.uri(), verdict.reason);
         config.log_blocked(&target.host, path, &verdict.reason);
         return text_response(StatusCode::FORBIDDEN, "Forbidden");

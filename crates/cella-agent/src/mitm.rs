@@ -245,7 +245,7 @@ async fn handle_request(
     let path = super::forward_proxy::strip_query(req.uri().path());
     let verdict = config.matcher.evaluate(host, path);
 
-    if !verdict.allowed {
+    if !verdict.is_allowed() {
         tracing::info!("BLOCKED HTTPS {host}{path} - {}", verdict.reason);
         config.log_blocked(host, path, &verdict.reason);
         let resp = Response::builder()

@@ -124,9 +124,9 @@ fn evaluate_mixed_case(bencher: divan::Bencher, rules: usize) {
 
 /// Called per CONNECT to decide whether TLS interception is needed.
 #[divan::bench(args = RULE_COUNTS)]
-fn needs_path_inspection(bencher: divan::Bencher, rules: usize) {
+fn needs_mitm(bencher: divan::Bencher, rules: usize) {
     let matcher = RuleMatcher::new(&build_config(rules));
     bencher.bench(|| {
-        divan::black_box(matcher.domain_needs_path_inspection(divan::black_box("github.com")));
+        divan::black_box(matcher.domain_needs_mitm(divan::black_box("github.com")));
     });
 }

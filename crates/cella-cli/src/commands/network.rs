@@ -140,7 +140,7 @@ fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync
     let matcher = cella_network::RuleMatcher::new(&net_config);
     let verdict = matcher.evaluate(&domain, &path);
 
-    if verdict.allowed {
+    if verdict.is_allowed() {
         println!("\u{2713} ALLOWED: {url}");
     } else {
         println!("\u{2717} BLOCKED: {url}");

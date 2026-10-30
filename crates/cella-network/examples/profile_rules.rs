@@ -68,7 +68,7 @@ fn main() {
     let mut blocked = 0usize;
     for i in 0..iterations {
         let (domain, path) = REQUESTS[i % REQUESTS.len()];
-        if !matcher.evaluate(domain, path).allowed {
+        if !matcher.evaluate(domain, path).is_allowed() {
             blocked += 1;
         }
     }
