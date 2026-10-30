@@ -263,7 +263,20 @@ Network proxy and blocking settings. See [Network Proxy](network-proxy.md) for f
 |-------|------|---------|-------------|
 | `domain` | string | *(required)* | Domain glob pattern |
 | `paths` | array of strings | `[]` | Path glob patterns |
-| `action` | string | *(required)* | `"block"` or `"allow"` |
+| `action` | string | *(required)* | `"block"`, `"allow"`, or `"respond"` |
+| `responses` | array of tables | `[]` | Mock responses for a `"respond"` rule, served in order (see [Mock responses](network-proxy.md#mock-responses)) |
+| `response_headers` | table of strings | `{}` | Headers an `"allow"` rule adds to upstream responses (see [Response headers](network-proxy.md#response-headers)) |
+
+`"respond"`, `responses`, and `response_headers` work only in `.devcontainer/cella.toml` and `~/.cella/config.toml`, not under `customizations.cella` in `devcontainer.json`.
+
+#### `[[network.rules.responses]]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `status` | integer | *(required)* | HTTP status code, `200` to `599` |
+| `headers` | table of strings | `{}` | Response headers |
+| `body` | string | *unset* | Response body |
+| `body_file` | string | *unset* | File to use as the response body, relative to the config file's directory |
 
 ### `[cli]`
 

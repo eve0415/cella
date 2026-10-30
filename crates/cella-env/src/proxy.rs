@@ -3,7 +3,8 @@
 //! Detects host proxy env vars and builds the env var set for injection
 //! into containers, respecting cella network config overrides.
 
-use cella_network::config::{NetworkConfig, ProxyConfig};
+use cella_network::ca::{CaCertificate, CaError};
+use cella_network::config::{NetworkConfig, NetworkRule, ProxyConfig};
 use cella_network::proxy_env::ProxyEnvVars;
 
 use crate::{EnvForwarding, ForwardEnv};
@@ -52,31 +53,23 @@ pub fn apply_proxy_env(
 /// When `credentials_protect` is true, CA materials are always included
 /// (credential routes require MITM TLS interception).
 pub fn build_agent_proxy_config_json(config: &NetworkConfig, credentials_protect: bool) -> String {
+    build_agent_proxy_config_json_with_ca(config, credentials_protect, cella_network::ca::ensure_ca)
+}
+
+/// [`build_agent_proxy_config_json`] with the CA source supplied, so tests
+/// can check the CA decision without writing the CA under `$HOME`.
+fn build_agent_proxy_config_json_with_ca(
+    config: &NetworkConfig,
+    credentials_protect: bool,
+    ensure_ca: impl FnOnce() -> Result<CaCertificate, CaError>,
+) -> String {
     let proxy_env = ProxyEnvVars::detect(&config.proxy);
     let upstream = proxy_env.and_then(|p| p.http_proxy.or(p.https_proxy));
 
-    let rules: Vec<serde_json::Value> = config
-        .rules
-        .iter()
-        .map(|r| {
-            let mut rule = serde_json::json!({
-                "domain": r.domain,
-                "action": match r.action {
-                    cella_network::RuleAction::Block => "block",
-                    cella_network::RuleAction::Allow => "allow",
-                },
-            });
-            if !r.paths.is_empty() {
-                rule["paths"] = serde_json::json!(r.paths);
-            }
-            rule
-        })
-        .collect();
+    let rules: Vec<serde_json::Value> = config.rules.iter().map(rule_json).collect();
 
-    let has_path_rules = config.rules.iter().any(|r| !r.paths.is_empty());
-    let needs_mitm = has_path_rules || credentials_protect;
-    let (ca_cert_pem, ca_key_pem) = if needs_mitm {
-        match cella_network::ca::ensure_ca() {
+    let (ca_cert_pem, ca_key_pem) = if config.needs_mitm(credentials_protect) {
+        match ensure_ca() {
             Ok(ca) => (Some(ca.cert_pem), Some(ca.key_pem)),
             Err(e) => {
                 tracing::warn!(
@@ -102,6 +95,34 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig, credentials_protect
     });
 
     json.to_string()
+}
+
+/// One rule as the agent reads it. Optional keys are omitted when empty.
+fn rule_json(r: &NetworkRule) -> serde_json::Value {
+    let mut rule = serde_json::json!({
+        "domain": r.domain,
+        "action": r.action.as_str(),
+    });
+    if !r.paths.is_empty() {
+        rule["paths"] = serde_json::json!(r.paths);
+    }
+    if !r.responses.is_empty() {
+        rule["responses"] = r
+            .responses
+            .iter()
+            .map(|resp| {
+                serde_json::json!({
+                    "status": resp.status,
+                    "headers": resp.headers,
+                    "body": resp.body,
+                })
+            })
+            .collect();
+    }
+    if !r.response_headers.is_empty() {
+        rule["response_headers"] = serde_json::json!(r.response_headers);
+    }
+    rule
 }
 
 /// Credential route for the agent proxy config.
@@ -158,7 +179,9 @@ pub fn inject_credential_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, ProxyConfig, RuleAction};
+    use cella_network::config::{
+        NetworkConfig, NetworkMode, NetworkRule, ProxyConfig, ResponseSpec, RuleAction,
+    };
 
     #[test]
     fn test_apply_proxy_env_disabled_proxy() {
@@ -224,6 +247,7 @@ mod tests {
                 domain: "*.evil.com".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
         };
 
@@ -249,11 +273,13 @@ mod tests {
                     domain: "registry.npmjs.org".to_string(),
                     paths: vec![],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "github.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
             ],
         };
@@ -278,6 +304,7 @@ mod tests {
                 domain: "api.example.com".to_string(),
                 paths: vec!["/v1/admin/*".to_string(), "/internal/*".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
         };
 
@@ -329,5 +356,83 @@ mod tests {
             json["ca_key_pem"].is_null(),
             "no path rules and no credential protection should not include CA key"
         );
+    }
+
+    fn fake_ca() -> CaCertificate {
+        CaCertificate {
+            cert_pem: "fake cert".to_string(),
+            key_pem: "fake key".to_string(),
+            cert_path: std::path::PathBuf::new(),
+            key_path: std::path::PathBuf::new(),
+        }
+    }
+
+    fn respond_config(paths: Vec<String>) -> NetworkConfig {
+        NetworkConfig {
+            mode: NetworkMode::Denylist,
+            proxy: ProxyConfig::default(),
+            rules: vec![NetworkRule {
+                domain: "api.anthropic.com".to_string(),
+                paths,
+                action: RuleAction::Respond,
+                responses: vec![ResponseSpec {
+                    status: 529,
+                    headers: [("retry-after".to_string(), "0".to_string())].into(),
+                    body: "overloaded".to_string(),
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_emits_respond_and_response_headers() {
+        let mut config = respond_config(vec!["/v1/messages".to_string()]);
+        config.rules.push(NetworkRule {
+            domain: "api.example.com".to_string(),
+            action: RuleAction::Allow,
+            response_headers: [("x-test-run".to_string(), "1".to_string())].into(),
+            ..Default::default()
+        });
+        config.rules.push(NetworkRule {
+            domain: "evil.com".to_string(),
+            action: RuleAction::Block,
+            ..Default::default()
+        });
+
+        let json_str = build_agent_proxy_config_json_with_ca(&config, false, || Ok(fake_ca()));
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        assert_eq!(rules[0]["action"], "respond");
+        assert_eq!(
+            rules[0]["responses"],
+            serde_json::json!([{
+                "status": 529,
+                "headers": {"retry-after": "0"},
+                "body": "overloaded",
+            }])
+        );
+        assert_eq!(
+            rules[1]["response_headers"],
+            serde_json::json!({"x-test-run": "1"})
+        );
+        for key in ["responses", "response_headers"] {
+            assert!(
+                rules[2].get(key).is_none(),
+                "{key} should be omitted when empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_ships_ca_for_domain_only_respond() {
+        let config = respond_config(vec![]);
+
+        let json_str = build_agent_proxy_config_json_with_ca(&config, false, || Ok(fake_ca()));
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(json["ca_cert_pem"], "fake cert");
+        assert_eq!(json["ca_key_pem"], "fake key");
     }
 }

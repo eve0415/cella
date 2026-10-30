@@ -4,19 +4,47 @@
 //! Domain matching is case-insensitive; path matching is case-sensitive.
 
 use std::borrow::Cow;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
+use crate::config::{NetworkConfig, NetworkMode, NetworkRule, ResponseSpec, RuleAction};
 
 /// Evaluates network rules against request URLs.
+///
+/// A verdict names a rule's configured responses or response headers by
+/// index only; the matcher keeps none of them, so whoever serves them holds
+/// the one copy (see [`RuleMatcher::with_payloads`]).
 pub struct RuleMatcher {
     mode: NetworkMode,
     rules: Vec<CompiledRule>,
 }
 
+/// The configured responses and response headers of a matcher's rules, moved
+/// out of its config, each at the index the matcher's verdicts carry.
+#[derive(Debug, Default)]
+pub struct RulePayloads {
+    /// Per `respond` rule, at its [`RespondIndex`], its responses in serving
+    /// order.
+    pub responses: Vec<Vec<ResponseSpec>>,
+    /// Per `allow` rule with response headers, at its [`HeadersIndex`].
+    pub headers: Vec<Vec<(String, String)>>,
+}
+
+/// The next index of each kind a rule compiled into a matcher takes.
+#[derive(Default)]
+struct NextIndices {
+    respond: usize,
+    headers: usize,
+}
+
 struct CompiledRule {
     domain_parts: Vec<PatternPart>,
     path_patterns: Vec<Vec<PatternPart>>,
-    action: RuleAction,
+    /// Pre-built verdict action, so a match costs a refcount bump.
+    action: VerdictAction,
+    /// Whether traffic to this rule's domain must be decrypted to apply it.
+    needs_mitm: bool,
     source: String,
     /// Human-readable display of the original rule (e.g., "*.example.com /admin/** (block)").
     pattern_display: String,
@@ -35,8 +63,8 @@ enum PatternPart {
 /// Result of evaluating a URL against the rule set.
 #[derive(Debug, Clone)]
 pub struct RuleVerdict {
-    /// Whether the request is allowed.
-    pub allowed: bool,
+    /// What to do with the request.
+    pub action: VerdictAction,
     /// Human-readable explanation (e.g., "blocked by rule: *.prod.internal").
     ///
     /// Borrowed when no rule matched — the common case for every allowed
@@ -49,6 +77,86 @@ pub struct RuleVerdict {
     pub source: Option<String>,
 }
 
+impl RuleVerdict {
+    /// Whether the request may go upstream.
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self.action, VerdictAction::Allow { .. })
+    }
+}
+
+/// What the proxy does with a request.
+#[derive(Debug, Clone)]
+pub enum VerdictAction {
+    /// Forward upstream, setting the rule's response headers, if it has any,
+    /// on the response.
+    Allow {
+        response_headers: Option<HeadersIndex>,
+    },
+    /// Refuse the request.
+    Block,
+    /// Answer with the rule's next configured response.
+    Respond(Arc<RespondRule>),
+}
+
+/// Position of a `respond` rule's responses in [`RulePayloads::responses`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RespondIndex(usize);
+
+impl RespondIndex {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Position of an `allow` rule's header list in [`RulePayloads::headers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadersIndex(usize);
+
+impl HeadersIndex {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// One `respond` rule's place among the configured responses and how many it
+/// has served. The responses themselves are in [`RulePayloads::responses`].
+///
+/// The counter is shared by every request that hits the rule, so a sequence
+/// advances across connections.
+#[derive(Debug)]
+pub struct RespondRule {
+    index: RespondIndex,
+    /// How many responses the rule has; never zero.
+    responses: usize,
+    served: AtomicUsize,
+}
+
+impl RespondRule {
+    /// `None` for an empty list, which has nothing to serve.
+    fn new(index: RespondIndex, responses: &[ResponseSpec]) -> Option<Self> {
+        (!responses.is_empty()).then(|| Self {
+            index,
+            responses: responses.len(),
+            served: AtomicUsize::new(0),
+        })
+    }
+
+    /// Position of this rule's responses in [`RulePayloads::responses`].
+    #[must_use]
+    pub const fn index(&self) -> RespondIndex {
+        self.index
+    }
+
+    /// Position among this rule's responses of the one to serve now:
+    /// responses go out in order and the last one repeats.
+    pub fn next_index(&self) -> usize {
+        let served = self.served.fetch_add(1, Ordering::Relaxed);
+        served.min(self.responses - 1)
+    }
+}
+
 impl RuleMatcher {
     /// Build a matcher from a network configuration.
     pub fn new(config: &NetworkConfig) -> Self {
@@ -57,10 +165,11 @@ impl RuleMatcher {
 
     /// Build a matcher from config with a source label for all rules.
     pub fn with_source(config: &NetworkConfig, source: &str) -> Self {
+        let mut next = NextIndices::default();
         let rules = config
             .rules
             .iter()
-            .map(|r| compile_rule(r, source))
+            .map(|rule| compile_rule(rule, source, compile_action(rule, &mut next)))
             .collect();
         Self {
             mode: config.mode,
@@ -68,10 +177,31 @@ impl RuleMatcher {
         }
     }
 
-    /// Build a matcher from rules that already have source labels.
-    pub fn from_labeled_rules(mode: NetworkMode, rules: &[(NetworkRule, String)]) -> Self {
-        let rules = rules.iter().map(|(r, src)| compile_rule(r, src)).collect();
-        Self { mode, rules }
+    /// Build a matcher from `config`, moving the configured responses and
+    /// response headers out to the caller, each at the index the matcher's
+    /// verdicts carry for it.
+    pub fn with_payloads(config: NetworkConfig) -> (Self, RulePayloads) {
+        let matcher = Self::new(&config);
+        let mut payloads = RulePayloads::default();
+        // `with_source` compiled one rule per config rule, in order.
+        for (compiled, rule) in matcher.rules.iter().zip(config.rules) {
+            match &compiled.action {
+                VerdictAction::Respond(r) => {
+                    place(&mut payloads.responses, r.index().get(), rule.responses);
+                }
+                VerdictAction::Allow {
+                    response_headers: Some(index),
+                } => {
+                    let headers = rule.response_headers.into_iter().collect();
+                    place(&mut payloads.headers, index.get(), headers);
+                }
+                VerdictAction::Allow {
+                    response_headers: None,
+                }
+                | VerdictAction::Block => {}
+            }
+        }
+        (matcher, payloads)
     }
 
     /// Evaluate whether a request to the given domain and path is allowed.
@@ -104,97 +234,134 @@ impl RuleMatcher {
             };
 
             if path_matched {
-                let allowed = rule.action == RuleAction::Allow;
+                return rule.verdict();
+            }
+        }
+
+        self.default_verdict()
+    }
+
+    /// Evaluate only domain-level rules (rules without path patterns).
+    ///
+    /// Used for CONNECT requests when MITM is unavailable — path-level rules
+    /// are skipped entirely rather than evaluated against a fake path. A
+    /// `respond` rule cannot be applied without decrypting, so a domain match
+    /// on one blocks, whatever its paths, instead of tunnelling to the real
+    /// server.
+    pub fn evaluate_domain_only(&self, domain: &str) -> RuleVerdict {
+        let domain_lower = ascii_lowercase_cow(domain);
+        let labels = split_domain(&domain_lower);
+
+        for rule in &self.rules {
+            if !match_segments(&rule.domain_parts, &labels) {
+                continue;
+            }
+            if matches!(rule.action, VerdictAction::Respond(_)) {
                 return RuleVerdict {
-                    allowed,
+                    action: VerdictAction::Block,
                     reason: format!(
-                        "{} by rule: {}",
-                        if allowed { "allowed" } else { "blocked" },
-                        rule.pattern_display,
+                        "respond rule requires TLS interception: {}",
+                        rule.pattern_display
                     )
                     .into(),
                     matched_rule: Some(rule.pattern_display.clone()),
                     source: Some(rule.source.clone()),
                 };
             }
-        }
-
-        // No rule matched — use default disposition based on mode.
-        match self.mode {
-            NetworkMode::Denylist => RuleVerdict {
-                allowed: true,
-                reason: Cow::Borrowed("allowed (no matching deny rule)"),
-                matched_rule: None,
-                source: None,
-            },
-            NetworkMode::Allowlist => RuleVerdict {
-                allowed: false,
-                reason: Cow::Borrowed("blocked (no matching allow rule)"),
-                matched_rule: None,
-                source: None,
-            },
-        }
-    }
-
-    /// Evaluate only domain-level rules (rules without path patterns).
-    ///
-    /// Used for CONNECT requests when MITM is unavailable — path-level rules
-    /// are skipped entirely rather than evaluated against a fake path.
-    pub fn evaluate_domain_only(&self, domain: &str) -> RuleVerdict {
-        let domain_lower = ascii_lowercase_cow(domain);
-        let labels = split_domain(&domain_lower);
-
-        for rule in &self.rules {
             if !rule.path_patterns.is_empty() {
                 continue;
             }
-            if !match_segments(&rule.domain_parts, &labels) {
-                continue;
-            }
-
-            let allowed = rule.action == RuleAction::Allow;
-            return RuleVerdict {
-                allowed,
-                reason: format!(
-                    "{} by rule: {}",
-                    if allowed { "allowed" } else { "blocked" },
-                    rule.pattern_display,
-                )
-                .into(),
-                matched_rule: Some(rule.pattern_display.clone()),
-                source: Some(rule.source.clone()),
-            };
+            return rule.verdict();
         }
 
+        self.default_verdict()
+    }
+
+    /// Check whether any rule for the given domain needs the request decrypted:
+    /// it inspects paths, answers with a configured response, or sets
+    /// response headers.
+    ///
+    /// If `true`, MITM TLS interception is needed for this domain.
+    /// If `false`, a domain-level verdict is sufficient (no MITM).
+    pub fn domain_needs_mitm(&self, domain: &str) -> bool {
+        let domain_lower = ascii_lowercase_cow(domain);
+        let labels = split_domain(&domain_lower);
+        self.rules
+            .iter()
+            .any(|rule| rule.needs_mitm && match_segments(&rule.domain_parts, &labels))
+    }
+
+    /// Verdict when no rule matched. Allocation-free: this is the path every
+    /// unmatched request takes.
+    const fn default_verdict(&self) -> RuleVerdict {
         match self.mode {
             NetworkMode::Denylist => RuleVerdict {
-                allowed: true,
+                action: VerdictAction::Allow {
+                    response_headers: None,
+                },
                 reason: Cow::Borrowed("allowed (no matching deny rule)"),
                 matched_rule: None,
                 source: None,
             },
             NetworkMode::Allowlist => RuleVerdict {
-                allowed: false,
+                action: VerdictAction::Block,
                 reason: Cow::Borrowed("blocked (no matching allow rule)"),
                 matched_rule: None,
                 source: None,
             },
         }
     }
+}
 
-    /// Check whether any rule for the given domain requires path inspection.
-    ///
-    /// If `true`, MITM TLS interception is needed for this domain.
-    /// If `false`, domain-level blocking is sufficient (no MITM).
-    pub fn domain_needs_path_inspection(&self, domain: &str) -> bool {
-        let domain_lower = ascii_lowercase_cow(domain);
-        let labels = split_domain(&domain_lower);
-        self.rules.iter().any(|rule| {
-            !rule.path_patterns.is_empty() && match_segments(&rule.domain_parts, &labels)
-        })
+/// Build the verdict action a match on `rule` returns, giving its responses
+/// or response headers the next index of their kind.
+///
+/// A `respond` rule with no responses has nothing to serve and blocks;
+/// config validation rejects it before it gets here.
+fn compile_action(rule: &NetworkRule, next: &mut NextIndices) -> VerdictAction {
+    match rule.action {
+        RuleAction::Block => VerdictAction::Block,
+        RuleAction::Allow => VerdictAction::Allow {
+            response_headers: (!rule.response_headers.is_empty()).then(|| {
+                let index = HeadersIndex(next.headers);
+                next.headers += 1;
+                index
+            }),
+        },
+        RuleAction::Respond => {
+            let index = RespondIndex(next.respond);
+            RespondRule::new(index, &rule.responses).map_or(VerdictAction::Block, |r| {
+                next.respond += 1;
+                VerdictAction::Respond(Arc::new(r))
+            })
+        }
     }
 }
 
+/// Put `item` at `index` in `list`, growing it as needed.
+fn place<T: Default>(list: &mut Vec<T>, index: usize, item: T) {
+    if list.len() <= index {
+        list.resize_with(index + 1, T::default);
+    }
+    list[index] = item;
+}
+
+impl CompiledRule {
+    /// Verdict for a request this rule matched.
+    fn verdict(&self) -> RuleVerdict {
+        let outcome = match self.action {
+            VerdictAction::Allow { .. } => "allowed",
+            VerdictAction::Block => "blocked",
+            VerdictAction::Respond(_) => "responded",
+        };
+        RuleVerdict {
+            action: self.action.clone(),
+            reason: format!("{outcome} by rule: {}", self.pattern_display).into(),
+            matched_rule: Some(self.pattern_display.clone()),
+            source: Some(self.source.clone()),
+        }
+    }
+}
 /// Lowercase `s` only if it actually contains uppercase ASCII.
 ///
 /// Hostnames arrive lowercase in the overwhelming majority of requests, so the
@@ -218,14 +385,11 @@ fn split_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
+fn compile_rule(rule: &NetworkRule, source: &str, action: VerdictAction) -> CompiledRule {
     let domain_parts = parse_domain_pattern(&rule.domain);
     let path_patterns = rule.paths.iter().map(|p| parse_path_pattern(p)).collect();
 
-    let action_str = match rule.action {
-        RuleAction::Block => "block",
-        RuleAction::Allow => "allow",
-    };
+    let action_str = rule.action.as_str();
     let pattern_display = if rule.paths.is_empty() {
         format!("{} ({})", rule.domain, action_str)
     } else {
@@ -235,15 +399,51 @@ fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
     CompiledRule {
         domain_parts,
         path_patterns,
-        action: rule.action,
+        action,
+        needs_mitm: rule.needs_mitm(),
         source: source.to_string(),
         pattern_display,
     }
 }
 
+/// Canonical form of an IPv6 literal written with or without brackets.
+///
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) becomes dotted IPv4; any other
+/// address, IPv4-compatible (`::a.b.c.d`) included, takes the compressed
+/// lowercase IPv6 form. Returns `None` when `literal` is not an IPv6 address,
+/// including one with a zone ID.
+pub fn canonical_ipv6_literal(literal: &str) -> Option<String> {
+    let inner = literal
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .unwrap_or(literal);
+    let addr: Ipv6Addr = inner.parse().ok()?;
+    Some(canonical_ipv6(addr).to_string())
+}
+
+/// `addr` as the address family it actually reaches.
+///
+/// Only an IPv4-mapped address reaches IPv4. The deprecated IPv4-compatible
+/// form (RFC 4291 §2.5.5.1) is an ordinary IPv6 destination, so it stays
+/// IPv6.
+const fn canonical_ipv6(addr: Ipv6Addr) -> IpAddr {
+    match addr.to_ipv4_mapped() {
+        Some(v4) => IpAddr::V4(v4),
+        None => IpAddr::V6(addr),
+    }
+}
+
 /// Parse a domain pattern like `*.example.com` into parts.
-/// Splits on `.` and maps `*` to `Star`.
+/// Splits on `.` and maps `*` to `Star`. An IPv6 literal, with or without
+/// brackets, compiles to its canonical form: one literal part for an IPv6
+/// address, or the labels of the IPv4 address it maps to.
 fn parse_domain_pattern(pattern: &str) -> Vec<PatternPart> {
+    if let Some(canonical) = canonical_ipv6_literal(pattern) {
+        if canonical.contains(':') {
+            return vec![PatternPart::Literal(canonical)];
+        }
+        return parse_domain_pattern(&canonical);
+    }
     pattern
         .to_ascii_lowercase()
         .split('.')
@@ -373,6 +573,70 @@ mod tests {
     // --- Domain pattern matching ---
 
     #[test]
+    fn ipv6_literal_rule_matches_canonical_form() {
+        for pattern in ["::1", "[::1]", "0:0:0:0:0:0:0:1", "[0:0::1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert_eq!(
+                parts,
+                [PatternPart::Literal("::1".to_string())],
+                "{pattern}"
+            );
+            assert!(match_domain(&parts, "::1"), "{pattern}");
+        }
+        let parts = parse_domain_pattern("[2001:DB8:0::1]");
+        assert!(match_domain(&parts, "2001:db8::1"));
+    }
+
+    #[test]
+    fn ipv4_mapped_rule_matches_ipv4_address() {
+        for pattern in ["::ffff:127.0.0.1", "[::ffff:7f00:1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert!(match_domain(&parts, "127.0.0.1"), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ipv4_compatible_rule_stays_ipv6() {
+        for pattern in ["::127.0.0.1", "[::7f00:1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert_eq!(
+                parts,
+                [PatternPart::Literal("::7f00:1".to_string())],
+                "{pattern}"
+            );
+            assert!(!match_domain(&parts, "127.0.0.1"), "{pattern}");
+        }
+        let parts = parse_domain_pattern("127.0.0.1");
+        assert!(!match_domain(&parts, "::7f00:1"));
+    }
+
+    #[test]
+    fn canonical_ipv6_literal_forms() {
+        assert_eq!(canonical_ipv6_literal("[::1]").as_deref(), Some("::1"));
+        assert_eq!(
+            canonical_ipv6_literal("::FFFF:127.0.0.1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("[::ffff:127.0.0.1]").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("[::127.0.0.1]").as_deref(),
+            Some("::7f00:1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("::8.8.8.8").as_deref(),
+            Some("::808:808")
+        );
+        assert_eq!(canonical_ipv6_literal("::").as_deref(), Some("::"));
+        assert_eq!(canonical_ipv6_literal("::1%eth0"), None);
+        assert_eq!(canonical_ipv6_literal("[not-an-ip]"), None);
+        assert_eq!(canonical_ipv6_literal("127.0.0.1"), None);
+        assert_eq!(canonical_ipv6_literal("example.com"), None);
+    }
+
+    #[test]
     fn exact_domain_match() {
         let parts = parse_domain_pattern("example.com");
         assert!(match_domain(&parts, "example.com"));
@@ -413,12 +677,13 @@ mod tests {
                 domain: "*.Example.COM".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
         let v = matcher.evaluate("FOO.EXAMPLE.COM", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
     }
 
     // --- Path pattern matching ---
@@ -507,16 +772,17 @@ mod tests {
                 domain: "*.prod.internal".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
         let v = matcher.evaluate("api.prod.internal", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
 
         let v = matcher.evaluate("api.staging.internal", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]
@@ -527,16 +793,17 @@ mod tests {
                 domain: "registry.npmjs.org".to_string(),
                 paths: vec![],
                 action: RuleAction::Allow,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
         let v = matcher.evaluate("registry.npmjs.org", "/");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
 
         let v = matcher.evaluate("evil.example.com", "/");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
     }
 
     #[test]
@@ -547,23 +814,24 @@ mod tests {
                 domain: "api.example.com".to_string(),
                 paths: vec!["/v1/admin/*".to_string(), "/internal/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
         let v = matcher.evaluate("api.example.com", "/v1/admin/delete");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
 
         let v = matcher.evaluate("api.example.com", "/internal/secrets/key");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
 
         let v = matcher.evaluate("api.example.com", "/v1/public/data");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
     }
 
     #[test]
-    fn domain_needs_path_inspection_check() {
+    fn domain_needs_mitm_for_path_rules() {
         let config = NetworkConfig {
             mode: NetworkMode::Denylist,
             rules: vec![
@@ -571,20 +839,22 @@ mod tests {
                     domain: "*.prod.internal".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "api.example.com".to_string(),
                     paths: vec!["/admin/**".to_string()],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
-        assert!(!matcher.domain_needs_path_inspection("foo.prod.internal"));
-        assert!(matcher.domain_needs_path_inspection("api.example.com"));
-        assert!(!matcher.domain_needs_path_inspection("other.example.com"));
+        assert!(!matcher.domain_needs_mitm("foo.prod.internal"));
+        assert!(matcher.domain_needs_mitm("api.example.com"));
+        assert!(!matcher.domain_needs_mitm("other.example.com"));
     }
 
     #[test]
@@ -596,11 +866,13 @@ mod tests {
                     domain: "api.example.com".to_string(),
                     paths: vec!["/public/**".to_string()],
                     action: RuleAction::Allow,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "api.example.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -609,11 +881,11 @@ mod tests {
 
         // /public/data matches first rule (allow)
         let v = matcher.evaluate("api.example.com", "/public/data");
-        assert!(v.allowed);
+        assert!(v.is_allowed());
 
         // /secret matches second rule (block)
         let v = matcher.evaluate("api.example.com", "/secret");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
     }
 
     #[test]
@@ -624,13 +896,14 @@ mod tests {
                 domain: "*.prod.internal".to_string(),
                 paths: vec!["/admin/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::with_source(&config, "cella.toml");
 
         let v = matcher.evaluate("api.prod.internal", "/admin/users");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
         assert_eq!(
             v.matched_rule.as_deref(),
             Some("*.prod.internal /admin/** (block)")
@@ -660,13 +933,14 @@ mod tests {
                 domain: "example.com".to_string(),
                 paths: vec![],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
         let v = matcher.evaluate("example.com", "");
-        assert!(!v.allowed);
+        assert!(!v.is_allowed());
     }
 
     #[test]
@@ -677,15 +951,16 @@ mod tests {
                 domain: "example.com".to_string(),
                 paths: vec!["/**".to_string()],
                 action: RuleAction::Block,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
         // Full evaluate with "/" matches the "/**" path rule → blocked.
-        assert!(!matcher.evaluate("example.com", "/").allowed);
+        assert!(!matcher.evaluate("example.com", "/").is_allowed());
         // Domain-only skips the path rule → allowed (denylist default).
-        assert!(matcher.evaluate_domain_only("example.com").allowed);
+        assert!(matcher.evaluate_domain_only("example.com").is_allowed());
     }
 
     #[test]
@@ -697,24 +972,244 @@ mod tests {
                     domain: "evil.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "mixed.com".to_string(),
                     paths: vec!["/secret/**".to_string()],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
                 NetworkRule {
                     domain: "mixed.com".to_string(),
                     paths: vec![],
                     action: RuleAction::Block,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let matcher = RuleMatcher::new(&config);
 
-        assert!(!matcher.evaluate_domain_only("evil.com").allowed);
-        assert!(!matcher.evaluate_domain_only("mixed.com").allowed);
-        assert!(matcher.evaluate_domain_only("good.com").allowed);
+        assert!(!matcher.evaluate_domain_only("evil.com").is_allowed());
+        assert!(!matcher.evaluate_domain_only("mixed.com").is_allowed());
+        assert!(matcher.evaluate_domain_only("good.com").is_allowed());
+    }
+
+    // --- Respond rules and response headers ---
+
+    fn response(status: u16) -> ResponseSpec {
+        ResponseSpec {
+            status,
+            headers: std::collections::BTreeMap::new(),
+            body: String::new(),
+        }
+    }
+
+    fn respond_rule(domain: &str, paths: &[&str], statuses: &[u16]) -> NetworkRule {
+        NetworkRule {
+            domain: domain.to_string(),
+            paths: paths.iter().map(ToString::to_string).collect(),
+            action: RuleAction::Respond,
+            responses: statuses.iter().map(|&s| response(s)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn matcher_for(rules: Vec<NetworkRule>) -> RuleMatcher {
+        RuleMatcher::new(&NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn respond_rule_match_returns_respond_verdict() {
+        let matcher = matcher_for(vec![respond_rule(
+            "api.anthropic.com",
+            &["/v1/messages"],
+            &[529, 200],
+        )]);
+
+        let v = matcher.evaluate("api.anthropic.com", "/v1/messages");
+        assert!(
+            matches!(v.action, VerdictAction::Respond(_)),
+            "{:?}",
+            v.action
+        );
+        assert!(!v.is_allowed());
+        assert_eq!(
+            v.reason,
+            "responded by rule: api.anthropic.com /v1/messages (respond)"
+        );
+
+        // A path the rule does not cover falls through to the default.
+        assert!(
+            matcher
+                .evaluate("api.anthropic.com", "/v1/models")
+                .is_allowed()
+        );
+    }
+
+    fn matcher_with_payloads(rules: Vec<NetworkRule>) -> (RuleMatcher, RulePayloads) {
+        RuleMatcher::with_payloads(NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn respond_rule_serves_in_order_then_repeats_last() {
+        let (matcher, payloads) =
+            matcher_with_payloads(vec![respond_rule("api.example.com", &[], &[529, 529, 200])]);
+
+        let served: Vec<u16> = (0..4)
+            .map(|_| match matcher.evaluate("api.example.com", "/").action {
+                VerdictAction::Respond(rule) => {
+                    payloads.responses[rule.index().get()][rule.next_index()].status
+                }
+                other => panic!("expected a respond verdict, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(served, [529, 529, 200, 200]);
+    }
+
+    #[test]
+    fn allow_verdict_carries_response_headers() {
+        let (matcher, payloads) = matcher_with_payloads(vec![NetworkRule {
+            domain: "api.example.com".to_string(),
+            action: RuleAction::Allow,
+            response_headers: [("x-test-run".to_string(), "1".to_string())].into(),
+            ..Default::default()
+        }]);
+
+        let v = matcher.evaluate("api.example.com", "/");
+        let VerdictAction::Allow {
+            response_headers: Some(headers),
+        } = &v.action
+        else {
+            panic!("expected allow with headers, got {:?}", v.action);
+        };
+        assert_eq!(
+            payloads.headers[headers.get()],
+            [("x-test-run".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn payloads_move_out_whole_responses() {
+        let busy = ResponseSpec {
+            status: 529,
+            headers: [("retry-after".to_string(), "0".to_string())].into(),
+            body: "busy".to_string(),
+        };
+        let rule = NetworkRule {
+            responses: vec![busy.clone(), response(200)],
+            ..respond_rule("api.example.com", &[], &[])
+        };
+        let (matcher, payloads) = matcher_with_payloads(vec![rule]);
+
+        let VerdictAction::Respond(rule) = matcher.evaluate("api.example.com", "/").action else {
+            panic!("expected a respond verdict");
+        };
+        assert_eq!(
+            payloads.responses[rule.index().get()],
+            [busy, response(200)]
+        );
+    }
+
+    fn allow_rule_with_header(domain: &str, name: &str) -> NetworkRule {
+        NetworkRule {
+            domain: domain.to_string(),
+            action: RuleAction::Allow,
+            response_headers: [(name.to_string(), "1".to_string())].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verdicts_index_their_rules_responses_and_headers() {
+        let (matcher, payloads) = matcher_with_payloads(vec![
+            allow_rule_with_header("a.example", "x-a"),
+            respond_rule("r.example", &[], &[529]),
+            NetworkRule {
+                domain: "plain.example".to_string(),
+                action: RuleAction::Allow,
+                ..Default::default()
+            },
+            allow_rule_with_header("b.example", "x-b"),
+            respond_rule("s.example", &[], &[418]),
+        ]);
+
+        for (domain, status) in [("r.example", 529), ("s.example", 418)] {
+            let VerdictAction::Respond(rule) = matcher.evaluate(domain, "/").action else {
+                panic!("expected a respond verdict for {domain}");
+            };
+            let indexed = &payloads.responses[rule.index().get()];
+            assert_eq!(indexed[0].status, status, "{domain}");
+        }
+        for (domain, name) in [("a.example", "x-a"), ("b.example", "x-b")] {
+            let VerdictAction::Allow {
+                response_headers: Some(index),
+            } = matcher.evaluate(domain, "/").action
+            else {
+                panic!("expected allow with headers for {domain}");
+            };
+            assert_eq!(payloads.headers[index.get()][0].0, name);
+        }
+        assert!(matches!(
+            matcher.evaluate("plain.example", "/").action,
+            VerdictAction::Allow {
+                response_headers: None
+            }
+        ));
+        assert_eq!(payloads.responses.len(), 2);
+        assert_eq!(payloads.headers.len(), 2);
+    }
+
+    #[test]
+    fn domain_needs_mitm_for_respond_and_response_headers() {
+        let matcher = matcher_for(vec![
+            respond_rule("mock.example.com", &[], &[200]),
+            NetworkRule {
+                domain: "headers.example.com".to_string(),
+                action: RuleAction::Allow,
+                response_headers: [("x-test-run".to_string(), "1".to_string())].into(),
+                ..Default::default()
+            },
+            NetworkRule {
+                domain: "blocked.example.com".to_string(),
+                action: RuleAction::Block,
+                ..Default::default()
+            },
+        ]);
+
+        assert!(matcher.domain_needs_mitm("mock.example.com"));
+        assert!(matcher.domain_needs_mitm("headers.example.com"));
+        assert!(!matcher.domain_needs_mitm("blocked.example.com"));
+        assert!(!matcher.domain_needs_mitm("other.example.com"));
+    }
+
+    #[test]
+    fn evaluate_domain_only_blocks_respond_rule_with_paths() {
+        let matcher = matcher_for(vec![respond_rule(
+            "api.anthropic.com",
+            &["/v1/messages"],
+            &[529],
+        )]);
+
+        let v = matcher.evaluate_domain_only("api.anthropic.com");
+        assert!(matches!(v.action, VerdictAction::Block));
+        assert_eq!(
+            v.reason,
+            "respond rule requires TLS interception: api.anthropic.com /v1/messages (respond)"
+        );
+        assert_eq!(
+            v.matched_rule.as_deref(),
+            Some("api.anthropic.com /v1/messages (respond)")
+        );
+        assert!(matcher.evaluate_domain_only("other.com").is_allowed());
     }
 }

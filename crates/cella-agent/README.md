@@ -11,7 +11,7 @@ cella-agent is a binary that runs inside dev containers started by cella. It is 
 1. **Port detection** — polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding
 2. **Port proxying** — rebinds localhost-bound listeners to `0.0.0.0` via `port_proxy` so they are reachable from outside the container
 3. **Forward proxy** — outbound HTTP/CONNECT proxy on `127.0.0.1` for egress filtering, enforcing network blocking rules via `forward_proxy`
-4. **MITM proxy** — HTTPS interception proxy for path-level blocking rules (works alongside the forward proxy via `mitm`)
+4. **MITM proxy** — HTTPS interception proxy for path-level rules, `respond` rules and `response_headers` (works alongside the forward proxy via `mitm`)
 5. **Browser interception** — handles `BROWSER` environment variable calls, forwarding URL open requests to the host (enables OAuth callbacks)
 6. **Credential forwarding** — forwards git credential requests to the host daemon for transparent authentication
 7. **Clipboard forwarding** — bidirectional clipboard sync (xsel/xclip) between container and host
@@ -49,8 +49,10 @@ cella-agent credential <operation>           # Handle git credential request (ge
 | `credential` | Handles git credential protocol (get/store/erase) by forwarding to host |
 | `control` | Host daemon communication — sends/receives messages over the control TCP connection |
 | `cli` | CLI mode for in-container `cella` commands (when agent binary is symlinked as `cella`) |
-| `forward_proxy` | Forward proxy for localhost-bound applications |
-| `mitm` | MITM proxy for HTTPS interception and path-level blocking |
+| `forward_proxy` | Forward proxy for localhost-bound applications; serves CONNECT and plain-HTTP requests with hyper, evaluating every request on a keep-alive connection |
+| `mitm` | MITM proxy for HTTPS interception and path-level blocking; connects upstream lazily on the first forwarded request |
+| `respond` | Per-request rule decision shared by the forward proxy and `mitm`: block, serve a `respond` rule's next response, or forward and set `response_headers` |
+| `proxy_http` | HTTP plumbing shared by the forward proxy and `mitm`: hop-by-hop header stripping, upgrade relaying, response builders, and the body type |
 | `doc_sync` | Claude Code document sync — watches `~/.claude.json` and both plugin manifests, sends merge patches to the daemon, applies canonical pushes back |
 | `proxy_config` | Network proxy configuration parsing and rule matching |
 | `clipboard` | Bidirectional clipboard forwarding — intercepts xsel/xclip calls and relays copy/paste/clear to the host daemon |

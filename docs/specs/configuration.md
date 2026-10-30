@@ -343,7 +343,20 @@ When `mode` is unset (`None`), the cella settings layer does not inject a mode o
 |---|---|---|---|
 | `domain` | `string` | *(required)* | Domain glob pattern |
 | `paths` | `string[]` | `[]` | Path glob patterns |
-| `action` | `string` | *(required)* | `"block"` or `"allow"` |
+| `action` | `string` | *(required)* | `"block"`, `"allow"`, or `"respond"` |
+| `responses` | `array` | `[]` | Responses a `"respond"` rule serves in order, the last one repeating; required for `"respond"` and invalid otherwise |
+| `response_headers` | `map<string, string>` | `{}` | Headers an `"allow"` rule sets on upstream responses; invalid on other actions |
+
+`"respond"`, `responses`, and `response_headers` are accepted only in `.devcontainer/cella.toml` and `~/.cella/config.toml` (or their `.json` forms), not in `customizations.cella`. See [network-proxy.md](network-proxy.md#respond-and-response-header-validation) for validation rules.
+
+#### `[[network.rules.responses]]`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `status` | `u16` | *(required)* | Status code, `200` to `599` |
+| `headers` | `map<string, string>` | `{}` | Response headers; no `content-type` is added automatically |
+| `body` | `string?` | *unset* | Inline response body |
+| `body_file` | `string?` | *unset* | File whose content becomes the body, relative to the declaring config file's directory; mutually exclusive with `body` |
 
 ### `[shell]`
 

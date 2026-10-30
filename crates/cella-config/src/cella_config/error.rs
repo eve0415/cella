@@ -39,4 +39,42 @@ pub enum CellaConfigError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Network(#[from] cella_network::NetworkConfigError),
+
+    #[error(
+        "network rule `{rule}` in customizations.cella uses `{field}`, which is only accepted in \
+         .devcontainer/cella.toml (or ~/.cella/config.toml); move the rule there"
+    )]
+    #[diagnostic(help(
+        "`action = \"respond\"`, `responses` and `response_headers` are cella config file settings"
+    ))]
+    RespondFieldInCustomizations { rule: String, field: String },
+
+    #[error("network rule `{rule}`: `{field}` sets both `body` and `body_file`; use one")]
+    ResponseBodyConflict { rule: String, field: String },
+
+    #[error(
+        "network rule `{rule}`: `{field}.body_file` ({path}) is not allowed because status {status} has no body",
+        path = path.display()
+    )]
+    ResponseBodyFileNotAllowed {
+        rule: String,
+        field: String,
+        status: u16,
+        path: PathBuf,
+    },
+
+    #[error(
+        "network rule `{rule}`: `{field}.body_file` ({path}): {problem}",
+        path = path.display()
+    )]
+    ResponseBodyFile {
+        rule: String,
+        field: String,
+        path: PathBuf,
+        problem: crate::settings::network::BodyFileProblem,
+    },
 }

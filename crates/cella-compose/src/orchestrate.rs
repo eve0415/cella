@@ -210,6 +210,28 @@ pub type DotfilesInstallFuture<'a> =
 pub type AgentLaunchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 
+/// Boxed future returned by [`ComposeUpHooks::post_create_setup`]: the
+/// lifecycle env on success.
+pub type PostCreateSetupFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// What [`ComposeUpHooks::post_create_setup`] sets up.
+pub struct PostCreateSetup<'a> {
+    pub container_id: &'a str,
+    pub remote_user: &'a str,
+    pub config: &'a serde_json::Value,
+    pub workspace_root: &'a Path,
+    pub remote_env: &'a [String],
+    /// The proxy forwarding validated at the start of compose up, so the
+    /// hook never reloads the cella config or re-reads a `body_file`.
+    pub proxy_fwd: Option<&'a cella_env::ProxyForwardingConfig>,
+}
+
 /// Callbacks for operations that live outside the orchestrator's dependency
 /// graph (daemon management, agent launch, etc.).
 pub trait ComposeUpHooks: Send + Sync {
@@ -253,12 +275,8 @@ pub trait ComposeUpHooks: Send + Sync {
     fn post_create_setup<'a>(
         &'a self,
         client: &'a dyn ContainerBackend,
-        container_id: &'a str,
-        remote_user: &'a str,
-        config: &'a serde_json::Value,
-        workspace_root: &'a Path,
-        remote_env: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
+        setup: PostCreateSetup<'a>,
+    ) -> PostCreateSetupFuture<'a>;
 
     /// Masker over the lifecycle `--secrets-file` values, used to redact
     /// secret values from compose lifecycle command output. Defaults to an
@@ -296,28 +314,89 @@ struct Ctx<'a> {
     cfg: &'a ComposeUpConfig<'a>,
     hooks: &'a dyn ComposeUpHooks,
     progress: &'a ProgressSender,
+    /// Proxy forwarding validated before the pipeline started.
+    proxy_fwd: Option<&'a cella_env::ProxyForwardingConfig>,
 }
 
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// Why [`compose_up`] failed.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+pub enum ComposeUpError {
+    /// The cella config could not be loaded or its network rules are invalid.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    CellaConfig(#[from] cella_config::cella_config::CellaConfigError),
+
+    /// Any later step of the compose pipeline failed.
+    #[error(transparent)]
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Run the Docker Compose orchestration flow.
 ///
 /// # Errors
 ///
-/// Returns an error if any step of the compose pipeline fails.
+/// Returns [`ComposeUpError::CellaConfig`] when the cella config or its
+/// network rules are invalid, and [`ComposeUpError::Other`] when any step of
+/// the compose pipeline fails.
 pub async fn compose_up(
     client: &dyn ContainerBackend,
     cfg: &ComposeUpConfig<'_>,
     hooks: &dyn ComposeUpHooks,
     progress: ProgressSender,
+) -> Result<ComposeUpResult, ComposeUpError> {
+    Box::pin(compose_up_with_global_dir(
+        client, cfg, hooks, progress, None,
+    ))
+    .await
+}
+
+/// [`compose_up`] with the global cella config read from `global_dir`
+/// (`None`: the user's own).
+async fn compose_up_with_global_dir(
+    client: &dyn ContainerBackend,
+    cfg: &ComposeUpConfig<'_>,
+    hooks: &dyn ComposeUpHooks,
+    progress: ProgressSender,
+    global_dir: Option<&Path>,
+) -> Result<ComposeUpResult, ComposeUpError> {
+    // Validate the network rules before anything else, so an invalid rule
+    // aborts reuse of a running project and a fresh start alike.
+    let proxy_fwd = build_proxy_forwarding_config(
+        cfg.resolved,
+        client.capabilities().managed_agent,
+        cfg.network_rule_policy,
+        global_dir,
+    )?;
+    Box::pin(run_compose_up(
+        client,
+        cfg,
+        hooks,
+        progress,
+        Some(&proxy_fwd),
+    ))
+    .await
+    .map_err(ComposeUpError::Other)
+}
+
+/// The compose pipeline after the network rules have been validated into
+/// `proxy_fwd`.
+async fn run_compose_up(
+    client: &dyn ContainerBackend,
+    cfg: &ComposeUpConfig<'_>,
+    hooks: &dyn ComposeUpHooks,
+    progress: ProgressSender,
+    proxy_fwd: Option<&cella_env::ProxyForwardingConfig>,
 ) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Ctx {
         client,
         cfg,
         hooks,
         progress: &progress,
+        proxy_fwd,
     };
     let config = cfg.config;
 
@@ -552,14 +631,11 @@ async fn resolve_user_and_env(
         cfg.omit_remote_env_from_metadata,
     );
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
-    let managed_agent = client.capabilities().managed_agent;
-    let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
-    let proxy_fwd = build_proxy_forwarding_config(cfg.resolved, managed_agent, skip_rules);
     let mut env_fwd = cella_env::prepare_env_forwarding(
         cfg.config,
         &remote_user,
         cfg.workspace_root,
-        proxy_fwd.as_ref(),
+        ctx.proxy_fwd,
         client.capabilities().ssh_agent,
     );
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
@@ -784,13 +860,16 @@ async fn finalize_compose(
     let lifecycle_env = hooks
         .post_create_setup(
             client,
-            &primary.id,
-            remote_user,
-            config,
-            cfg.workspace_root,
-            &lifecycle_remote_env,
+            PostCreateSetup {
+                container_id: &primary.id,
+                remote_user,
+                config,
+                workspace_root: cfg.workspace_root,
+                remote_env: &lifecycle_remote_env,
+                proxy_fwd: ctx.proxy_fwd,
+            },
         )
-        .await;
+        .await?;
 
     // 21. Run lifecycle phases (primary service only). Honor the lifecycle
     // gate: --skip-post-create drops everything, --prebuild and
@@ -2139,17 +2218,29 @@ where
 }
 
 /// Build proxy forwarding config from merged cella settings.
+///
+/// `global_dir` overrides the global cella config directory; `None` uses
+/// the user's own. Under [`cella_network::NetworkRulePolicy::Skip`] no rule
+/// is converted and no `body_file` is read.
+///
+/// # Errors
+///
+/// Returns the config error when the cella config cannot be loaded or its
+/// network rules are invalid; never falls back to an empty rule set.
 pub fn build_proxy_forwarding_config(
     resolved: &ResolvedConfig,
     managed_agent: bool,
-    skip_rules: bool,
-) -> Option<cella_env::ProxyForwardingConfig> {
-    let settings = cella_config::CellaConfig::load(&resolved.workspace_root, Some(resolved))
-        .unwrap_or_default();
+    policy: cella_network::NetworkRulePolicy,
+    global_dir: Option<&Path>,
+) -> Result<cella_env::ProxyForwardingConfig, cella_config::cella_config::CellaConfigError> {
+    let settings = cella_config::CellaConfig::load_with_global(
+        &resolved.workspace_root,
+        Some(resolved),
+        global_dir,
+    )?;
 
-    Some(cella_env::ProxyForwardingConfig::resolve(
-        settings.network.to_network_config(),
-        skip_rules,
+    Ok(cella_env::ProxyForwardingConfig::resolve(
+        settings.network.to_network_config(policy)?,
         settings.credentials.protect,
         managed_agent,
     ))
@@ -2399,6 +2490,239 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invalid_network_config_fails_proxy_forwarding_resolution() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(
+            devcontainer.join("cella.toml"),
+            "[[network.rules]]\ndomain = \"api.example.com\"\naction = \"respond\"\n",
+        )
+        .unwrap();
+        let mut resolved = resolved_with(
+            serde_json::json!({"image": "ubuntu"}),
+            serde_json::Value::Null,
+        );
+        resolved.workspace_root = ws.path().to_path_buf();
+        resolved.config_path = devcontainer.join("devcontainer.json");
+
+        let global = tempfile::TempDir::new().unwrap();
+
+        let Err(err) = build_proxy_forwarding_config(
+            &resolved,
+            true,
+            cella_network::NetworkRulePolicy::Enforce,
+            Some(global.path()),
+        ) else {
+            panic!("an invalid network rule must abort compose up, not run with no rules");
+        };
+        assert!(err.to_string().contains("api.example.com"), "{err}");
+    }
+
+    /// Run `compose_up` against a [`RecordingBackend`] in a compose workspace
+    /// whose `cella.toml` is `cella_toml`, with an empty global config dir.
+    /// Returns the error and the runtime calls made before it.
+    ///
+    /// [`RecordingBackend`]: cella_backend::testing::RecordingBackend
+    async fn compose_up_error(
+        cella_toml: &str,
+        policy: cella_network::NetworkRulePolicy,
+    ) -> (ComposeUpError, Vec<&'static str>) {
+        let ws = tempfile::TempDir::new().unwrap();
+        let global = tempfile::TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(devcontainer.join("cella.toml"), cella_toml).unwrap();
+        std::fs::write(
+            devcontainer.join("docker-compose.yml"),
+            "services:\n  app:\n    image: ubuntu\n",
+        )
+        .unwrap();
+        let mut resolved = resolved_with(
+            serde_json::json!({
+                "dockerComposeFile": "docker-compose.yml",
+                "service": "app",
+                "workspaceFolder": "/workspace",
+            }),
+            serde_json::Value::Null,
+        );
+        resolved.workspace_root = ws.path().to_path_buf();
+        resolved.config_path = devcontainer.join("devcontainer.json");
+
+        let mut cfg = compose_up_config(
+            &resolved,
+            &resolved.config,
+            &resolved.config_path,
+            &resolved.workspace_root,
+        );
+        cfg.network_rule_policy = policy;
+        let backend = cella_backend::testing::RecordingBackend::default();
+        let (tx, _) = tokio::sync::mpsc::channel(64);
+        let result = Box::pin(compose_up_with_global_dir(
+            &backend,
+            &cfg,
+            &TestHooks::default(),
+            ProgressSender::new(tx, false),
+            Some(global.path()),
+        ))
+        .await;
+        let Err(err) = result else {
+            panic!("compose up cannot succeed without a container runtime");
+        };
+        (err, backend.calls())
+    }
+
+    const INVALID_RESPOND_RULE: &str =
+        "[[network.rules]]\ndomain = \"api.example.com\"\naction = \"respond\"\n";
+
+    #[tokio::test]
+    async fn invalid_network_rule_aborts_compose_up_before_the_runtime() {
+        let (err, calls) = compose_up_error(
+            INVALID_RESPOND_RULE,
+            cella_network::NetworkRulePolicy::Enforce,
+        )
+        .await;
+        assert!(err.to_string().contains("api.example.com"), "{err}");
+        assert!(
+            calls.is_empty(),
+            "an invalid rule must abort before reuse or build: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_network_rule_keeps_its_diagnostic_code_in_compose_up() {
+        use miette::Diagnostic;
+
+        let (err, _) = compose_up_error(
+            INVALID_RESPOND_RULE,
+            cella_network::NetworkRulePolicy::Enforce,
+        )
+        .await;
+        assert_eq!(
+            err.code().map(|code| code.to_string()).as_deref(),
+            Some("cella::network::missing_responses"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_network_rules_do_not_read_body_file_in_compose_up() {
+        let (err, calls) = compose_up_error(
+            "[[network.rules]]\ndomain = \"api.example.com\"\naction = \"respond\"\n\
+             [[network.rules.responses]]\nstatus = 200\n\
+             body_file = \"/nonexistent/cella-test/missing.json\"\n",
+            cella_network::NetworkRulePolicy::Skip,
+        )
+        .await;
+        assert_eq!(calls.first(), Some(&"find_compose_service"), "{err}");
+    }
+
+    fn running_container() -> ContainerInfo {
+        ContainerInfo {
+            id: "primary-container-id".to_string(),
+            name: "cella-test-app-1".to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels: std::collections::HashMap::new(),
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            started_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: cella_backend::BackendKind::Docker,
+        }
+    }
+
+    fn project_in(workspace_root: &Path) -> ComposeProject {
+        ComposeProject {
+            project_name: "cella-test".to_string(),
+            compose_files: vec![],
+            override_file: workspace_root.join("override.yaml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspace".to_string(),
+            config_dir: workspace_root.to_path_buf(),
+            workspace_root: workspace_root.to_path_buf(),
+            config_hash: "hash123".to_string(),
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_create_setup_gets_the_proxy_config_validated_up_front() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let global = tempfile::TempDir::new().unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        let body_file = devcontainer.join("body.json");
+        std::fs::write(&body_file, "validated body").unwrap();
+        std::fs::write(
+            devcontainer.join("cella.toml"),
+            "[[network.rules]]\ndomain = \"api.example.com\"\naction = \"respond\"\n\
+             [[network.rules.responses]]\nstatus = 200\nbody_file = \"body.json\"\n",
+        )
+        .unwrap();
+        let mut resolved = resolved_with(
+            serde_json::json!({"image": "ubuntu"}),
+            serde_json::Value::Null,
+        );
+        resolved.workspace_root = ws.path().to_path_buf();
+        resolved.config_path = devcontainer.join("devcontainer.json");
+
+        let proxy_fwd = build_proxy_forwarding_config(
+            &resolved,
+            true,
+            cella_network::NetworkRulePolicy::Enforce,
+            Some(global.path()),
+        )
+        .unwrap();
+        let validated = proxy_responses(Some(&proxy_fwd));
+        assert!(
+            validated
+                .as_ref()
+                .is_some_and(|responses| responses.iter().any(|r| r.body == "validated body")),
+            "precondition: validation inlines the body: {validated:?}"
+        );
+        // Anything that re-read the body after validation would now fail.
+        std::fs::remove_file(&body_file).unwrap();
+
+        let cfg = compose_up_config(
+            &resolved,
+            &resolved.config,
+            &resolved.config_path,
+            &resolved.workspace_root,
+        );
+        let backend =
+            cella_backend::testing::RecordingBackend::with_running_container(running_container());
+        let hooks = TestHooks::default();
+        let (tx, _) = tokio::sync::mpsc::channel(64);
+        let progress = ProgressSender::new(tx, false);
+        let ctx = Ctx {
+            client: &backend,
+            cfg: &cfg,
+            hooks: &hooks,
+            progress: &progress,
+            proxy_fwd: Some(&proxy_fwd),
+        };
+        // Only the hook call matters; whatever follows it may fail.
+        let _ =
+            finalize_compose(&ctx, &project_in(ws.path()), "vscode", None, "x86_64", None).await;
+
+        assert_eq!(
+            *hooks.post_create_responses.lock().unwrap(),
+            vec![validated],
+            "backend calls: {:?}",
+            backend.calls()
+        );
+    }
+
     /// A substituted config and its raw snapshot that differ, so a writer
     /// that persists the wrong one is caught.
     fn substituted_and_raw() -> (serde_json::Value, serde_json::Value) {
@@ -2524,6 +2848,71 @@ mod tests {
         assert_ne!(&base, changed);
     }
 
+    /// Hooks that do nothing but record, per `post_create_setup` call, the
+    /// responses of the proxy config it was given.
+    #[derive(Default)]
+    struct TestHooks {
+        post_create_responses: std::sync::Mutex<Vec<Option<Vec<cella_network::ResponseSpec>>>>,
+    }
+
+    /// Every `respond` response in `proxy_fwd`'s rules.
+    fn proxy_responses(
+        proxy_fwd: Option<&cella_env::ProxyForwardingConfig>,
+    ) -> Option<Vec<cella_network::ResponseSpec>> {
+        let rules = &proxy_fwd?.full_config.as_ref()?.rules;
+        Some(rules.iter().flat_map(|r| r.responses.clone()).collect())
+    }
+
+    impl ComposeUpHooks for TestHooks {
+        fn daemon_env<'a>(
+            &'a self,
+            _container_name: &'a str,
+            _host_gateway: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+            Box::pin(async { vec![] })
+        }
+
+        fn sync_agent_runtime<'a>(
+            &'a self,
+            _client: &'a dyn ContainerBackend,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn register_container<'a>(
+            &'a self,
+            _client: &'a dyn ContainerBackend,
+            _container_id: &'a str,
+            _config: &'a serde_json::Value,
+            _container_name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn launch_agent<'a>(
+            &'a self,
+            _client: &'a dyn ContainerBackend,
+            _container_id: &'a str,
+            _agent_arch: &'a str,
+            wait_for_proxy: bool,
+        ) -> AgentLaunchFuture<'a> {
+            let _ = wait_for_proxy;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn post_create_setup<'a>(
+            &'a self,
+            _: &'a dyn ContainerBackend,
+            setup: PostCreateSetup<'a>,
+        ) -> PostCreateSetupFuture<'a> {
+            self.post_create_responses
+                .lock()
+                .unwrap()
+                .push(proxy_responses(setup.proxy_fwd));
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
     /// Test that `lifecycle_secret_masker` from the trait default is passthrough,
     /// and that a non-empty masker built from `SecretMasker::new` actually redacts.
     ///
@@ -2535,62 +2924,7 @@ mod tests {
     /// the non-default value produced by `SecretMasker::new` actually masks.
     #[test]
     fn lifecycle_secret_masker_trait_default_is_passthrough() {
-        use std::future::Future;
-        use std::pin::Pin;
-
-        struct NoopHooks;
-
-        impl ComposeUpHooks for NoopHooks {
-            fn daemon_env<'a>(
-                &'a self,
-                _container_name: &'a str,
-                _host_gateway: &'a str,
-            ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
-                Box::pin(async { vec![] })
-            }
-
-            fn sync_agent_runtime<'a>(
-                &'a self,
-                _client: &'a dyn ContainerBackend,
-            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-                Box::pin(async {})
-            }
-
-            fn register_container<'a>(
-                &'a self,
-                _client: &'a dyn ContainerBackend,
-                _container_id: &'a str,
-                _config: &'a serde_json::Value,
-                _container_name: &'a str,
-            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-                Box::pin(async {})
-            }
-
-            fn launch_agent<'a>(
-                &'a self,
-                _client: &'a dyn ContainerBackend,
-                _container_id: &'a str,
-                _agent_arch: &'a str,
-                wait_for_proxy: bool,
-            ) -> AgentLaunchFuture<'a> {
-                let _ = wait_for_proxy;
-                Box::pin(async { Ok(()) })
-            }
-
-            fn post_create_setup<'a>(
-                &'a self,
-                _client: &'a dyn ContainerBackend,
-                _container_id: &'a str,
-                _remote_user: &'a str,
-                _config: &'a serde_json::Value,
-                _workspace_root: &'a Path,
-                _remote_env: &'a [String],
-            ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
-                Box::pin(async { vec![] })
-            }
-        }
-
-        let hooks = NoopHooks;
+        let hooks = TestHooks::default();
 
         // Default impl returns an empty (passthrough) masker.
         let default_masker = hooks.lifecycle_secret_masker();

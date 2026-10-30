@@ -388,14 +388,14 @@ Existing user-specified `NO_PROXY` entries are preserved. Duplicates are suppres
 
 ### Agent Proxy Mode
 
-When network blocking rules are active (allowlist or denylist mode), proxy env vars point to the cella-agent's in-container forward proxy instead of the upstream proxy:
+When any network rule is configured (in allowlist or denylist mode), or credential protection is on, proxy env vars point to the cella-agent's in-container forward proxy instead of the upstream proxy:
 
 ```
 HTTP_PROXY=http://127.0.0.1:<proxy_port>
 HTTPS_PROXY=http://127.0.0.1:<proxy_port>
 ```
 
-The agent proxy config is delivered as a JSON file at `/tmp/.cella/proxy-config.json` with `0600` permissions (the file contains the CA private key when path-level blocking rules require MITM inspection). The `CELLA_PROXY_CONFIG` env var tells the agent where to find this file.
+The agent proxy config is delivered as a JSON file at `/tmp/.cella/proxy-config.json` with `0600` permissions (the file contains the CA private key when rules or credential protection require MITM inspection, and the inlined bodies of `respond` rules). The `CELLA_PROXY_CONFIG` env var tells the agent where to find this file.
 
 The proxy config includes:
 
@@ -403,10 +403,10 @@ The proxy config includes:
 |---|---|
 | `listen_port` | Agent proxy listen port |
 | `mode` | `denylist` or `allowlist` |
-| `rules` | Domain/path rules with `block`/`allow` actions |
+| `rules` | Domain/path rules with `block`/`allow`/`respond` actions, plus `responses` for `respond` rules and `response_headers` for `allow` rules |
 | `upstream_proxy` | Upstream proxy URL (from host env or config) |
-| `ca_cert_pem` | MITM CA certificate (when path rules are present) |
-| `ca_key_pem` | MITM CA private key (when path rules are present) |
+| `ca_cert_pem` | MITM CA certificate (when a rule has path patterns, is a `respond` rule, or has `response_headers`, or credential protection is on) |
+| `ca_key_pem` | MITM CA private key (under the same condition as `ca_cert_pem`) |
 
 When credential protection is also active, credential routes and daemon connection info are injected into the same config file. See [Credential Protection](credential-protection.md) for details.
 

@@ -418,6 +418,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "hex",
+ "http",
  "indicatif",
  "inquire",
  "insta",

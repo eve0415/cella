@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use cella_config::settings::CustomCredentialProvider;
+use cella_config::settings::{Credentials, CustomCredentialProvider};
 use cella_env::credential_providers::{self, CustomProviderInput, MergedProvider};
 use cella_protocol::PhantomTokenEntry;
 use tracing::{info, warn};
@@ -18,8 +18,43 @@ pub struct PhantomTokenSet {
 
 /// Generate phantom tokens for all detected credential providers.
 pub fn generate_phantom_tokens(settings: &cella_config::CellaConfig) -> PhantomTokenSet {
-    let custom_inputs: Vec<CustomProviderInput<'_>> = settings
-        .credentials
+    phantom_tokens_for(
+        &settings.credentials,
+        host_env,
+        cella_env::gh_credential::gh_is_authenticated,
+    )
+}
+
+/// Phantom tokens for every provider [`provider_selected`] picks, probing the
+/// host through `env` and `gh_authenticated`.
+fn phantom_tokens_for(
+    credentials: &Credentials,
+    env: impl Fn(&str) -> Option<String>,
+    gh_authenticated: impl Fn() -> bool,
+) -> PhantomTokenSet {
+    let mut entries = Vec::new();
+    let mut gh_phantom = None;
+
+    for provider in merged_providers(credentials) {
+        if !provider_selected(credentials, &provider, &env, &gh_authenticated) {
+            continue;
+        }
+        let token = format!("pt-{}", uuid::Uuid::new_v4());
+        if provider.id == "github" {
+            gh_phantom = Some(token.clone());
+        }
+        entries.push(build_entry(&provider, token));
+    }
+
+    PhantomTokenSet {
+        entries,
+        gh_phantom,
+    }
+}
+
+/// Built-in credential providers merged with the custom ones in `credentials`.
+pub fn merged_providers(credentials: &Credentials) -> Vec<MergedProvider> {
+    let custom_inputs: Vec<CustomProviderInput<'_>> = credentials
         .providers
         .iter()
         .map(|c| CustomProviderInput {
@@ -30,38 +65,30 @@ pub fn generate_phantom_tokens(settings: &cella_config::CellaConfig) -> PhantomT
             prefix: &c.prefix,
         })
         .collect();
+    credential_providers::merge_with_custom(&custom_inputs)
+}
 
-    let providers = credential_providers::merge_with_custom(&custom_inputs);
-
-    let mut entries = Vec::new();
-    let mut gh_phantom = None;
-
-    let ai = &settings.credentials.ai;
-
-    for provider in &providers {
-        if provider.id == "github" {
-            if settings.credentials.gh && cella_env::gh_credential::gh_is_authenticated() {
-                let token = format!("pt-{}", uuid::Uuid::new_v4());
-                gh_phantom = Some(token.clone());
-                entries.push(build_entry(provider, token));
-            }
-            continue;
-        }
-
-        if !ai.enabled || !ai.is_provider_enabled(&provider.id) {
-            continue;
-        }
-
-        if has_env_var(&provider.env_var) {
-            let token = format!("pt-{}", uuid::Uuid::new_v4());
-            entries.push(build_entry(provider, token));
-        }
+/// Whether `provider` gets a phantom token, and so a credential route.
+///
+/// GitHub is selected when gh forwarding is on and `gh_authenticated` reports
+/// the host `gh` logged in; the probe runs only in that case. Every other
+/// provider is selected when AI forwarding enables it and `env` returns a
+/// non-empty value for its environment variable.
+pub fn provider_selected(
+    credentials: &Credentials,
+    provider: &MergedProvider,
+    env: impl Fn(&str) -> Option<String>,
+    gh_authenticated: impl Fn() -> bool,
+) -> bool {
+    if provider.id == "github" {
+        return credentials.gh && gh_authenticated();
     }
+    credentials.ai.is_provider_enabled(&provider.id)
+        && env(&provider.env_var).is_some_and(|v| !v.is_empty())
+}
 
-    PhantomTokenSet {
-        entries,
-        gh_phantom,
-    }
+fn host_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 fn build_entry(provider: &MergedProvider, phantom_token: String) -> PhantomTokenEntry {
@@ -73,10 +100,6 @@ fn build_entry(provider: &MergedProvider, phantom_token: String) -> PhantomToken
         header: provider.header.clone(),
         prefix: provider.prefix.clone(),
     }
-}
-
-fn has_env_var(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
 /// Register phantom tokens with the daemon via management socket.
@@ -164,39 +187,88 @@ pub fn read_daemon_connection_info(
 }
 
 /// Generate phantom tokens and inject credential routes into the proxy config.
+///
+/// Returns the routes injected, which is none when no provider is selected,
+/// the daemon is not reachable, or there is no proxy config to patch.
 pub fn inject_routes_into_proxy_config(
     settings: &cella_config::CellaConfig,
     container_name: &str,
     env_fwd: &mut cella_env::EnvForwarding,
-) {
+) -> Vec<cella_env::proxy::CredentialRouteConfig> {
     let phantom_set = generate_phantom_tokens(settings);
     if phantom_set.entries.is_empty() {
-        return;
+        return Vec::new();
     }
     let routes = build_credential_routes(&phantom_set.entries);
     let Some(daemon) = read_daemon_connection_info(container_name) else {
-        return;
+        return Vec::new();
     };
-    patch_proxy_config(env_fwd, &routes, &daemon);
+    if patch_proxy_config(env_fwd, &routes, &daemon) {
+        routes
+    } else {
+        Vec::new()
+    }
 }
 
-/// Inject credential routes into the proxy config file upload.
+/// Inject credential routes into the proxy config file upload, returning
+/// whether there was one to patch.
 pub fn patch_proxy_config(
     env_fwd: &mut cella_env::EnvForwarding,
     routes: &[cella_env::proxy::CredentialRouteConfig],
     daemon: &cella_env::proxy::DaemonConnectionInfo,
-) {
+) -> bool {
     let proxy_config_path = cella_env::PROXY_CONFIG_PATH;
-    if let Some(upload) = env_fwd
+    let Some(upload) = env_fwd
         .post_start
         .file_uploads
         .iter_mut()
         .find(|f| f.container_path == proxy_config_path)
-    {
-        let base_json = String::from_utf8_lossy(&upload.content);
-        let patched = cella_env::proxy::inject_credential_routes(&base_json, routes, daemon);
-        upload.content = patched.into_bytes();
-    }
+    else {
+        return false;
+    };
+    let base_json = String::from_utf8_lossy(&upload.content);
+    let patched = cella_env::proxy::inject_credential_routes(&base_json, routes, daemon);
+    upload.content = patched.into_bytes();
+    true
+}
+
+/// Warnings for the rules a credential route keeps from applying.
+///
+/// The agent hands requests for a routed domain to the credential proxy before
+/// it evaluates network rules, so a `respond` rule or an `allow` rule's
+/// response headers never reach that domain. Block and plain allow rules are
+/// not listed. A wildcard rule is listed for each routed domain it matches; it
+/// still applies to the other domains it matches.
+pub fn shadowed_rule_warnings(
+    rules: &[cella_network::NetworkRule],
+    routes: &[cella_env::proxy::CredentialRouteConfig],
+) -> Vec<String> {
+    let routed: std::collections::BTreeSet<&str> =
+        routes.iter().map(|r| r.domain.as_str()).collect();
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.action == cella_network::RuleAction::Respond || !rule.response_headers.is_empty()
+        })
+        .flat_map(|rule| {
+            // Every rule left needs MITM, so this is the matcher's own domain
+            // match against the rule's pattern.
+            let matcher = cella_network::RuleMatcher::new(&cella_network::NetworkConfig {
+                rules: vec![rule.clone()],
+                ..Default::default()
+            });
+            routed
+                .iter()
+                .filter(move |domain| matcher.domain_needs_mitm(domain))
+                .map(move |domain| {
+                    format!(
+                        "Network rule `{}: {}` does not apply to {domain}: credential protection routes that domain to the credential proxy, which takes precedence over network rules.",
+                        rule.action.as_str(),
+                        rule.label()
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Add the credential protection label to container labels.
@@ -308,6 +380,217 @@ mod tests {
             header: "Authorization".to_string(),
             prefix: "Bearer ".to_string(),
         }
+    }
+
+    fn env_of<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    fn merged(credentials: &Credentials, id: &str) -> MergedProvider {
+        merged_providers(credentials)
+            .into_iter()
+            .find(|p| p.id == id)
+            .expect("provider is merged")
+    }
+
+    fn internal_credentials() -> Credentials {
+        Credentials {
+            providers: vec![CustomCredentialProvider {
+                name: "internal".to_string(),
+                env: "INTERNAL_KEY".to_string(),
+                domains: vec!["api.internal.example".to_string()],
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provider_not_selected_without_env_var() {
+        let credentials = Credentials::default();
+        let anthropic = merged(&credentials, "anthropic");
+        assert!(!provider_selected(
+            &credentials,
+            &anthropic,
+            env_of(&[]),
+            || false
+        ));
+        assert!(!provider_selected(
+            &credentials,
+            &anthropic,
+            env_of(&[("ANTHROPIC_API_KEY", "")]),
+            || false
+        ));
+        assert!(provider_selected(
+            &credentials,
+            &anthropic,
+            env_of(&[("ANTHROPIC_API_KEY", "sk-test")]),
+            || false
+        ));
+    }
+
+    #[test]
+    fn ai_providers_not_selected_when_ai_disabled() {
+        let mut credentials = Credentials::default();
+        credentials.ai.enabled = false;
+        let anthropic = merged(&credentials, "anthropic");
+        let env = env_of(&[("ANTHROPIC_API_KEY", "sk-test")]);
+        assert!(!provider_selected(&credentials, &anthropic, env, || false));
+    }
+
+    #[test]
+    fn disabled_provider_not_selected() {
+        let mut credentials = Credentials::default();
+        credentials
+            .ai
+            .providers
+            .insert("anthropic".to_string(), false);
+        let vars = [
+            ("ANTHROPIC_API_KEY", "sk-test"),
+            ("OPENAI_API_KEY", "sk-test"),
+        ];
+        let anthropic = merged(&credentials, "anthropic");
+        let openai = merged(&credentials, "openai");
+        assert!(!provider_selected(
+            &credentials,
+            &anthropic,
+            env_of(&vars),
+            || false
+        ));
+        assert!(provider_selected(
+            &credentials,
+            &openai,
+            env_of(&vars),
+            || false
+        ));
+    }
+
+    #[test]
+    fn custom_provider_selected_when_env_present() {
+        let credentials = internal_credentials();
+        let internal = merged(&credentials, "internal");
+        assert!(provider_selected(
+            &credentials,
+            &internal,
+            env_of(&[("INTERNAL_KEY", "secret")]),
+            || false
+        ));
+        assert!(!provider_selected(
+            &credentials,
+            &internal,
+            env_of(&[]),
+            || false
+        ));
+    }
+
+    #[test]
+    fn github_selected_only_when_forwarded_and_authenticated() {
+        let mut credentials = Credentials::default();
+        let github = merged(&credentials, "github");
+        assert!(provider_selected(
+            &credentials,
+            &github,
+            env_of(&[]),
+            || true
+        ));
+        assert!(!provider_selected(
+            &credentials,
+            &github,
+            env_of(&[]),
+            || false
+        ));
+        credentials.gh = false;
+        assert!(!provider_selected(
+            &credentials,
+            &github,
+            env_of(&[]),
+            || { panic!("gh probed with gh forwarding off") }
+        ));
+    }
+
+    /// Routes `phantom_tokens_for` decides with `env` and gh logged out.
+    fn routes_with(
+        credentials: &Credentials,
+        vars: &[(&str, &str)],
+    ) -> Vec<cella_env::proxy::CredentialRouteConfig> {
+        build_credential_routes(&phantom_tokens_for(credentials, env_of(vars), || false).entries)
+    }
+
+    fn net_rule(domain: &str, action: cella_network::RuleAction) -> cella_network::NetworkRule {
+        cella_network::NetworkRule {
+            domain: domain.to_string(),
+            paths: vec!["/v1/messages".to_string()],
+            action,
+            ..Default::default()
+        }
+    }
+
+    fn header_rule(domain: &str) -> cella_network::NetworkRule {
+        let mut rule = net_rule(domain, cella_network::RuleAction::Allow);
+        rule.response_headers
+            .insert("x-test-run".to_string(), "1".to_string());
+        rule
+    }
+
+    const ANTHROPIC_KEY: [(&str, &str); 1] = [("ANTHROPIC_API_KEY", "sk-test")];
+
+    #[test]
+    fn shadowed_rule_warnings_name_rules_on_routed_domains() {
+        let rules = [
+            net_rule("api.anthropic.com", cella_network::RuleAction::Respond),
+            header_rule("api.anthropic.com"),
+        ];
+        let routes = routes_with(&Credentials::default(), &ANTHROPIC_KEY);
+        assert_eq!(
+            shadowed_rule_warnings(&rules, &routes),
+            [
+                "Network rule `respond: api.anthropic.com [/v1/messages]` does not apply to api.anthropic.com: credential protection routes that domain to the credential proxy, which takes precedence over network rules.",
+                "Network rule `allow: api.anthropic.com [/v1/messages]` does not apply to api.anthropic.com: credential protection routes that domain to the credential proxy, which takes precedence over network rules.",
+            ]
+        );
+    }
+
+    #[test]
+    fn shadowed_rule_warnings_need_a_route() {
+        let rules = [net_rule(
+            "api.anthropic.com",
+            cella_network::RuleAction::Respond,
+        )];
+        let routes = routes_with(&Credentials::default(), &[]);
+        assert!(shadowed_rule_warnings(&rules, &routes).is_empty());
+    }
+
+    #[test]
+    fn shadowed_rule_warnings_skip_rules_routing_does_not_shadow() {
+        let rules = [
+            net_rule("api.anthropic.com", cella_network::RuleAction::Block),
+            net_rule("api.anthropic.com", cella_network::RuleAction::Allow),
+            net_rule("api.openai.com", cella_network::RuleAction::Respond),
+        ];
+        let routes = routes_with(&Credentials::default(), &ANTHROPIC_KEY);
+        assert!(shadowed_rule_warnings(&rules, &routes).is_empty());
+    }
+
+    #[test]
+    fn shadowed_rule_warnings_list_wildcard_rules_with_the_routed_domain() {
+        let rules = [net_rule(
+            "*.anthropic.com",
+            cella_network::RuleAction::Respond,
+        )];
+        let routes = routes_with(&Credentials::default(), &ANTHROPIC_KEY);
+        let warnings = shadowed_rule_warnings(&rules, &routes);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with(
+                "Network rule `respond: *.anthropic.com [/v1/messages]` does not apply to api.anthropic.com:"
+            ),
+            "{warnings:?}"
+        );
     }
 
     #[test]

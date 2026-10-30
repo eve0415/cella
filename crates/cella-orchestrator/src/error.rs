@@ -28,6 +28,11 @@ pub enum OrchestratorError {
     )]
     HostRequirements { message: String },
 
+    /// The cella config could not be loaded or its network rules are invalid.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    CellaConfig(#[from] cella_config::cella_config::CellaConfigError),
+
     #[error("{message}")]
     #[diagnostic(code(cella::orchestrator::other))]
     Other { message: String },

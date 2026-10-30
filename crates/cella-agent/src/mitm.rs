@@ -1,61 +1,256 @@
-use std::sync::{Arc, OnceLock};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::task::{Context, Poll};
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::BodyExt;
+use hyper::body::{Body, Incoming};
+use hyper::client::conn::TrySendError;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{CertificateParams, DnType, DnValue, IsCa, Issuer, KeyPair, SanType};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use crate::proxy_config::AgentProxyConfig;
-
-type BoxBody =
-    http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+use crate::proxy_http::{
+    BoxBody, GatewayError, Sent, await_pooled, full, has_invalid_token_lines, is_websocket_upgrade,
+    offer_only_websocket, relay_upgrade, strip_hop_by_hop, text_response,
+};
+use crate::respond::{self, Channel, Decision};
 
 static NATIVE_ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
 
-enum UpstreamSender {
-    Http1(hyper::client::conn::http1::SendRequest<Incoming>),
-    Http2(hyper::client::conn::http2::SendRequest<Incoming>),
+/// Extra upstream connections one intercepted client connection may open,
+/// beyond the first, while every open one is busy with an earlier response.
+/// Past these, a request waits for an open one to come free.
+const MAX_EXTRA_UPSTREAMS: usize = 8;
+
+/// The upstream connections of one intercepted client connection, opened
+/// lazily.
+struct Upstream<B = Incoming> {
+    /// Open connections: one for an HTTP/2 upstream, and for an HTTP/1.1
+    /// upstream another whenever every open one is still busy.
+    senders: Mutex<Senders<B>>,
+    /// Held while opening a connection when none is open, so requests that
+    /// arrive together share the first connection rather than each opening
+    /// their own.
+    first_connect: tokio::sync::Mutex<()>,
+    /// Held by the one request watching for a busy connection to come free,
+    /// so requests that find every connection busy and none to add wait in
+    /// turn instead of each polling the connections.
+    waiting: tokio::sync::Mutex<()>,
+    /// One permit per open connection, released when the connection ends.
+    permits: Arc<Semaphore>,
+    /// Notified whenever a connection joins or leaves `senders`, so the
+    /// waiting request watches the connections open now rather than those
+    /// open when it started waiting.
+    changed: Notify,
 }
 
-impl UpstreamSender {
-    async fn send_request(&mut self, req: Request<Incoming>) -> hyper::Result<Response<Incoming>> {
-        match self {
-            Self::Http1(s) => s.send_request(req).await,
-            Self::Http2(s) => s.send_request(req).await,
+/// What a request finds once it has waited out every connection being busy.
+enum Room {
+    /// An open connection came free, or closed.
+    Freed,
+    /// Another connection may be opened.
+    New(OwnedSemaphorePermit),
+}
+
+impl<B> Upstream<B> {
+    fn new() -> Self {
+        Self {
+            senders: Mutex::new(Senders(Vec::new())),
+            first_connect: tokio::sync::Mutex::new(()),
+            waiting: tokio::sync::Mutex::new(()),
+            permits: Arc::new(Semaphore::new(1 + MAX_EXTRA_UPSTREAMS)),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Reserve room for one more open connection, waiting while the most
+    /// are open.
+    async fn reserve(&self) -> Result<OwnedSemaphorePermit, String> {
+        Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("upstream connection limit: {e}"))
+    }
+
+    /// Wait until a busy connection comes free or another may be opened,
+    /// preferring a free one.
+    ///
+    /// Each pass registers for a change to the open connections before
+    /// looking at them, so a connection added after the look wakes it, and
+    /// one added before, even while it waited for its turn, is in the look.
+    async fn room(&self) -> Result<Room, String> {
+        if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+            return Ok(Room::New(permit));
+        }
+        let turn = self.waiting.lock().await;
+        let room = loop {
+            let mut changed = std::pin::pin!(self.changed.notified());
+            changed.as_mut().enable();
+            tokio::select! {
+                biased;
+                () = std::future::poll_fn(|cx| self.poll_freed(cx)) => break Room::Freed,
+                () = changed => {}
+                permit = self.reserve() => break Room::New(permit?),
+            }
+        };
+        drop(turn);
+        Ok(room)
+    }
+
+    /// The open connections, with those that closed dropped.
+    fn open_senders(&self) -> MutexGuard<'_, Senders<B>> {
+        let mut senders = self.senders();
+        if senders.prune_closed() {
+            self.changed.notify_waiters();
+        }
+        senders
+    }
+
+    /// Ready once an open connection can take a request or has closed.
+    fn poll_freed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self
+            .senders()
+            .0
+            .iter_mut()
+            .any(|sender| sender.poll_ready(cx).is_ready())
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// The open connections, locked only for synchronous bookkeeping.
+    fn senders(&self) -> MutexGuard<'_, Senders<B>> {
+        self.senders.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<B: Body + Send + 'static> Upstream<B> {
+    /// Start `req` on the first open connection that can take it now.
+    fn checkout(&self, req: Request<B>) -> Checkout<B> {
+        self.open_senders().checkout(req)
+    }
+
+    /// Keep a newly opened connection and start `req` on it.
+    fn add(&self, mut sender: UpstreamSender<B>, req: Request<B>) -> SendFuture<B> {
+        let sending = sender.try_send(req);
+        self.senders().0.push(sender);
+        self.changed.notify_waiters();
+        sending
+    }
+}
+
+/// A request started on an upstream connection.
+type SendFuture<B> =
+    Pin<Box<dyn Future<Output = Result<Response<Incoming>, TrySendError<Request<B>>>> + Send>>;
+
+/// Where a request can go among the open upstream connections.
+enum Checkout<B> {
+    /// Started on an open connection that was free.
+    Sent(SendFuture<B>),
+    /// Every open connection is busy with an earlier response.
+    Busy(Request<B>),
+    /// No connection is open.
+    Vacant(Request<B>),
+}
+
+struct Senders<B>(Vec<UpstreamSender<B>>);
+
+impl<B> Senders<B> {
+    /// Drop the closed connections, returning whether there were any.
+    fn prune_closed(&mut self) -> bool {
+        let open = self.0.len();
+        self.0.retain(|sender| !sender.is_closed());
+        self.0.len() != open
+    }
+}
+
+impl<B: Body + Send + 'static> Senders<B> {
+    /// Start `req` on the first connection that can take it now. Closed
+    /// connections must already be pruned.
+    fn checkout(&mut self, req: Request<B>) -> Checkout<B> {
+        if self.0.is_empty() {
+            return Checkout::Vacant(req);
+        }
+        match self.0.iter_mut().find(|sender| sender.is_ready()) {
+            Some(sender) => Checkout::Sent(sender.try_send(req)),
+            None => Checkout::Busy(req),
         }
     }
 }
 
-pub async fn intercept_tls(
-    client: TcpStream,
-    host: &str,
-    port: u16,
-    config: Arc<AgentProxyConfig>,
-) {
+enum UpstreamSender<B = Incoming> {
+    Http1(hyper::client::conn::http1::SendRequest<B>),
+    Http2(hyper::client::conn::http2::SendRequest<B>),
+}
+
+impl<B> UpstreamSender<B> {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Http1(s) => s.is_closed(),
+            Self::Http2(s) => s.is_closed(),
+        }
+    }
+
+    /// Whether a request can go out now without waiting for an earlier
+    /// response on this connection to finish.
+    fn is_ready(&self) -> bool {
+        match self {
+            Self::Http1(s) => s.is_ready(),
+            Self::Http2(s) => s.is_ready(),
+        }
+    }
+
+    /// Ready once a request can go out without waiting, or the connection
+    /// closed. Only one task may wait on a connection at a time: a second
+    /// one takes over the wake-up from the first.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<hyper::Result<()>> {
+        match self {
+            Self::Http1(s) => s.poll_ready(cx),
+            Self::Http2(s) => s.poll_ready(cx),
+        }
+    }
+}
+
+impl<B: Body + Send + 'static> UpstreamSender<B> {
+    /// Start `req` without waiting for the connection to become ready. The
+    /// returned future does not borrow the sender.
+    fn try_send(&mut self, req: Request<B>) -> SendFuture<B> {
+        match self {
+            Self::Http1(s) => Box::pin(s.try_send_request(req)),
+            Self::Http2(s) => Box::pin(s.try_send_request(req)),
+        }
+    }
+}
+
+pub async fn intercept_tls<S>(client: S, host: &str, port: u16, config: Arc<AgentProxyConfig>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some(client_tls) = accept_client_tls(client, host, &config).await else {
         return;
     };
-    let Some(sender) = connect_upstream_tls(host, port, &config).await else {
-        return;
-    };
 
-    let sender = Arc::new(Mutex::new(sender));
+    // Connected on the first forwarded request, so a connection answered
+    // entirely by `respond` rules (or the credential route) never opens one.
+    let upstream = Arc::new(Upstream::new());
     let host_owned: Arc<str> = host.into();
     let client_io = TokioIo::new(client_tls);
 
     let svc = service_fn(move |req: Request<Incoming>| {
-        let sender = sender.clone();
+        let upstream = upstream.clone();
         let host = host_owned.clone();
         let config = config.clone();
-        async move { handle_request(req, &host, port, &config, &sender).await }
+        async move { handle_request(req, &host, port, &config, &upstream).await }
     });
 
     let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -64,11 +259,14 @@ pub async fn intercept_tls(
     }
 }
 
-async fn accept_client_tls(
-    client: TcpStream,
+async fn accept_client_tls<S>(
+    client: S,
     host: &str,
     config: &AgentProxyConfig,
-) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let tls_config = match generate_server_config(host, config) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -88,39 +286,25 @@ async fn accept_client_tls(
     }
 }
 
+/// Open an upstream connection whose task holds `permit` until it ends.
 async fn connect_upstream_tls(
     host: &str,
     port: u16,
     config: &AgentProxyConfig,
-) -> Option<UpstreamSender> {
-    let upstream_tcp =
-        match super::forward_proxy::connect_upstream_for_mitm(host, port, config).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to connect to {host}:{port}: {e}");
-                config.log_error(host, &format!("upstream connect failed: {e}"));
-                return None;
-            }
-        };
+    permit: OwnedSemaphorePermit,
+) -> Result<UpstreamSender, String> {
+    let upstream_tcp = super::forward_proxy::connect_upstream_for_mitm(host, port, config)
+        .await
+        .map_err(|e| format!("upstream connect failed: {e}"))?;
 
     let extra = config.ca_cert_der.as_ref().map(std::slice::from_ref);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(extra)));
-    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
-        Ok(sn) => sn,
-        Err(e) => {
-            warn!("Invalid server name {host}: {e}");
-            return None;
-        }
-    };
-
-    let upstream_tls = match connector.connect(server_name, upstream_tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Upstream TLS handshake failed for {host}: {e}");
-            config.log_error(host, &format!("upstream TLS failed: {e}"));
-            return None;
-        }
-    };
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid server name: {e}"))?;
+    let upstream_tls = connector
+        .connect(server_name, upstream_tcp)
+        .await
+        .map_err(|e| format!("upstream TLS failed: {e}"))?;
 
     let is_h2 = upstream_tls
         .get_ref()
@@ -131,46 +315,28 @@ async fn connect_upstream_tls(
 
     if is_h2 {
         let (sender, conn) =
-            match hyper::client::conn::http2::handshake(TokioExecutor::new(), upstream_io).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("Upstream HTTP/2 handshake failed for {host}: {e}");
-                    return None;
-                }
-            };
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), upstream_io)
+                .await
+                .map_err(|e| format!("upstream HTTP/2 handshake failed: {e}"))?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("Upstream h2 connection ended: {e}");
             }
+            drop(permit);
         });
-        Some(UpstreamSender::Http2(sender))
+        Ok(UpstreamSender::Http2(sender))
     } else {
-        let (sender, conn) = match hyper::client::conn::http1::handshake(upstream_io).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("Upstream HTTP/1.1 handshake failed for {host}: {e}");
-                return None;
-            }
-        };
+        let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io)
+            .await
+            .map_err(|e| format!("upstream HTTP/1.1 handshake failed: {e}"))?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("Upstream h1 connection ended: {e}");
             }
+            drop(permit);
         });
-        Some(UpstreamSender::Http1(sender))
+        Ok(UpstreamSender::Http1(sender))
     }
-}
-
-fn is_upgrade_request<B>(req: &Request<B>) -> bool {
-    req.headers().get("upgrade").is_some()
-        && req
-            .headers()
-            .get("connection")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-            })
 }
 
 async fn connect_h1_upstream(
@@ -209,54 +375,28 @@ async fn handle_upgrade_request(
     host: &str,
     port: u16,
     config: &AgentProxyConfig,
-) -> Result<Response<BoxBody>, std::convert::Infallible> {
+) -> Result<Response<BoxBody>, GatewayError> {
     let client_upgrade = hyper::upgrade::on(&mut req);
-    let req = prepare_forwarded_request(req, host, true);
+    let mut req = prepare_forwarded_request(req, host, true);
+    offer_only_websocket(req.headers_mut());
 
     let mut sender = match connect_h1_upstream(host, port, config).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Upgrade upstream connection to {host} failed: {e}");
-            return Ok(Response::builder()
-                .status(hyper::StatusCode::BAD_GATEWAY)
-                .body(full("Bad Gateway"))
-                .expect("building 502"));
+            return Err(GatewayError::BadGateway);
         }
     };
 
-    let mut resp = match sender.send_request(req).await {
+    let resp = match sender.send_request(req).await {
         Ok(r) => r,
         Err(e) => {
             warn!("Upgrade request to {host} failed: {e}");
-            return Ok(Response::builder()
-                .status(hyper::StatusCode::BAD_GATEWAY)
-                .body(full("Bad Gateway"))
-                .expect("building 502"));
+            return Err(GatewayError::BadGateway);
         }
     };
 
-    if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
-        return Ok(resp.map(|body| body.map_err(Into::into).boxed()));
-    }
-
-    let upstream_upgrade = hyper::upgrade::on(&mut resp);
-    let host_owned = host.to_string();
-    tokio::spawn(async move {
-        let (client_io, upstream_io) = match tokio::join!(client_upgrade, upstream_upgrade) {
-            (Ok(c), Ok(u)) => (c, u),
-            (Err(e), _) | (_, Err(e)) => {
-                debug!("Upgrade for {host_owned} failed: {e}");
-                return;
-            }
-        };
-        let mut client_io = TokioIo::new(client_io);
-        let mut upstream_io = TokioIo::new(upstream_io);
-        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
-            debug!("Upgraded connection to {host_owned} ended: {e}");
-        }
-    });
-
-    Ok(resp.map(|body| body.map_err(Into::into).boxed()))
+    relay_upgrade(client_upgrade, resp, host)
 }
 
 async fn handle_request(
@@ -264,8 +404,13 @@ async fn handle_request(
     host: &str,
     port: u16,
     config: &AgentProxyConfig,
-    sender: &Mutex<UpstreamSender>,
+    upstream: &Upstream,
 ) -> Result<Response<BoxBody>, std::convert::Infallible> {
+    // A field line `header_tokens` would skip could hide an `Upgrade` token
+    // or a header listed for stripping, so it is refused before any routing.
+    if has_invalid_token_lines(req.headers()) {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "Bad Request"));
+    }
     if let Some(route) = config.credential_route_for_domain(host)
         && let (Some(addr), Some(token), Some(name)) = (
             &config.daemon_addr,
@@ -276,41 +421,115 @@ async fn handle_request(
         return Ok(route_credential_request(req, host, route, addr, token, name, config).await);
     }
 
-    let path = super::forward_proxy::strip_query(req.uri().path());
-    let verdict = config.matcher.evaluate(host, path);
+    let (req, response_headers) = match respond::decide(req, host, config, Channel::Mitm).await {
+        Decision::Done(resp) => return Ok(resp),
+        Decision::Forward(req, response_headers) => (req, response_headers),
+    };
 
-    if !verdict.allowed {
-        tracing::info!("BLOCKED HTTPS {host}{path} - {}", verdict.reason);
-        config.log_blocked(host, path, &verdict.reason);
-        let resp = Response::builder()
-            .status(hyper::StatusCode::FORBIDDEN)
-            .header("connection", "close")
-            .body(full("Forbidden"))
-            .expect("building 403 response");
-        return Ok(resp);
-    }
+    // Only WebSocket upgrades are spliced. Any other upgrade (such as h2c) is
+    // forwarded as an ordinary request with its upgrade headers stripped, so
+    // later requests on the connection still go through the rules. HTTP/2
+    // clients use Extended CONNECT (RFC 8441) instead of Upgrade headers, so
+    // this only triggers for HTTP/1.1 clients.
+    let forwarded = if is_websocket_upgrade(&req) {
+        handle_upgrade_request(req, host, port, config).await
+    } else {
+        forward_request(req, host, port, config, upstream).await
+    };
+    Ok(respond::forwarded_response(
+        forwarded,
+        response_headers,
+        host,
+        config,
+    ))
+}
 
-    config.log_allowed(host, path);
-
-    // HTTP/2 clients use Extended CONNECT (RFC 8441) instead of Upgrade headers,
-    // so this only triggers for HTTP/1.1 clients.
-    if is_upgrade_request(&req) {
-        return handle_upgrade_request(req, host, port, config).await;
-    }
-
+/// Forward an allowed request on a free upstream connection of this client
+/// connection, opening one when none is free.
+///
+/// No lock is held while the request is in flight, so a long response never
+/// holds up the client's other requests.
+async fn forward_request(
+    req: Request<Incoming>,
+    host: &str,
+    port: u16,
+    config: &AgentProxyConfig,
+    upstream: &Upstream,
+) -> Result<Response<BoxBody>, GatewayError> {
     let req = prepare_forwarded_request(req, host, false);
-    let mut upstream = sender.lock().await;
-    match upstream.send_request(req).await {
-        Ok(resp) => Ok(resp.map(|body| body.map_err(Into::into).boxed())),
+    let connect = |permit| Box::pin(connect_upstream_tls(host, port, config, permit));
+    match send_pooled(req, upstream, connect, host).await {
+        Ok(mut resp) => {
+            strip_hop_by_hop(resp.headers_mut(), false);
+            Ok(resp.map(|body| body.map_err(Into::into).boxed()))
+        }
         Err(e) => {
-            warn!("Upstream request to {host} failed: {e}");
-            let resp = Response::builder()
-                .status(hyper::StatusCode::BAD_GATEWAY)
-                .body(full("Bad Gateway"))
-                .expect("building 502 response");
-            Ok(resp)
+            warn!("Upstream request to {host}:{port} failed: {e}");
+            config.log_error(host, &e);
+            Err(GatewayError::BadGateway)
         }
     }
+}
+
+/// Send `req` on a free open connection of `upstream`, or on one `connect`
+/// opens when none is free. With the most connections open and all busy, it
+/// waits for one to come free; the client's own timeouts bound the wait.
+///
+/// A request an open connection hands back unsent, because it closed first,
+/// goes through the same choice again; one that went out is never resent.
+/// When no connection is open, this first waits for any request already
+/// opening one, and uses that connection instead if it is free.
+async fn send_pooled<B, C, CF>(
+    mut req: Request<B>,
+    upstream: &Upstream<B>,
+    connect: C,
+    host: &str,
+) -> Result<Response<Incoming>, String>
+where
+    B: Body + Send + 'static,
+    C: Fn(OwnedSemaphorePermit) -> CF + Sync,
+    CF: Future<Output = Result<UpstreamSender<B>, String>> + Send,
+{
+    loop {
+        let checkout = upstream.checkout(req);
+        req = match checkout {
+            Checkout::Sent(sending) => match await_pooled(sending, host).await? {
+                Sent::Answered(resp) => return Ok(resp),
+                Sent::Returned(req) => *req,
+            },
+            Checkout::Busy(req) => {
+                let room = upstream.room().await?;
+                match room {
+                    Room::Freed => req,
+                    Room::New(permit) => {
+                        return send_on_new(req, upstream, connect(permit), None).await;
+                    }
+                }
+            }
+            Checkout::Vacant(req) => {
+                let gate = upstream.first_connect.lock().await;
+                if upstream.open_senders().0.is_empty() {
+                    let connecting = connect(upstream.reserve().await?);
+                    return send_on_new(req, upstream, connecting, Some(gate)).await;
+                }
+                req
+            }
+        };
+    }
+}
+
+/// Send `req` on the connection `connecting` opens, keeping the connection
+/// for later requests. `gate` is released once the connection is kept.
+async fn send_on_new<B: Body + Send + 'static>(
+    req: Request<B>,
+    upstream: &Upstream<B>,
+    connecting: impl Future<Output = Result<UpstreamSender<B>, String>>,
+    gate: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> Result<Response<Incoming>, String> {
+    let sender = connecting.await?;
+    let sending = upstream.add(sender, req);
+    drop(gate);
+    sending.await.map_err(|e| e.into_error().to_string())
 }
 
 fn prepare_forwarded_request(
@@ -335,30 +554,7 @@ fn prepare_forwarded_request(
         }
     }
 
-    let hop_by_hop: &[&str] = if preserve_upgrade {
-        &[
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-        ]
-    } else {
-        &[
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-        ]
-    };
-    for name in hop_by_hop {
-        parts.headers.remove(*name);
-    }
+    strip_hop_by_hop(&mut parts.headers, preserve_upgrade);
 
     Request::from_parts(parts, body)
 }
@@ -436,12 +632,6 @@ async fn get_or_connect_mux(
             None
         }
     }
-}
-
-fn full(data: &'static str) -> BoxBody {
-    Full::new(Bytes::from(data))
-        .map_err(|never| match never {})
-        .boxed()
 }
 
 fn generate_server_config(domain: &str, config: &AgentProxyConfig) -> Result<ServerConfig, String> {
@@ -529,9 +719,124 @@ pub fn upstream_tls_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy_http::test_upstreams::{
+        Body as TestBody, LIVE_BODY, get, live_h1, live_h2, unspawned_h1, unspawned_h2,
+    };
 
     fn install_crypto_provider() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    /// Opens a working HTTP/2 connection in place of the real upstream.
+    async fn connect_live(
+        permit: OwnedSemaphorePermit,
+    ) -> Result<UpstreamSender<TestBody>, String> {
+        drop(permit);
+        Ok(UpstreamSender::Http2(live_h2().await))
+    }
+
+    /// Poll `fut` once, which must leave it pending.
+    async fn poll_once<F: Future>(fut: Pin<&mut F>) {
+        let mut fut = Some(fut);
+        std::future::poll_fn(|cx| {
+            let pending = fut.take().unwrap().poll(cx).is_pending();
+            assert!(pending, "finished on its first poll");
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Two pooled connections, each ready when the request is handed to it and
+    /// ended before it goes out.
+    async fn pooled_then_ended() -> Vec<(UpstreamSender<TestBody>, Pin<Box<dyn Send>>)> {
+        let (h1, h1_conn) = unspawned_h1().await;
+        let (h2, h2_conn) = unspawned_h2().await;
+        vec![
+            (UpstreamSender::Http1(h1), h1_conn as Pin<Box<dyn Send>>),
+            (UpstreamSender::Http2(h2), h2_conn as Pin<Box<dyn Send>>),
+        ]
+    }
+
+    #[tokio::test]
+    async fn resends_when_pooled_connection_closes_before_the_request_goes_out() {
+        for (sender, conn) in pooled_then_ended().await {
+            let upstream = Upstream::new();
+            upstream.senders().0.push(sender);
+            let mut sending =
+                std::pin::pin!(send_pooled(get(), &upstream, connect_live, "upstream.test"));
+            poll_once(sending.as_mut()).await;
+            drop(conn);
+            let resp = sending.await.expect("request was not resent");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, LIVE_BODY);
+        }
+    }
+
+    /// A request waiting for another to open the first connection lands on
+    /// that connection, which ends before the request goes out.
+    #[tokio::test]
+    async fn resends_when_connection_opened_meanwhile_closes_before_the_request_goes_out() {
+        for (sender, conn) in pooled_then_ended().await {
+            let upstream = Upstream::new();
+            let opening = upstream.first_connect.lock().await;
+            let mut sending =
+                std::pin::pin!(send_pooled(get(), &upstream, connect_live, "upstream.test"));
+            poll_once(sending.as_mut()).await;
+            upstream.senders().0.push(sender);
+            drop(opening);
+            poll_once(sending.as_mut()).await;
+            drop(conn);
+            let resp = sending.await.expect("request was not resent");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, LIVE_BODY);
+        }
+    }
+
+    /// With the most connections open and all busy, a waiting request takes a
+    /// connection another request opened while it waited, once that one
+    /// comes free, without any connection closing or permit coming back.
+    #[tokio::test]
+    async fn waiting_request_takes_a_connection_opened_while_it_waited() {
+        let upstream = Arc::new(Upstream::new());
+        let all_permits = u32::try_from(1 + MAX_EXTRA_UPSTREAMS).unwrap();
+        let held = Arc::clone(&upstream.permits)
+            .try_acquire_many_owned(all_permits)
+            .unwrap();
+        // Busy with a request it never answers: its connection never runs.
+        let (mut busy, busy_conn) = unspawned_h1().await;
+        let busy_sending = busy.try_send_request(get());
+        assert!(!busy.is_ready() && !busy.is_closed());
+        upstream.senders().0.push(UpstreamSender::Http1(busy));
+
+        let waiter = tokio::spawn({
+            let upstream = Arc::clone(&upstream);
+            async move {
+                let refuse = |_| async { Err("opened another connection".to_string()) };
+                send_pooled(get(), &upstream, refuse, "upstream.test").await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while upstream.waiting.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request never started waiting");
+
+        let opened = UpstreamSender::Http1(live_h1().await);
+        let resp = send_on_new(get(), &upstream, async { Ok(opened) }, None)
+            .await
+            .unwrap();
+        resp.into_body().collect().await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiting request was never woken")
+            .unwrap()
+            .expect("waiting request failed");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, LIVE_BODY);
+        drop((held, busy_sending, busy_conn));
     }
 
     /// Installing the provider must actually succeed the first time, not just
@@ -598,7 +903,7 @@ mod tests {
             tls.shutdown().await.unwrap();
         });
 
-        let stream = TcpStream::connect(addr).await.unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
         let domain = rustls::pki_types::ServerName::try_from("example.com").unwrap();
         let mut tls = connector
@@ -658,44 +963,5 @@ mod tests {
             config.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-    }
-
-    #[test]
-    fn detects_websocket_upgrade_request() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn detects_upgrade_in_multi_value_connection() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "keep-alive, Upgrade")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn rejects_request_without_upgrade_header() {
-        let req = Request::builder()
-            .header("connection", "keep-alive")
-            .body(())
-            .unwrap();
-        assert!(!is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn rejects_upgrade_without_connection_token() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "keep-alive")
-            .body(())
-            .unwrap();
-        assert!(!is_upgrade_request(&req));
     }
 }

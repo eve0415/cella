@@ -347,18 +347,14 @@ impl ProxyForwardingConfig {
     /// either one on its own is enough to route through it — and neither is
     /// possible on a backend that never provisions an agent.
     ///
-    /// `skip_rules` drops user-configured rules (the caller's rule policy);
-    /// `credentials_protect` is the `credentials.protect` setting.
+    /// `net_config` already reflects the rule policy (`--no-network-rules`
+    /// leaves it with no rules); `credentials_protect` is the
+    /// `credentials.protect` setting.
     pub fn resolve(
-        mut net_config: cella_network::config::NetworkConfig,
-        skip_rules: bool,
+        net_config: cella_network::config::NetworkConfig,
         credentials_protect: bool,
         managed_agent: bool,
     ) -> Self {
-        if skip_rules {
-            net_config.rules.clear();
-            net_config.mode = cella_network::config::NetworkMode::Denylist;
-        }
         let has_rules = net_config.has_rules();
         let credentials_protect = credentials_protect && managed_agent;
         let needs_proxy = (has_rules || credentials_protect) && managed_agent;
@@ -488,15 +484,16 @@ pub fn prepare_env_forwarding(
             ca_injection.apply_to(&mut fwd.post_start, distro);
         }
 
-        // If MITM TLS interception is needed (path-level blocking or
-        // credential protection), inject the MITM CA into the system trust
-        // store and set application-level env vars pointing to a combined
-        // CA bundle (host CAs + MITM CA + the configured CA).
-        let has_path_rules = net_config
+        // If MITM TLS interception is needed (see `NetworkConfig::needs_mitm`),
+        // inject the MITM CA into the system trust store and set
+        // application-level env vars pointing to a combined CA bundle (host
+        // CAs + MITM CA + the configured CA).
+        let needs_mitm = net_config
             .full_config
             .as_ref()
-            .is_some_and(|c| c.rules.iter().any(|r| !r.paths.is_empty()));
-        let needs_mitm = has_path_rules || net_config.credentials_protect;
+            .map_or(net_config.credentials_protect, |c| {
+                c.needs_mitm(net_config.credentials_protect)
+            });
 
         if needs_mitm && let Ok(ca) = cella_network::ca::ensure_ca() {
             inject_mitm_ca_trust(&mut fwd, distro, &ca.cert_pem, additional_ca);
@@ -682,7 +679,7 @@ mod tests {
             "precondition: no user-configured rules"
         );
 
-        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, true);
+        let pfc = ProxyForwardingConfig::resolve(net_config, true, true);
 
         assert!(
             pfc.has_blocking_rules,
@@ -698,7 +695,7 @@ mod tests {
     #[test]
     fn resolve_skips_proxy_without_managed_agent() {
         let net_config = cella_network::config::NetworkConfig::default();
-        let pfc = ProxyForwardingConfig::resolve(net_config, false, true, false);
+        let pfc = ProxyForwardingConfig::resolve(net_config, true, false);
 
         assert!(
             !pfc.has_blocking_rules,
@@ -711,60 +708,10 @@ mod tests {
     #[test]
     fn resolve_skips_proxy_when_nothing_is_requested() {
         let net_config = cella_network::config::NetworkConfig::default();
-        let pfc = ProxyForwardingConfig::resolve(net_config, false, false, true);
+        let pfc = ProxyForwardingConfig::resolve(net_config, false, true);
 
         assert!(!pfc.has_blocking_rules);
         assert!(pfc.full_config.is_none());
-    }
-
-    #[test]
-    fn resolve_honours_skip_rules_but_not_for_credentials_protect() {
-        let net_config = cella_network::config::NetworkConfig {
-            rules: vec![cella_network::config::NetworkRule {
-                domain: "example.com".to_string(),
-                paths: vec![],
-                action: cella_network::config::RuleAction::Block,
-            }],
-            ..Default::default()
-        };
-
-        let skipped = ProxyForwardingConfig::resolve(net_config.clone(), true, false, true);
-        assert!(
-            !skipped.has_blocking_rules,
-            "skip_rules must drop user-configured rules"
-        );
-
-        let protected = ProxyForwardingConfig::resolve(net_config, true, true, true);
-        assert!(
-            protected.has_blocking_rules,
-            "skip_rules must not disable credential protection"
-        );
-    }
-
-    #[test]
-    fn resolve_removes_explicitly_skipped_rules_from_credential_proxy_config() {
-        let net_config = cella_network::config::NetworkConfig {
-            mode: cella_network::config::NetworkMode::Allowlist,
-            rules: vec![cella_network::config::NetworkRule {
-                domain: "allowed.example.com".to_string(),
-                paths: vec![],
-                action: cella_network::config::RuleAction::Allow,
-            }],
-            ..Default::default()
-        };
-
-        let resolved = ProxyForwardingConfig::resolve(net_config, true, true, true);
-        let agent_config = resolved
-            .full_config
-            .expect("credential protection still requires an agent proxy config");
-
-        assert!(resolved.has_blocking_rules);
-        assert!(agent_config.rules.is_empty());
-        assert_eq!(
-            agent_config.mode,
-            cella_network::config::NetworkMode::Denylist,
-            "denylist with no rules permits unmatched traffic"
-        );
     }
 
     #[test]

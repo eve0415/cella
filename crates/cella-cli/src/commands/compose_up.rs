@@ -4,7 +4,6 @@
 //! and post-create setup via CLI-specific code paths.
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 
 use tracing::{debug, info};
@@ -56,11 +55,9 @@ pub async fn compose_ensure_up(
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
     let result =
-        cella_orchestrator::compose_up::compose_up(ctx.client.as_ref(), &cfg, &hooks, sender)
-            .await
-            .map_err(|e| e.to_string());
+        cella_orchestrator::compose_up::compose_up(ctx.client.as_ref(), &cfg, &hooks, sender).await;
     let _ = renderer.await;
-    let result = result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let result = result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     Ok(super::up::UpResult {
         container_id: result.container_id,
@@ -152,36 +149,31 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
     fn post_create_setup<'a>(
         &'a self,
         client: &'a dyn ContainerBackend,
-        container_id: &'a str,
-        remote_user: &'a str,
-        config: &'a serde_json::Value,
-        workspace_root: &'a Path,
-        remote_env: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+        setup: cella_orchestrator::compose_up::PostCreateSetup<'a>,
+    ) -> cella_orchestrator::compose_up::PostCreateSetupFuture<'a> {
+        let cella_orchestrator::compose_up::PostCreateSetup {
+            container_id,
+            remote_user,
+            config,
+            workspace_root,
+            remote_env,
+            proxy_fwd,
+        } = setup;
         Box::pin(async move {
-            let managed_agent = client.capabilities().managed_agent;
-            let skip_rules = self.ctx.network_rules == cella_orchestrator::NetworkRulePolicy::Skip;
-            let proxy_fwd = cella_orchestrator::compose_up::build_proxy_forwarding_config(
-                &self.ctx.resolved,
-                managed_agent,
-                skip_rules,
-            );
             let env_fwd = cella_env::prepare_env_forwarding(
                 config,
                 remote_user,
                 workspace_root,
-                proxy_fwd.as_ref(),
+                proxy_fwd,
                 client.capabilities().ssh_agent,
             );
-            // Trait method can't return Result; fall back to defaults on config error.
             let settings =
-                cella_config::CellaConfig::load(workspace_root, Some(&self.ctx.resolved))
-                    .unwrap_or_default();
+                cella_config::CellaConfig::load(workspace_root, Some(&self.ctx.resolved))?;
             let (_probed_env, lifecycle_env) = self
                 .ctx
                 .post_create_setup(container_id, remote_user, &env_fwd, &settings, remote_env)
                 .await;
-            lifecycle_env
+            Ok(lifecycle_env)
         })
     }
 
