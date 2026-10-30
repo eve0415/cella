@@ -24,6 +24,7 @@ mod mitm;
 mod port_proxy;
 mod port_watcher;
 mod proxy_config;
+mod proxy_http;
 mod reconnecting_client;
 mod ssh_agent_bridge;
 mod state;

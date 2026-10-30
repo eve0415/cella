@@ -4,6 +4,7 @@
 //! Domain matching is case-insensitive; path matching is case-sensitive.
 
 use std::borrow::Cow;
+use std::net::{IpAddr, Ipv6Addr};
 
 use crate::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 
@@ -235,9 +236,44 @@ fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
     }
 }
 
+/// Canonical form of an IPv6 literal written with or without brackets.
+///
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) becomes dotted IPv4; any other
+/// address, IPv4-compatible (`::a.b.c.d`) included, takes the compressed
+/// lowercase IPv6 form. Returns `None` when `literal` is not an IPv6 address,
+/// including one with a zone ID.
+pub fn canonical_ipv6_literal(literal: &str) -> Option<String> {
+    let inner = literal
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .unwrap_or(literal);
+    let addr: Ipv6Addr = inner.parse().ok()?;
+    Some(canonical_ipv6(addr).to_string())
+}
+
+/// `addr` as the address family it actually reaches.
+///
+/// Only an IPv4-mapped address reaches IPv4. The deprecated IPv4-compatible
+/// form (RFC 4291 §2.5.5.1) is an ordinary IPv6 destination, so it stays
+/// IPv6.
+const fn canonical_ipv6(addr: Ipv6Addr) -> IpAddr {
+    match addr.to_ipv4_mapped() {
+        Some(v4) => IpAddr::V4(v4),
+        None => IpAddr::V6(addr),
+    }
+}
+
 /// Parse a domain pattern like `*.example.com` into parts.
-/// Splits on `.` and maps `*` to `Star`.
+/// Splits on `.` and maps `*` to `Star`. An IPv6 literal, with or without
+/// brackets, compiles to its canonical form: one literal part for an IPv6
+/// address, or the labels of the IPv4 address it maps to.
 fn parse_domain_pattern(pattern: &str) -> Vec<PatternPart> {
+    if let Some(canonical) = canonical_ipv6_literal(pattern) {
+        if canonical.contains(':') {
+            return vec![PatternPart::Literal(canonical)];
+        }
+        return parse_domain_pattern(&canonical);
+    }
     pattern
         .to_ascii_lowercase()
         .split('.')
@@ -365,6 +401,70 @@ mod tests {
     }
 
     // --- Domain pattern matching ---
+
+    #[test]
+    fn ipv6_literal_rule_matches_canonical_form() {
+        for pattern in ["::1", "[::1]", "0:0:0:0:0:0:0:1", "[0:0::1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert_eq!(
+                parts,
+                [PatternPart::Literal("::1".to_string())],
+                "{pattern}"
+            );
+            assert!(match_domain(&parts, "::1"), "{pattern}");
+        }
+        let parts = parse_domain_pattern("[2001:DB8:0::1]");
+        assert!(match_domain(&parts, "2001:db8::1"));
+    }
+
+    #[test]
+    fn ipv4_mapped_rule_matches_ipv4_address() {
+        for pattern in ["::ffff:127.0.0.1", "[::ffff:7f00:1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert!(match_domain(&parts, "127.0.0.1"), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ipv4_compatible_rule_stays_ipv6() {
+        for pattern in ["::127.0.0.1", "[::7f00:1]"] {
+            let parts = parse_domain_pattern(pattern);
+            assert_eq!(
+                parts,
+                [PatternPart::Literal("::7f00:1".to_string())],
+                "{pattern}"
+            );
+            assert!(!match_domain(&parts, "127.0.0.1"), "{pattern}");
+        }
+        let parts = parse_domain_pattern("127.0.0.1");
+        assert!(!match_domain(&parts, "::7f00:1"));
+    }
+
+    #[test]
+    fn canonical_ipv6_literal_forms() {
+        assert_eq!(canonical_ipv6_literal("[::1]").as_deref(), Some("::1"));
+        assert_eq!(
+            canonical_ipv6_literal("::FFFF:127.0.0.1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("[::ffff:127.0.0.1]").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("[::127.0.0.1]").as_deref(),
+            Some("::7f00:1")
+        );
+        assert_eq!(
+            canonical_ipv6_literal("::8.8.8.8").as_deref(),
+            Some("::808:808")
+        );
+        assert_eq!(canonical_ipv6_literal("::").as_deref(), Some("::"));
+        assert_eq!(canonical_ipv6_literal("::1%eth0"), None);
+        assert_eq!(canonical_ipv6_literal("[not-an-ip]"), None);
+        assert_eq!(canonical_ipv6_literal("127.0.0.1"), None);
+        assert_eq!(canonical_ipv6_literal("example.com"), None);
+    }
 
     #[test]
     fn exact_domain_match() {

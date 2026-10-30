@@ -1,22 +1,20 @@
 use std::sync::{Arc, OnceLock};
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{CertificateParams, DnType, DnValue, IsCa, Issuer, KeyPair, SanType};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use crate::proxy_config::AgentProxyConfig;
-
-type BoxBody =
-    http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+use crate::proxy_http::{BoxBody, full, is_upgrade_request, relay_upgrade, strip_hop_by_hop};
 
 static NATIVE_ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
 
@@ -34,12 +32,10 @@ impl UpstreamSender {
     }
 }
 
-pub async fn intercept_tls(
-    client: TcpStream,
-    host: &str,
-    port: u16,
-    config: Arc<AgentProxyConfig>,
-) {
+pub async fn intercept_tls<S>(client: S, host: &str, port: u16, config: Arc<AgentProxyConfig>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some(client_tls) = accept_client_tls(client, host, &config).await else {
         return;
     };
@@ -64,11 +60,14 @@ pub async fn intercept_tls(
     }
 }
 
-async fn accept_client_tls(
-    client: TcpStream,
+async fn accept_client_tls<S>(
+    client: S,
     host: &str,
     config: &AgentProxyConfig,
-) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let tls_config = match generate_server_config(host, config) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -161,18 +160,6 @@ async fn connect_upstream_tls(
     }
 }
 
-fn is_upgrade_request<B>(req: &Request<B>) -> bool {
-    req.headers().get("upgrade").is_some()
-        && req
-            .headers()
-            .get("connection")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-            })
-}
-
 async fn connect_h1_upstream(
     host: &str,
     port: u16,
@@ -224,7 +211,7 @@ async fn handle_upgrade_request(
         }
     };
 
-    let mut resp = match sender.send_request(req).await {
+    let resp = match sender.send_request(req).await {
         Ok(r) => r,
         Err(e) => {
             warn!("Upgrade request to {host} failed: {e}");
@@ -235,28 +222,7 @@ async fn handle_upgrade_request(
         }
     };
 
-    if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
-        return Ok(resp.map(|body| body.map_err(Into::into).boxed()));
-    }
-
-    let upstream_upgrade = hyper::upgrade::on(&mut resp);
-    let host_owned = host.to_string();
-    tokio::spawn(async move {
-        let (client_io, upstream_io) = match tokio::join!(client_upgrade, upstream_upgrade) {
-            (Ok(c), Ok(u)) => (c, u),
-            (Err(e), _) | (_, Err(e)) => {
-                debug!("Upgrade for {host_owned} failed: {e}");
-                return;
-            }
-        };
-        let mut client_io = TokioIo::new(client_io);
-        let mut upstream_io = TokioIo::new(upstream_io);
-        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
-            debug!("Upgraded connection to {host_owned} ended: {e}");
-        }
-    });
-
-    Ok(resp.map(|body| body.map_err(Into::into).boxed()))
+    Ok(relay_upgrade(client_upgrade, resp, host))
 }
 
 async fn handle_request(
@@ -335,30 +301,7 @@ fn prepare_forwarded_request(
         }
     }
 
-    let hop_by_hop: &[&str] = if preserve_upgrade {
-        &[
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-        ]
-    } else {
-        &[
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-        ]
-    };
-    for name in hop_by_hop {
-        parts.headers.remove(*name);
-    }
+    strip_hop_by_hop(&mut parts.headers, preserve_upgrade);
 
     Request::from_parts(parts, body)
 }
@@ -436,12 +379,6 @@ async fn get_or_connect_mux(
             None
         }
     }
-}
-
-fn full(data: &'static str) -> BoxBody {
-    Full::new(Bytes::from(data))
-        .map_err(|never| match never {})
-        .boxed()
 }
 
 fn generate_server_config(domain: &str, config: &AgentProxyConfig) -> Result<ServerConfig, String> {
@@ -598,7 +535,7 @@ mod tests {
             tls.shutdown().await.unwrap();
         });
 
-        let stream = TcpStream::connect(addr).await.unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
         let domain = rustls::pki_types::ServerName::try_from("example.com").unwrap();
         let mut tls = connector
@@ -658,44 +595,5 @@ mod tests {
             config.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-    }
-
-    #[test]
-    fn detects_websocket_upgrade_request() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn detects_upgrade_in_multi_value_connection() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "keep-alive, Upgrade")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn rejects_request_without_upgrade_header() {
-        let req = Request::builder()
-            .header("connection", "keep-alive")
-            .body(())
-            .unwrap();
-        assert!(!is_upgrade_request(&req));
-    }
-
-    #[test]
-    fn rejects_upgrade_without_connection_token() {
-        let req = Request::builder()
-            .header("upgrade", "websocket")
-            .header("connection", "keep-alive")
-            .body(())
-            .unwrap();
-        assert!(!is_upgrade_request(&req));
     }
 }

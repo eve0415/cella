@@ -1,19 +1,66 @@
 //! HTTP forward proxy for domain and path blocking.
 //!
-//! Implements an HTTP CONNECT proxy that runs inside the container.
-//! For HTTPS, uses CONNECT tunneling. For HTTP, proxies directly.
-//! Evaluates blocking rules against each request.
+//! Serves each client connection with hyper. CONNECT requests are tunnelled
+//! or handed to TLS interception; absolute-form `http://` requests are
+//! evaluated one by one, so every request on a keep-alive connection is
+//! checked against the rules before it is forwarded.
 
+use std::convert::Infallible;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::{HOST, HeaderValue, UPGRADE};
+use hyper::http::uri::{PathAndQuery, Scheme};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use cella_network::rules::canonical_ipv6_literal;
+
 use crate::proxy_config::AgentProxyConfig;
+use crate::proxy_http::{
+    BoxBody, closing_response, has_invalid_token_lines, is_websocket_switch, is_websocket_upgrade,
+    relay_upgrade, strip_hop_by_hop, text_response,
+};
+
+/// Most upstream connections one client connection keeps open at once.
+const MAX_POOLED_UPSTREAMS: usize = 8;
+
+/// Upstream HTTP/1.1 connections of one client connection, keyed by
+/// (lowercased host, port) and capped at [`MAX_POOLED_UPSTREAMS`], least
+/// recently used first.
+#[derive(Default)]
+struct UpstreamPool {
+    entries: Vec<(UpstreamKey, SendRequest<Incoming>)>,
+}
+
+type UpstreamKey = (String, u16);
+
+impl UpstreamPool {
+    fn take(&mut self, key: &UpstreamKey) -> Option<SendRequest<Incoming>> {
+        let index = self.entries.iter().position(|(k, _)| k == key)?;
+        Some(self.entries.remove(index).1)
+    }
+
+    /// Store `sender` as the most recently used entry, dropping the least
+    /// recently used one (which closes its connection) past the cap.
+    fn put(&mut self, key: UpstreamKey, sender: SendRequest<Incoming>) {
+        self.entries.retain(|(k, _)| k != &key);
+        self.entries.push((key, sender));
+        if self.entries.len() > MAX_POOLED_UPSTREAMS {
+            self.entries.remove(0);
+        }
+    }
+}
 
 /// Running forward proxy listener.
 pub struct ForwardProxyHandle {
@@ -58,72 +105,49 @@ pub async fn start_forward_proxy(
     Ok(ForwardProxyHandle { local_addr, task })
 }
 
-/// Handle a single proxy connection.
-///
-/// Wraps the stream in a `BufReader` to avoid consuming bytes beyond the HTTP
-/// headers (e.g., the TLS `ClientHello` for CONNECT requests).
+/// Serve one client connection, evaluating every request it carries.
 async fn handle_connection(stream: TcpStream, config: Arc<AgentProxyConfig>) {
-    let mut reader = BufReader::new(stream);
-
-    // Read headers line by line until \r\n\r\n.
-    let mut header_bytes = Vec::new();
-    let mut first_line = String::new();
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(e) => {
-                debug!("Proxy read error: {e}");
-                return;
-            }
+    let pool: Arc<Mutex<UpstreamPool>> = Arc::default();
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let config = config.clone();
+        let pool = pool.clone();
+        async move {
+            let resp = if req.method() == Method::CONNECT {
+                handle_connect(req, &config).await
+            } else {
+                handle_plain(req, &config, &pool).await
+            };
+            Ok::<_, Infallible>(resp)
         }
-        if first_line.is_empty() {
-            first_line = line.clone();
-        }
-        header_bytes.extend_from_slice(line.as_bytes());
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-    }
+    });
 
-    let trimmed = first_line.trim_end();
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 {
-        let _ = reader
-            .get_mut()
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
-        return;
-    }
-
-    let method = parts[0].to_string();
-    let target = parts[1].to_string();
-
-    if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(reader, &target, &config).await;
-    } else {
-        handle_direct_http(reader, &header_bytes, &method, &target, &config).await;
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.half_close(true);
+    if let Err(e) = builder
+        .serve_connection(TokioIo::new(stream), svc)
+        .with_upgrades()
+        .await
+    {
+        debug!("Proxy connection ended: {e}");
     }
 }
 
 /// Handle CONNECT tunneling (for HTTPS).
 ///
-/// CONNECT requests look like: `CONNECT host:port HTTP/1.1`
-/// We evaluate domain blocking rules before establishing the tunnel.
-/// For domains with path-level rules, we defer to MITM TLS interception.
+/// Domain rules are evaluated before the tunnel is established. Domains with
+/// path-level rules or credential routing go to MITM TLS interception.
+/// Refusals close the connection, since hyper would otherwise keep it open
+/// after a non-2xx CONNECT reply.
 async fn handle_connect(
-    mut client: BufReader<TcpStream>,
-    target: &str,
+    req: Request<Incoming>,
     config: &Arc<AgentProxyConfig>,
-) {
-    // Parse host:port from CONNECT target.
-    let Some((host, port)) = parse_host_port(target) else {
-        let _ = client
-            .get_mut()
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
-        return;
+) -> Response<BoxBody> {
+    let Some((host, port)) = req
+        .uri()
+        .authority()
+        .and_then(|a| parse_host_port(a.as_str()))
+    else {
+        return closing_response(StatusCode::BAD_REQUEST, "Bad Request");
     };
 
     let is_credential_domain = config.credential_route_for_domain(&host).is_some();
@@ -134,24 +158,23 @@ async fn handle_connect(
         warn!(
             "CONNECT to {host}: credential protection requires TLS interception but MITM is unavailable"
         );
-        let _ = client
-            .get_mut()
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 58\r\n\r\nCredential protection requires TLS interception (no MITM).")
-            .await;
-        return;
+        return closing_response(
+            StatusCode::BAD_GATEWAY,
+            "Credential protection requires TLS interception (no MITM).",
+        );
     }
 
     if (is_credential_domain || needs_path_inspection) && has_mitm {
-        let mut client_tcp = client.into_inner();
-        if client_tcp
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .is_err()
-        {
-            return;
-        }
-        crate::mitm::intercept_tls(client_tcp, &host, port, config.clone()).await;
-        return;
+        let config = config.clone();
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    crate::mitm::intercept_tls(TokioIo::new(upgraded), &host, port, config).await;
+                }
+                Err(e) => debug!("CONNECT upgrade for {host} failed: {e}"),
+            }
+        });
+        return Response::new(crate::proxy_http::full(""));
     }
 
     // When MITM is unavailable, evaluate domain-level rules only — path
@@ -170,104 +193,266 @@ async fn handle_connect(
     if !verdict.allowed {
         info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
         config.log_blocked(&host, "/", &verdict.reason);
-        let _ = client
-            .get_mut()
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            .await;
-        return;
+        return closing_response(StatusCode::FORBIDDEN, "Forbidden");
     }
 
     config.log_allowed(&host, "/");
 
     // Tunnel without MITM.
-    let upstream = match connect_upstream(&host, port, config).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client
-                .get_mut()
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await;
-            return;
-        }
-    };
-
-    // Headers have been fully consumed by BufReader; safe to unwrap to raw TcpStream.
-    let mut client_tcp = client.into_inner();
-    if client_tcp
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // Tunnel bidirectionally.
-    let mut upstream = upstream;
-    if let Err(e) = copy_bidirectional(&mut client_tcp, &mut upstream).await {
-        debug!("Tunnel to {host}:{port} ended: {e}");
-    }
-}
-
-/// Handle direct HTTP proxy request (non-CONNECT).
-///
-/// Direct requests look like: `GET http://host/path HTTP/1.1`
-/// We evaluate both domain and path blocking rules.
-async fn handle_direct_http(
-    mut client: BufReader<TcpStream>,
-    header_bytes: &[u8],
-    _method: &str,
-    target: &str,
-    config: &AgentProxyConfig,
-) {
-    // Parse the URL to extract host and path.
-    let Some((host, port, path)) = parse_http_url(target) else {
-        let _ = client
-            .get_mut()
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
-        return;
-    };
-
-    // Evaluate rules with both domain and path (strip query/fragment).
-    let verdict = config.matcher.evaluate(&host, strip_query(&path));
-    if !verdict.allowed {
-        info!("BLOCKED HTTP {target} - {}", verdict.reason);
-        config.log_blocked(&host, &path, &verdict.reason);
-        let _ = client
-            .get_mut()
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            .await;
-        return;
-    }
-
-    config.log_allowed(&host, &path);
-
-    // Connect to upstream and forward the request.
     let mut upstream = match connect_upstream(&host, port, config).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client
-                .get_mut()
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await;
-            return;
+            return closing_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
         }
     };
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let mut client = TokioIo::new(upgraded);
+                if let Err(e) = copy_bidirectional(&mut client, &mut upstream).await {
+                    debug!("Tunnel to {host}:{port} ended: {e}");
+                }
+            }
+            Err(e) => debug!("CONNECT upgrade for {host} failed: {e}"),
+        }
+    });
+    Response::new(crate::proxy_http::full(""))
+}
 
-    // Forward the original request headers to upstream.
-    if upstream.write_all(header_bytes).await.is_err() {
-        return;
+/// Target of an absolute-form `http://` request.
+///
+/// Any userinfo in the request URI is dropped: only the host and port are
+/// kept, for `Host`, the upstream pool key, and log text.
+struct PlainTarget {
+    /// Lowercased host; an IPv6 literal in canonical form without brackets.
+    host: String,
+    port: u16,
+    /// Host as written, lowercased, with an IPv6 literal in brackets, plus
+    /// `:port` unless it is the default 80: the `Host` value.
+    host_header: String,
+}
+
+impl PlainTarget {
+    /// Only absolute-form `http://` targets are accepted. The `Host` header is
+    /// never used as a fallback: it would let a client point the proxy at
+    /// itself.
+    fn from_uri(uri: &Uri) -> Option<Self> {
+        if uri.scheme() != Some(&Scheme::HTTP) {
+            return None;
+        }
+        let authority = uri.authority()?.as_str();
+        let host_and_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        let HostPort {
+            host,
+            written,
+            port,
+        } = parse_authority(host_and_port, 80)?;
+        let written = written.to_ascii_lowercase();
+        let host_header = if port == 80 {
+            written
+        } else {
+            format!("{written}:{port}")
+        };
+        Some(Self {
+            host,
+            port,
+            host_header,
+        })
     }
 
-    // Bidirectional copy for the rest (request body + response).
-    let mut client_tcp = client.into_inner();
-    if let Err(e) = copy_bidirectional(&mut client_tcp, &mut upstream).await {
-        debug!("Direct HTTP tunnel to {host}:{port} ended: {e}");
+    fn key(&self) -> UpstreamKey {
+        (self.host.clone(), self.port)
     }
 }
 
+/// Handle one plain-HTTP proxy request (non-CONNECT).
+async fn handle_plain(
+    req: Request<Incoming>,
+    config: &AgentProxyConfig,
+    pool: &Mutex<UpstreamPool>,
+) -> Response<BoxBody> {
+    // A field line `header_tokens` would skip could hide an `Upgrade` token
+    // or a header listed for stripping.
+    if has_invalid_token_lines(req.headers()) {
+        return text_response(StatusCode::BAD_REQUEST, "Bad Request");
+    }
+    let Some(target) = PlainTarget::from_uri(req.uri()) else {
+        return text_response(StatusCode::BAD_REQUEST, "Bad Request");
+    };
+
+    let path = strip_query(req.uri().path());
+    let verdict = config.matcher.evaluate(&target.host, path);
+    if !verdict.allowed {
+        info!("BLOCKED HTTP {} - {}", req.uri(), verdict.reason);
+        config.log_blocked(&target.host, path, &verdict.reason);
+        return text_response(StatusCode::FORBIDDEN, "Forbidden");
+    }
+
+    config.log_allowed(&target.host, path);
+
+    // Only WebSocket upgrades are spliced. Any other upgrade (such as h2c) is
+    // forwarded as an ordinary request with its upgrade headers stripped, so
+    // later requests on the connection still go through the rules.
+    if is_websocket_upgrade(&req) {
+        return forward_plain_upgrade(req, &target, config).await;
+    }
+    forward_plain(req, &target, config, pool).await
+}
+
+/// Rewrite a client request for the upstream.
+///
+/// Without an upstream proxy the request goes out in origin-form; through an
+/// upstream proxy it goes out in absolute-form without userinfo. `Host`
+/// always names the target host and port (RFC 9112 §3.2.2), which also
+/// covers HTTP/1.0 clients that omit it.
+fn prepare_plain_request(
+    req: Request<Incoming>,
+    target: &PlainTarget,
+    config: &AgentProxyConfig,
+    preserve_upgrade: bool,
+) -> Request<Incoming> {
+    let (mut parts, body) = req.into_parts();
+    let pq = parts
+        .uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| PathAndQuery::from_static("/"));
+    parts.uri = if config.upstream_proxy.is_none() {
+        Uri::from(pq)
+    } else {
+        Uri::builder()
+            .scheme(Scheme::HTTP)
+            .authority(target.host_header.as_str())
+            .path_and_query(pq)
+            .build()
+            .unwrap_or_else(|_| parts.uri.clone())
+    };
+    strip_hop_by_hop(&mut parts.headers, preserve_upgrade);
+    if let Ok(host) = HeaderValue::from_str(&target.host_header) {
+        parts.headers.insert(HOST, host);
+    }
+    Request::from_parts(parts, body)
+}
+
+/// Forward an allowed plain-HTTP request over the connection's pool.
+async fn forward_plain(
+    req: Request<Incoming>,
+    target: &PlainTarget,
+    config: &AgentProxyConfig,
+    pool: &Mutex<UpstreamPool>,
+) -> Response<BoxBody> {
+    let req = prepare_plain_request(req, target, config, false);
+    let key = target.key();
+    let pooled = take_ready_sender(pool, &key).await;
+
+    match send_plain(pooled, req, target, config).await {
+        Ok((sender, mut resp)) => {
+            pool.lock().await.put(key, sender);
+            strip_hop_by_hop(resp.headers_mut(), false);
+            resp.map(|body| body.map_err(Into::into).boxed())
+        }
+        Err(e) => {
+            warn!("Upstream request to {} failed: {e}", target.host_header);
+            text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+        }
+    }
+}
+
+/// Take the pooled sender for `key` if its upstream connection is still usable.
+async fn take_ready_sender(
+    pool: &Mutex<UpstreamPool>,
+    key: &UpstreamKey,
+) -> Option<SendRequest<Incoming>> {
+    let mut sender = pool.lock().await.take(key)?;
+    sender.ready().await.ok()?;
+    Some(sender)
+}
+
+/// Send on the pooled sender, reconnecting once if the upstream closed the
+/// connection before the request went out.
+async fn send_plain(
+    pooled: Option<SendRequest<Incoming>>,
+    req: Request<Incoming>,
+    target: &PlainTarget,
+    config: &AgentProxyConfig,
+) -> Result<(SendRequest<Incoming>, Response<Incoming>), String> {
+    let req = match pooled {
+        Some(mut sender) => match sender.try_send_request(req).await {
+            Ok(resp) => return Ok((sender, resp)),
+            Err(mut e) => match e.take_message() {
+                Some(req) => {
+                    debug!(
+                        "Pooled upstream {} closed, reconnecting",
+                        target.host_header
+                    );
+                    req
+                }
+                None => return Err(e.into_error().to_string()),
+            },
+        },
+        None => req,
+    };
+    let mut sender = connect_plain_upstream(target, config).await?;
+    let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+    Ok((sender, resp))
+}
+
+async fn connect_plain_upstream(
+    target: &PlainTarget,
+    config: &AgentProxyConfig,
+) -> Result<SendRequest<Incoming>, String> {
+    let tcp = connect_upstream(&target.host, target.port, config)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
+    let host = target.host_header.clone();
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!("Upstream connection to {host} ended: {e}");
+        }
+    });
+    Ok(sender)
+}
+
+/// Forward a plain-HTTP WebSocket upgrade (`ws://`) on a dedicated upstream
+/// connection.
+async fn forward_plain_upgrade(
+    mut req: Request<Incoming>,
+    target: &PlainTarget,
+    config: &AgentProxyConfig,
+) -> Response<BoxBody> {
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    let mut req = prepare_plain_request(req, target, config, true);
+    // Offer the upstream WebSocket and nothing else, so it cannot switch the
+    // spliced connection to another protocol such as h2c.
+    req.headers_mut()
+        .insert(UPGRADE, HeaderValue::from_static("websocket"));
+    req.headers_mut().remove("http2-settings");
+    let resp = match connect_plain_upstream(target, config).await {
+        Ok(mut sender) => sender.send_request(req).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match resp {
+        Ok(resp)
+            if resp.status() == StatusCode::SWITCHING_PROTOCOLS && !is_websocket_switch(&resp) =>
+        {
+            // Dropping the response drops the upstream connection unspliced.
+            warn!(
+                "Upstream {} switched to a protocol other than WebSocket",
+                target.host_header
+            );
+            closing_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+        }
+        Ok(resp) => relay_upgrade(client_upgrade, resp, &target.host_header),
+        Err(e) => {
+            warn!("Upgrade request to {} failed: {e}", target.host_header);
+            text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+        }
+    }
+}
 /// Connect to the target, either directly or through an upstream proxy.
 /// Public for use by the MITM module.
 pub async fn connect_upstream_for_mitm(
@@ -304,7 +489,8 @@ async fn connect_via_upstream_proxy(
     let mut proxy_stream = TcpStream::connect(proxy_addr.as_str()).await?;
 
     // Send CONNECT request to upstream proxy.
-    let connect_req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    let target = host_port(host, port);
+    let connect_req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     proxy_stream.write_all(connect_req.as_bytes()).await?;
 
     // Read the response (expect "HTTP/1.1 200").
@@ -334,30 +520,91 @@ pub fn strip_query(path: &str) -> &str {
     &path[..end]
 }
 
-/// Parse `host:port` from a CONNECT target.
+/// Parse `host:port` from a CONNECT target, defaulting to port 443.
+///
+/// The host is the canonical one [`parse_authority`] returns. A target with
+/// userinfo is rejected: it would be matched as part of the host and must
+/// not reach the log.
 fn parse_host_port(target: &str) -> Option<(String, u16)> {
-    if let Some((host, port_str)) = target.rsplit_once(':') {
-        let port: u16 = port_str.parse().ok()?;
-        Some((host.to_string(), port))
+    if target.contains('@') {
+        return None;
+    }
+    parse_authority(target, 443).map(|hp| (hp.host, hp.port))
+}
+
+/// A parsed `host[:port]`.
+struct HostPort<'a> {
+    /// Lowercased host for rule matching, credential lookup, the pool key,
+    /// and connecting. A bracketed IPv6 literal is in canonical form without
+    /// brackets, or dotted IPv4 when it is IPv4-mapped (`::ffff:a.b.c.d`).
+    host: String,
+    /// Host as written, with an IPv6 literal in brackets.
+    written: &'a str,
+    port: u16,
+}
+
+/// Parse `host[:port]`, defaulting the port to `default_port` when none is
+/// given or the port after `:` is empty (RFC 3986 §3.2.3).
+///
+/// Returns `None` when the host is empty, a port is given but is not a
+/// decimal `u16`, a bracketed host is not an IPv6 address (a zone ID
+/// included), or the host is the unspecified address (`0.0.0.0`, `::`, or
+/// `::ffff:0.0.0.0`), which connects to this machine whatever the rules say
+/// about loopback.
+fn parse_authority(authority: &str, default_port: u16) -> Option<HostPort<'_>> {
+    let (written, port) = split_host_port(authority)?;
+    if written.is_empty() {
+        return None;
+    }
+    let port = match port {
+        None | Some("") => default_port,
+        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok()?,
+        Some(_) => return None,
+    };
+    let host = if written.starts_with('[') {
+        canonical_ipv6_literal(written)?
     } else {
-        Some((target.to_string(), 443))
+        written.to_ascii_lowercase()
+    };
+    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        return None;
+    }
+    Some(HostPort {
+        host,
+        written,
+        port,
+    })
+}
+
+/// Split `host[:port]` into the host as written, IPv6 brackets included,
+/// and the port text when one is present.
+///
+/// Returns `None` for an unterminated bracket, text after `]` other than a
+/// port, or an unbracketed host containing `:`.
+fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
+    if authority.starts_with('[') {
+        let (host, after) = authority.split_at(authority.find(']')? + 1);
+        let port = if after.is_empty() {
+            None
+        } else {
+            Some(after.strip_prefix(':')?)
+        };
+        return Some((host, port));
+    }
+    match authority.split_once(':') {
+        Some((_, port)) if port.contains(':') => None,
+        Some((host, port)) => Some((host, Some(port))),
+        None => Some((authority, None)),
     }
 }
 
-/// Parse an HTTP URL to extract host, port, and path.
-fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("http://")?;
-    let (host_port, path) = rest
-        .find('/')
-        .map_or((rest, "/"), |idx| (&rest[..idx], &rest[idx..]));
-
-    let (host, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
-        (h.to_string(), p.parse().ok()?)
+/// `host:port` as written in an authority: an IPv6 literal goes in brackets.
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
     } else {
-        (host_port.to_string(), 80)
-    };
-
-    Some((host, port, path.to_string()))
+        format!("{host}:{port}")
+    }
 }
 
 /// Parse a proxy URL like `http://host:port` to `host:port`.
@@ -393,27 +640,117 @@ mod tests {
     }
 
     #[test]
-    fn parse_http_url_with_path() {
-        let (host, port, path) = parse_http_url("http://example.com:8080/api/v1").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 8080);
-        assert_eq!(path, "/api/v1");
+    fn parse_connect_target_ipv6_literal() {
+        assert_eq!(parse_host_port("[::1]:443"), Some(("::1".to_string(), 443)));
+        assert_eq!(
+            parse_host_port("[2001:DB8::1]:8443"),
+            Some(("2001:db8::1".to_string(), 8443))
+        );
+        assert_eq!(
+            parse_host_port("[0:0:0:0:0:0:0:1]:443"),
+            Some(("::1".to_string(), 443))
+        );
+        assert_eq!(
+            parse_host_port("[::ffff:127.0.0.1]:443"),
+            Some(("127.0.0.1".to_string(), 443))
+        );
+        assert_eq!(
+            parse_host_port("[::127.0.0.1]:443"),
+            Some(("::7f00:1".to_string(), 443))
+        );
+        assert!(parse_host_port("[::1%25eth0]:443").is_none());
+        assert!(parse_host_port("[not-an-ip]:443").is_none());
+        assert_eq!(parse_host_port("[::1]"), Some(("::1".to_string(), 443)));
+        assert!(parse_host_port("[::1").is_none());
+        assert!(parse_host_port("[::1]443").is_none());
+        assert!(parse_host_port("::1:443").is_none());
     }
 
     #[test]
-    fn parse_http_url_default_port() {
-        let (host, port, path) = parse_http_url("http://example.com/index.html").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 80);
-        assert_eq!(path, "/index.html");
+    fn plain_target_unbrackets_ipv6_host() {
+        let uri: Uri = "http://[::1]:8080/path".parse().unwrap();
+        let target = PlainTarget::from_uri(&uri).unwrap();
+        assert_eq!(target.host, "::1");
+        assert_eq!(target.port, 8080);
+        assert_eq!(target.host_header, "[::1]:8080");
+
+        let uri: Uri = "http://[::1]/".parse().unwrap();
+        let target = PlainTarget::from_uri(&uri).unwrap();
+        assert_eq!(target.host, "::1");
+        assert_eq!(target.port, 80);
+        assert_eq!(target.host_header, "[::1]");
     }
 
     #[test]
-    fn parse_http_url_no_path() {
-        let (host, port, path) = parse_http_url("http://example.com").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 80);
-        assert_eq!(path, "/");
+    fn plain_target_rejects_invalid_port() {
+        for uri in [
+            "http://example.com:65536/path",
+            "http://example.com:abc/",
+            "http://example.com:+80/",
+            "http://[::1]:abc/",
+        ] {
+            let uri: Uri = uri.parse().unwrap();
+            assert!(PlainTarget::from_uri(&uri).is_none(), "{uri} was accepted");
+        }
+        let uri: Uri = "http://user:pw@example.com/".parse().unwrap();
+        let target = PlainTarget::from_uri(&uri).unwrap();
+        assert_eq!((target.host.as_str(), target.port), ("example.com", 80));
+    }
+
+    #[test]
+    fn empty_port_means_scheme_default() {
+        for (uri, host_header) in [
+            ("http://Example.com:/path", "example.com"),
+            ("http://[::1]:/", "[::1]"),
+        ] {
+            let uri: Uri = uri.parse().unwrap();
+            let target = PlainTarget::from_uri(&uri).unwrap();
+            assert_eq!(target.port, 80, "{uri}");
+            assert_eq!(target.host_header, host_header, "{uri}");
+        }
+        assert_eq!(
+            parse_host_port("example.com:"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(parse_host_port("[::1]:"), Some(("::1".to_string(), 443)));
+    }
+
+    #[test]
+    fn unspecified_address_is_rejected() {
+        for target in ["[::]", "[0::0]", "[::ffff:0.0.0.0]", "0.0.0.0"] {
+            assert!(
+                parse_host_port(&format!("{target}:443")).is_none(),
+                "{target}"
+            );
+            let uri: Uri = format!("http://{target}:80/").parse().unwrap();
+            assert!(PlainTarget::from_uri(&uri).is_none(), "{target}");
+        }
+    }
+
+    #[test]
+    fn empty_host_is_rejected() {
+        for target in [":443", ":", ""] {
+            assert!(parse_host_port(target).is_none(), "{target:?}");
+        }
+        let uri: Uri = "http://:8080/x".parse().unwrap();
+        assert!(PlainTarget::from_uri(&uri).is_none());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_userinfo() {
+        assert!(parse_host_port("u:secret@example.com:443").is_none());
+        assert!(parse_host_port("u@example.com").is_none());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_signed_port() {
+        assert!(parse_host_port("example.com:+443").is_none());
+    }
+
+    #[test]
+    fn host_port_brackets_ipv6_literal() {
+        assert_eq!(host_port("::1", 443), "[::1]:443");
+        assert_eq!(host_port("example.com", 443), "example.com:443");
     }
 
     #[test]
@@ -468,29 +805,6 @@ mod tests {
     fn parse_host_port_port_overflow() {
         // u16 max is 65535
         assert!(parse_host_port("myhost:99999").is_none());
-    }
-
-    #[test]
-    fn parse_http_url_https_prefix_rejected() {
-        assert!(parse_http_url("https://example.com/path").is_none());
-    }
-
-    #[test]
-    fn parse_http_url_no_scheme() {
-        assert!(parse_http_url("example.com/path").is_none());
-    }
-
-    #[test]
-    fn parse_http_url_with_query_string() {
-        let (host, port, path) = parse_http_url("http://example.com/api?key=val").unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 80);
-        assert_eq!(path, "/api?key=val");
-    }
-
-    #[test]
-    fn parse_http_url_invalid_port() {
-        assert!(parse_http_url("http://example.com:abc/path").is_none());
     }
 
     #[test]
