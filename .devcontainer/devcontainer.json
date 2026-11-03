@@ -3,7 +3,7 @@
   "image": "mcr.microsoft.com/devcontainers/rust:2.1.5-trixie",
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1.1.3": {
-      "extensions": "github/gh-stack",
+      "extensions": "github/gh-stack,github/gh-actions-lock",
       "installDirectlyFromGitHubRelease": true,
       "version": "latest"
     },
