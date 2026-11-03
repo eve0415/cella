@@ -19,6 +19,11 @@ impl BrowserHandler {
     pub fn open_url(&self, url: &str) {
         info!("Opening URL in browser: {url}");
 
+        // Tests exercise the BrowserOpen message path and must not open real tabs.
+        if cfg!(test) {
+            return;
+        }
+
         let result = std::process::Command::new(&self.open_command)
             .arg(url)
             .stdin(std::process::Stdio::null())
@@ -79,5 +84,22 @@ mod tests {
     fn browser_handler_creates() {
         let handler = BrowserHandler::new();
         assert!(!handler.open_command.is_empty());
+    }
+
+    #[test]
+    fn open_url_does_not_spawn_the_opener_in_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let handler = BrowserHandler {
+            open_command: "touch".to_string(),
+        };
+
+        handler.open_url(marker.to_str().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            !marker.exists(),
+            "open_url spawned the opener during a test"
+        );
     }
 }
