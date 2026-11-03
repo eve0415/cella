@@ -41,7 +41,7 @@ description = "A terminal-native devcontainer CLI built for the AI agent era"
 readme = "README.md"
 keywords = ["devcontainers", "containers", "cli", "docker", "vscode"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.98.1"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 # Async runtime
@@ -88,7 +88,7 @@ miette = { version = "=7.6.0", features = ["fancy"] }
 bollard = "=0.21.1"
 
 # Hashing
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 hex = "=0.4.3"
 olpc-cjson = "=0.1.4"
 
@@ -156,7 +156,7 @@ http = "=1.5.0"
 http-body-util = "=0.1.5"
 
 # File watching
-notify = "=8.2.0"
+notify = "=8.2.1"
 
 # Process inspection
 nix = { version = "=0.31.3", default-features = false, features = ["signal", "term", "user"] }
@@ -245,6 +245,7 @@ nursery = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 # Domain naming (container_id/container_name/container_ip) is more readable than forced disambiguation
 similar_names = "allow"
+assert_is_empty = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

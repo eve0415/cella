@@ -1114,28 +1114,28 @@ async fn run_exec(
                 return Ok(());
             }
         }
-    } else {
-        let msg = AgentMessage::ExecRequest {
-            request_id: id.clone(),
-            branch: branch.to_string(),
-            command: command.to_vec(),
-        };
-        client.send(&msg).await?;
-        loop {
-            let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
-            match resp {
-                DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                    OutputStream::Stdout => print!("{data}"),
-                    OutputStream::Stderr => eprint!("{data}"),
-                },
-                DaemonMessage::ExecResult { exit_code, .. } => {
-                    if exit_code != 0 {
-                        std::process::exit(exit_code);
-                    }
-                    return Ok(());
+    }
+
+    let msg = AgentMessage::ExecRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+        command: command.to_vec(),
+    };
+    client.send(&msg).await?;
+    loop {
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
+        match resp {
+            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stderr => eprint!("{data}"),
+            },
+            DaemonMessage::ExecResult { exit_code, .. } => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
                 }
-                _ => {}
+                return Ok(());
             }
+            _ => {}
         }
     }
 }
