@@ -16,6 +16,15 @@ use tracing::warn;
 
 use crate::respond::PreparedRules;
 
+/// Env var that turns the agent's network proxy off.
+pub const NO_NETWORK_RULES_ENV: &str = "CELLA_NO_NETWORK_RULES";
+
+/// Whether a [`NO_NETWORK_RULES_ENV`] value turns the network proxy off:
+/// `1` or `true` in any case.
+pub fn network_rules_disabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// A credential-protected domain route.
 #[derive(Debug, Clone)]
 pub struct CredentialRoute {
@@ -270,6 +279,17 @@ mod tests {
 
     fn make_json(mode: &str, rules: &str, extras: &str) -> String {
         format!(r#"{{"listen_port":8080,"mode":"{mode}","rules":[{rules}]{extras}}}"#)
+    }
+
+    #[test]
+    fn network_rules_disabled_only_by_one_or_true() {
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(network_rules_disabled(Some(on)), "{on}");
+        }
+        for off in ["0", "false", "yes", "", " 1"] {
+            assert!(!network_rules_disabled(Some(off)), "{off:?}");
+        }
+        assert!(!network_rules_disabled(None));
     }
 
     #[test]

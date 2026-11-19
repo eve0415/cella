@@ -125,19 +125,46 @@ The agent assigns a unique ID to each request and waits for the matching
 
 ## Startup
 
-The agent is started by the container entrypoint script under a
-restart loop so the daemon binary can be replaced in place (e.g. after
-`cella up` upgrades the agent). From `cella-orchestrator`'s perspective
-a restart is `pkill -f 'cella-agent daemon'; sleep 1; pgrep ... ||
-spawn`. The loop (in newer containers) picks it back up; the manual
-spawn is a backward-compat fallback for images created before the
-restart loop existed.
+The daemon runs as root under a supervisor loop, so the binary can be replaced in place (for example after `cella up` upgrades the agent) and the daemon can read the root-only `/tmp/.cella/proxy-config.json`.
+The loop is defined once, by `supervisor_loop()` in `cella-backend::agent`, and is always launched by `spawn_agent_supervisor()` as `sh -c '<loop>' </dev/null >/dev/null 2>&1 &`, detached from the streams of whatever started it.
+That command is always the body of an `if`, never the end of a list such as `a || <launch>`, because a trailing `&` backgrounds the whole list, and bash (the `sh` of Fedora and RHEL-family images) runs that list in a subshell that keeps the starter's streams open until the supervisor exits.
 
 ```sh
-if [ -x "$AGENT_PATH" ]; then
-  "$AGENT_PATH" daemon --poll-interval "${CELLA_PORT_POLL_INTERVAL:-1000}" &
-fi
+: cella-agent-supervisor; l=/run/cella-agent.log; true 2>/dev/null >>"$l" || l=/dev/null; while true; do [ "$l" = /dev/null ] || [ "$(wc -c 2>/dev/null <"$l")" -le 1048576 ] 2>/dev/null || true 2>/dev/null >"$l"; "/cella/bin/cella-agent" daemon --poll-interval "${CELLA_PORT_POLL_INTERVAL:-1000}" >>"$l" 2>&1; sleep 1; done
 ```
+
+The loop appends the daemon's stdout and stderr to `/run/cella-agent.log` (`cella_env::AGENT_LOG_PATH`), the same file the compose path's `nohup` launch writes to.
+The log lives in root-owned `/run` because a non-root user could create a name in sticky `/tmp` first, and on a host with `fs.protected_regular` set root's append to that file would then fail and the daemon would never start.
+The loop picks the log once when it starts and uses `/dev/null` instead when the log cannot be opened, and it empties the log before a respawn once it has grown past 1 MiB.
+The compose launch falls back to `/dev/null` the same way.
+The opens use `true` rather than `:`, because a redirection that fails on a special built-in such as `:` makes `sh` exit.
+
+The container entrypoint starts the supervisor only when it runs as root.
+A non-root entrypoint (a Dockerfile ending in `USER vscode`, for example) starts nothing and leaves the agent to cella.
+
+Two functions in `cella-backend::agent` start the agent from outside, both as a root exec that returns at once when the agent binary is missing.
+`restart_agent_in_container()` kills a running daemon, which its supervisor respawns, removes `/tmp/.cella/proxy-ready`, and starts a supervisor if none is running.
+It runs on every `cella up` of an existing container, after a daemon restart, and on a new container that got a proxy config, because the entrypoint's daemon started before the config was uploaded.
+`ensure_agent_running()` only starts a supervisor if none is running and leaves a running daemon and its marker alone; it runs on a new container without a proxy config.
+Both run as a blocking exec that returns when the script exits, which is as soon as the scan is done, because only the supervisor launch itself is backgrounded, so under dash and bash alike nothing left running holds the exec's streams.
+A non-zero exit is logged as a warning.
+
+After restarting the daemon on a new container with a proxy config, `cella up` waits for `/tmp/.cella/proxy-ready` before it runs lifecycle commands.
+The daemon writes that marker once it has finished proxy setup: when the proxy is bound, or at once when `CELLA_NO_NETWORK_RULES` turns the proxy off.
+The restart removes the marker after killing the daemon and before starting any supervisor, and the wait begins only after the restart has returned, so the marker it sees is the respawned daemon's and never one the killed daemon left behind.
+
+Both find processes by scanning `/proc` with `tr`, `read` and `kill` alone, so the image needs no procps.
+Each process's NUL-separated cmdline is joined with spaces and matched by prefix: `/cella/bin/cella-agent daemon` is the daemon and `sh -c : cella-agent-supervisor` is a supervisor.
+The script's own `sh -c [ -x …` argv, which its subshells share, matches neither prefix.
+The agent path is quoted inside the loop, so the unanchored `pkill -f 'cella-agent daemon'` of an older cella cannot kill the supervisor either.
+A process is matched only when it shares the script's mount namespace, which is checked before its cmdline is read, because with `--pid=host` or a compose `pid:` the scan also sees other containers' daemons and supervisors.
+The script compares the mount ID on the first line of `/proc/<pid>/mountinfo`, the namespace's root mount, rather than the `/proc/<pid>/ns/mnt` link, because reading that link needs `CAP_SYS_PTRACE` for a process of another user, such as the non-root daemon of a container created by an older cella, and Docker does not grant that capability by default.
+
+Each daemon holds an exclusive `flock` on `/run/cella-agent.lock` for its whole lifetime, so a container never has more than one active daemon.
+A duplicate daemon, such as one started by the entrypoint loop of a container created by an older cella, waits on the lock and takes over when the active daemon exits.
+`/run` is root-owned, so a non-root user can neither create the lock first nor plant a symlink there, and the lock is opened without following symlinks.
+Only a root daemon may create the lock file, so a non-root daemon cannot open it and exits.
+A root daemon that cannot open or take the lock logs a warning and runs without it, since it is the daemon that has to serve the proxy.
 
 Configuration sources, in priority order:
 

@@ -19,7 +19,6 @@
 //! The file is JSON; see [`AgentStateSnapshot`]. Writes are atomic via
 //! temp-file-rename to avoid torn reads.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -176,30 +175,18 @@ async fn writer_loop(
     }
 }
 
-/// Write a snapshot atomically (temp-file + rename) at `path`.
+/// Write a snapshot atomically at `path`, through a temp file created exclusively so that a link planted in `/tmp` is never written through (see [`cella_filesync::atomic_write`]).
+///
+/// The file is world-readable, so a non-root `cella doctor` can read the state of a root daemon.
 ///
 /// # Errors
 ///
 /// Returns an `io::Error` if any filesystem operation fails.
 pub fn write_snapshot_atomic(path: &Path, snapshot: &AgentStateSnapshot) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("cella-agent.state");
-    let tmp_path = parent.join(format!("{file_name}.tmp.{}", std::process::id()));
-
     let mut json = serde_json::to_vec_pretty(snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     json.push(b'\n');
-
-    {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(&json)?;
-        f.sync_all()?;
-    }
-
-    std::fs::rename(&tmp_path, path)
+    cella_filesync::atomic_write(path, &json, 0o644)
 }
 
 /// Read a snapshot from `path`. Returns `None` if the file doesn't exist or is
@@ -288,6 +275,35 @@ mod tests {
         // After atomic rename, the temp should be gone.
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(entries.len(), 1, "only the final file should remain");
+    }
+
+    /// `/tmp` is shared with every user in the container, and a temp name that is predictable from the pid lets one of them plant a link there for root to write through.
+    #[test]
+    fn write_does_not_follow_a_link_at_a_predictable_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let path = dir.path().join("state.json");
+        let planted = dir
+            .path()
+            .join(format!("state.json.tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        write_snapshot_atomic(&path, &sample(AgentState::Connected)).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(read_snapshot(&path).unwrap().pid, 42);
+    }
+
+    /// A non-root `cella doctor` reads the state of a root daemon.
+    #[test]
+    fn write_leaves_the_state_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        write_snapshot_atomic(&path, &sample(AgentState::Connected)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "mode was {:o}", mode & 0o777);
     }
 
     #[test]

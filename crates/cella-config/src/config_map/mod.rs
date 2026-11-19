@@ -12,7 +12,9 @@ pub mod run_args;
 use std::collections::HashMap;
 use std::path::Path;
 
+use cella_backend::agent::spawn_agent_supervisor;
 use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
+use cella_env::AGENT_PATH;
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
@@ -31,7 +33,6 @@ pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
     pub host_mount_folder: &'a Path,
     pub feature_config: Option<&'a FeatureContainerConfig>,
     pub image_env: &'a [String],
-    pub agent_arch: &'a str,
     /// Workspace mount consistency mode (e.g. "cached", "delegated").
     /// `None` means use the default ("cached"), except on Linux where
     /// consistency is always omitted.
@@ -51,7 +52,6 @@ pub fn map_config<S: std::hash::BuildHasher>(
         host_mount_folder,
         feature_config,
         image_env,
-        agent_arch,
         workspace_mount_consistency,
     } = params;
 
@@ -93,7 +93,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
     let sec = merge_security_config(config, feature_config);
-    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config, agent_arch);
+    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config);
     let gpu_request = map_gpu_device_request(config);
     let run_args_overrides = parse_run_args_from_config(config);
 
@@ -225,7 +225,6 @@ fn map_merged_string_list(
 fn build_entrypoint_cmd(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
-    _agent_arch: &str,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     use std::fmt::Write;
 
@@ -240,21 +239,13 @@ fn build_entrypoint_cmd(
 
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
-    // Stable agent binary path inside containers. This is a devcontainer
-    // convention, not Docker-specific, so we hardcode it here rather than
-    // pulling in a backend-specific crate.
-    let agent_path = "/cella/bin/cella-agent";
-    // Restart loop: if the agent crashes, it is restarted after 1 second.
-    // `restart_agent_in_container()` sends `pkill -f 'cella-agent daemon'`
-    // which terminates the daemon process; the loop survives and restarts it.
-    let _ = write!(
+    // Only a root entrypoint starts the agent supervisor: the agent must run
+    // as root to read the root-only proxy config. With a non-root default
+    // user, `cella up` starts a root supervisor through a root exec instead.
+    let _ = writeln!(
         script,
-        "if [ -x \"{agent_path}\" ]; then\n  \
-         while true; do \
-         \"{agent_path}\" daemon \
-         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" 2>/dev/null; \
-         sleep 1; done &\n\
-         fi\n"
+        "if [ \"$(id -u)\" = 0 ] && [ -x \"{AGENT_PATH}\" ]; then {} fi",
+        spawn_agent_supervisor()
     );
 
     if let Some(fc) = feature_config {
@@ -395,7 +386,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/test"),
             feature_config,
             image_env,
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         })
     }
@@ -416,7 +406,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -440,7 +429,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -469,6 +457,30 @@ mod tests {
         assert_eq!(cmd[0], "-c");
         assert!(cmd[1].contains("while sleep 1 & wait $!; do :; done"));
         assert_eq!(cmd[2], "-");
+    }
+
+    #[test]
+    fn entrypoint_starts_the_agent_supervisor_only_as_root() {
+        let opts = test_map_config(&json!({"image": "ubuntu"}), None, &[]);
+        let script = &opts.cmd.unwrap()[1];
+        let launch = spawn_agent_supervisor();
+        let launching: Vec<&str> = script.lines().filter(|l| l.contains(&launch)).collect();
+        assert_eq!(launching.len(), 1, "script:\n{script}");
+        assert!(
+            launching[0].starts_with("if [ \"$(id -u)\" = 0 ] && "),
+            "supervisor launch is not guarded by a root check:\n{script}"
+        );
+    }
+
+    #[test]
+    fn entrypoint_script_parses() {
+        let opts = test_map_config(&json!({"image": "ubuntu"}), None, &[]);
+        let script = &opts.cmd.unwrap()[1];
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", script])
+            .status()
+            .unwrap();
+        assert!(status.success(), "sh rejected:\n{script}");
     }
 
     #[test]
@@ -550,7 +562,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert!(opts.workspace_mount.is_some());
@@ -906,7 +917,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/myproject"),
             feature_config: Some(&substituted),
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -932,7 +942,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(opts.workspace_folder, "/workspaces/project");
@@ -950,7 +959,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/monorepo"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(opts.workspace_folder, "/workspaces/monorepo/packages/app");
@@ -976,7 +984,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/monorepo"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(

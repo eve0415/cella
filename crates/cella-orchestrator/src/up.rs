@@ -5,7 +5,9 @@ use std::pin::Pin;
 
 use tracing::{debug, info, warn};
 
-use cella_backend::agent::restart_agent_in_container;
+use cella_backend::agent::{
+    ensure_agent_running, restart_agent_in_container, wait_for_agent_proxy,
+};
 use cella_backend::{
     BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, FileToUpload,
     ImageDetails, LifecycleContext, MountConfig, agent_env_vars, container_labels,
@@ -1437,16 +1439,12 @@ impl EnsureUpContext<'_> {
         })
         .await;
 
-        // The container's entrypoint launches `cella-agent daemon` immediately,
-        // before this post-start step uploads `proxy-config.json`. The daemon
-        // therefore reads `CELLA_PROXY_CONFIG`, finds no file, and gives up
-        // without binding port 18080 — leaving every connection through
-        // `HTTP_PROXY` to ECONNREFUSED. Restart the daemon now that the file
-        // exists so the entrypoint's restart loop respawns it against a
-        // populated config.
-        if injected_proxy_config(&env_fwd.post_start) && self.client.capabilities().managed_agent {
-            restart_agent_in_container(self.client, container_id).await;
-        }
+        start_agent_after_create(
+            self.client,
+            container_id,
+            injected_proxy_config(&env_fwd.post_start),
+        )
+        .await;
 
         crate::container_setup::inject_shell_integration(self.client, container_id, remote_user)
             .await;
@@ -1653,7 +1651,6 @@ impl EnsureUpContext<'_> {
         img_name: &str,
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
-        agent_arch: &str,
         subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
     ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
@@ -1719,7 +1716,6 @@ impl EnsureUpContext<'_> {
             host_mount_folder: &host_mount_folder,
             feature_config: effective_feature_config,
             image_env: &image_env,
-            agent_arch,
             workspace_mount_consistency: self.config.mount_flags.workspace_mount_consistency,
         });
 
@@ -2120,7 +2116,6 @@ impl EnsureUpContext<'_> {
             &img_name,
             base_image_details,
             resolved_features.as_ref(),
-            &agent_arch,
             &subst_ctx,
         )?;
 
@@ -2641,9 +2636,33 @@ fn normalize_path_string(path: &str) -> String {
     }
 }
 
+/// Start the agent on a freshly created container.
+///
+/// A non-root entrypoint starts no agent at all, so a root supervisor is started if none exists.
+/// A root entrypoint starts its daemon before `proxy-config.json` is uploaded, so that daemon finds no config and never binds the proxy port: with an uploaded config, the daemon is restarted against it and the proxy is waited for, so lifecycle commands do not race it.
+/// The restart returns only after removing the killed daemon's readiness marker, so the wait sees the respawned daemon's.
+/// A proxy that never comes up is logged rather than failing `up`.
+async fn start_agent_after_create(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    proxy_config_uploaded: bool,
+) {
+    if !client.capabilities().managed_agent {
+        return;
+    }
+    if !proxy_config_uploaded {
+        ensure_agent_running(client, container_id).await;
+        return;
+    }
+    restart_agent_in_container(client, container_id).await;
+    if let Err(e) = wait_for_agent_proxy(client, container_id).await {
+        warn!("{e}; network requests through HTTP_PROXY may fail");
+    }
+}
+
 /// Returns `true` if the post-start injection includes the cella-agent
-/// proxy config upload. Used by the create flow to decide whether to
-/// restart the agent so it picks up the now-present config file.
+/// proxy config upload. Used by the create flow to decide whether to wait
+/// for the agent's proxy after starting it.
 fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
     post_start
         .file_uploads
@@ -3126,6 +3145,38 @@ mod tests {
     fn injected_proxy_config_false_when_empty() {
         let post_start = cella_env::PostStartInjection::default();
         assert!(!injected_proxy_config(&post_start));
+    }
+
+    /// Regression: a container whose entrypoint runs as a non-root user has
+    /// no agent until cella starts one, so starting it cannot depend on a
+    /// proxy config having been uploaded. Without one, a daemon the
+    /// entrypoint started is left running.
+    #[tokio::test]
+    async fn new_container_without_a_proxy_config_gets_an_agent_started() {
+        let backend = cella_backend::testing::RecordingBackend::default();
+        start_agent_after_create(&backend, "cid", false).await;
+
+        let ensure = cella_backend::testing::RecordingBackend::default();
+        ensure_agent_running(&ensure, "cid").await;
+        assert_eq!(backend.calls(), ["exec_command"]);
+        assert_eq!(backend.exec_commands(), ensure.exec_commands());
+    }
+
+    /// The restart runs to completion (a blocking exec, not a detached one) before the wait starts, because it is what removes the killed daemon's readiness marker; nothing else touches the marker in between.
+    #[tokio::test]
+    async fn proxy_config_restarts_the_daemon_to_completion_then_waits_for_the_proxy() {
+        let backend = cella_backend::testing::RecordingBackend::default();
+        start_agent_after_create(&backend, "cid", true).await;
+
+        let restart = cella_backend::testing::RecordingBackend::default();
+        restart_agent_in_container(&restart, "cid").await;
+        let wait = cella_backend::testing::RecordingBackend::default();
+        let _ = wait_for_agent_proxy(&wait, "cid").await;
+        assert_eq!(backend.calls(), ["exec_command", "exec_command"]);
+        assert_eq!(
+            backend.exec_commands(),
+            [restart.exec_commands(), wait.exec_commands()].concat()
+        );
     }
 
     #[tokio::test]

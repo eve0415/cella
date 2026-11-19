@@ -8,7 +8,9 @@ use std::pin::Pin;
 
 use tracing::{debug, info};
 
+use cella_backend::agent::{open_agent_log, wait_for_agent_proxy};
 use cella_backend::{ContainerBackend, ExecOptions};
+use cella_env::AGENT_PATH;
 use cella_orchestrator::compose_up::{ComposeUpConfig, ComposeUpHooks, ComposeUpOutcome};
 
 use super::up::{UpContext, output_result};
@@ -208,31 +210,30 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
 
 /// Launch the cella-agent as a background process in the container.
 ///
-/// Since compose's `overrideCommand` defaults to `false`, the container runs its
-/// own entrypoint. The agent is started via `exec` as a background daemon.
+/// Since compose's `overrideCommand` defaults to `false`, the container runs its own entrypoint.
+/// The agent is started via `exec` as a background daemon.
 ///
-/// Agent stdout/stderr goes to `/tmp/cella-agent.log` (appended) so failures
-/// are observable via `docker exec $CID tail /tmp/cella-agent.log` instead
-/// of being silently discarded — without this, every agent-side problem is
-/// invisible to users and maintainers.
+/// Agent stdout/stderr goes to [`cella_env::AGENT_LOG_PATH`] (appended), as under the supervisor loop, so failures are observable by tailing that file in the container instead of being silently discarded — without this, every agent-side problem is invisible to users and maintainers.
+/// Like the loop, it falls back to `/dev/null` when the log cannot be opened, rather than not starting the agent.
 async fn launch_agent_exec(
     client: &dyn ContainerBackend,
     container_id: &str,
     wait_for_proxy: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let agent_path = "/cella/bin/cella-agent";
-    let log_path = "/tmp/cella-agent.log";
+    let log_path = cella_env::AGENT_LOG_PATH;
     let ready_path = cella_env::AGENT_PROXY_READY_PATH;
 
     let script = format!(
         "rm -f \"{ready_path}\"; \
-         if [ -x \"{agent_path}\" ]; then \
-         nohup \"{agent_path}\" daemon \
+         if [ -x \"{AGENT_PATH}\" ]; then \
+         {}; \
+         nohup \"{AGENT_PATH}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" \
-         >> \"{log_path}\" 2>&1 & fi"
+         >>\"$l\" 2>&1 & fi",
+        open_agent_log()
     );
 
-    debug!("Launching agent in container {container_id}: {agent_path}");
+    debug!("Launching agent in container {container_id}: {AGENT_PATH}");
     client
         .exec_detached(
             container_id,
@@ -247,36 +248,10 @@ async fn launch_agent_exec(
     info!("Agent launched in container");
 
     if wait_for_proxy {
-        wait_for_agent_proxy(client, container_id, ready_path).await?;
+        wait_for_agent_proxy(client, container_id)
+            .await
+            .map_err(|e| format!("{e}; see {log_path}"))?;
     }
 
-    Ok(())
-}
-
-async fn wait_for_agent_proxy(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-    ready_path: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
-    let script = format!(
-        "elapsed=0; while [ ! -f \"{ready_path}\" ]; do \
-         [ \"$elapsed\" -ge {timeout_secs} ] && exit 1; \
-         sleep 1; elapsed=$((elapsed + 1)); done"
-    );
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), script],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await?;
-    if result.exit_code != 0 {
-        return Err("cella-agent proxy did not become ready; see /tmp/cella-agent.log".into());
-    }
     Ok(())
 }

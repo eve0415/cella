@@ -40,6 +40,10 @@ use tracing::{debug, warn};
 
 use crate::reconnecting_client::ReconnectingClient;
 
+mod user_file;
+
+use user_file::{Lookup, Ownership, UserFile};
+
 /// Debounce for coalescing rapid editor writes.
 ///
 /// Shared by all three documents. The plugin manifests previously used 5s to
@@ -65,7 +69,7 @@ pub type ApplyMessage = (SyncDoc, u64, String);
 pub struct DocState {
     doc: SyncDoc,
     /// The container-side file this agent reads and writes.
-    path: PathBuf,
+    file: UserFile,
     /// Container↔host path translation, `None` for `~/.claude.json` (whose codec
     /// is the identity) and for documents with no resolvable mapping.
     map: Option<PathMap>,
@@ -103,19 +107,19 @@ impl DocState {
     /// for a key present in the base, so a narrower baseline can never fabricate
     /// a deletion. The worst case of a lost baseline is a local edit that fails
     /// to propagate — never a peer's state being reverted.
-    fn new(doc: SyncDoc, path: PathBuf, map: Option<PathMap>, baseline_dir: &Path) -> Self {
+    fn new(doc: SyncDoc, file: UserFile, map: Option<PathMap>, baseline_dir: &Path) -> Self {
         let baseline_path = baseline_dir.join(format!("{}.json", doc.as_str()));
         let baseline = load_baseline(&baseline_path)
-            .or_else(|| read_canonical(doc, &path, map.as_ref()))
+            .or_else(|| read_canonical(doc, &file, map.as_ref()))
             .unwrap_or_else(|| serde_json::json!({}));
         Self {
             doc,
             baseline_path,
             baseline: Mutex::new(baseline),
-            last_hash: Mutex::new(initial_hash(&path)),
+            last_hash: Mutex::new(initial_hash(&file)),
             announced: AtomicBool::new(false),
             last_rev: Mutex::new(0),
-            path,
+            file,
             map,
         }
     }
@@ -144,16 +148,42 @@ fn load_baseline(path: &Path) -> Option<serde_json::Value> {
 }
 
 /// Read a container file straight into canonical form.
-fn read_canonical(doc: SyncDoc, path: &Path, map: Option<&PathMap>) -> Option<serde_json::Value> {
-    to_canonical(doc, &std::fs::read_to_string(path).ok()?, map)
+fn read_canonical(
+    doc: SyncDoc,
+    file: &UserFile,
+    map: Option<&PathMap>,
+) -> Option<serde_json::Value> {
+    to_canonical(doc, &read_text(file)?, map)
 }
 
 /// Hash of the file's current content, or empty if it doesn't exist yet.
-fn initial_hash(path: &Path) -> String {
-    std::fs::read(path)
-        .ok()
+fn initial_hash(file: &UserFile) -> String {
+    contents(file, file.read())
         .map(|b| cella_filesync::sha256_hex(&b))
         .unwrap_or_default()
+}
+
+/// The bytes a read of `file` found. A refused read is warned about and, like
+/// a missing file, yields no document.
+fn contents(file: &UserFile, lookup: Lookup) -> Option<Vec<u8>> {
+    match lookup {
+        Lookup::Found(contents) => Some(contents),
+        Lookup::Absent => None,
+        Lookup::Refused(e) => {
+            warn!("doc sync: not reading {}: {e}", file.path().display());
+            None
+        }
+    }
+}
+
+/// The UTF-8 text of `file`, read as [`contents`] does.
+fn read_text(file: &UserFile) -> Option<String> {
+    String::from_utf8(contents(file, file.read())?).ok()
+}
+
+/// [`read_text`] on a blocking thread.
+async fn read_text_async(file: &UserFile) -> Option<String> {
+    String::from_utf8(contents(file, file.read_async().await)?).ok()
 }
 
 /// Whether this agent participates in Claude Code config sync, per the
@@ -228,15 +258,15 @@ fn build_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    if let Some(path) = config_path() {
-        out.push(Arc::new(DocState::new(
+    match config_path().map(|path| UserFile::in_parent(&path).ok_or(path)) {
+        Some(Ok(file)) => out.push(Arc::new(DocState::new(
             SyncDoc::ClaudeJson,
-            path,
+            file,
             None,
             baseline_dir,
-        )));
-    } else {
-        warn!("doc sync: cannot resolve ~/.claude.json path ($HOME unset)");
+        ))),
+        Some(Err(path)) => warn!("doc sync: {} is not a file path", path.display()),
+        None => warn!("doc sync: cannot resolve ~/.claude.json path ($HOME unset)"),
     }
     out.extend(plugin_states(baseline_dir));
     out
@@ -262,13 +292,20 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
         Ok(map) => dir.map_or_else(Vec::new, |dir| {
             [SyncDoc::InstalledPlugins, SyncDoc::KnownMarketplaces]
                 .into_iter()
-                .map(|doc| {
-                    Arc::new(DocState::new(
+                .filter_map(|doc| {
+                    let Some(file) = plugin_manifest(&dir, doc) else {
+                        warn!(
+                            "doc sync: {} is not a `<home>/.claude/plugins` path",
+                            dir.display()
+                        );
+                        return None;
+                    };
+                    Some(Arc::new(DocState::new(
                         doc,
-                        dir.join(doc.file_name()),
+                        file,
                         Some(map.clone()),
                         baseline_dir,
-                    ))
+                    )))
                 })
                 .collect()
         }),
@@ -280,6 +317,16 @@ fn plugin_states(baseline_dir: &Path) -> Vec<Arc<DocState>> {
             Vec::new()
         }
     }
+}
+
+/// `doc`'s manifest in `plugins_dir` (`<home>/.claude/plugins`), anchored at
+/// the home two levels up, as `~/.claude.json` is.
+fn plugin_manifest(plugins_dir: &Path, doc: SyncDoc) -> Option<UserFile> {
+    let home = plugins_dir.parent()?.parent()?;
+    UserFile::new(
+        home,
+        plugins_dir.strip_prefix(home).ok()?.join(doc.file_name()),
+    )
 }
 
 /// What to re-announce to the daemon on every (re)connect: this container's
@@ -316,7 +363,7 @@ pub async fn reannounce_messages() -> Vec<AgentMessage> {
         // and the same failed read would leave `pending_local_patch` empty too —
         // so the push would overwrite the local content instead of preserving
         // it. Nothing is lost by waiting: the next watcher event re-derives it.
-        let Some(canonical) = current_canonical(st.doc, &st.path, st.map.as_ref()).await else {
+        let Some(canonical) = current_canonical(st.doc, &st.file, st.map.as_ref()).await else {
             debug!(
                 "doc sync: {:?} unreadable at (re)connect; not announcing it",
                 st.doc
@@ -350,16 +397,16 @@ fn announce(
     ]
 }
 
-/// Read `path` and derive the merge patch taking `baseline` to its current
+/// Read `file` and derive the merge patch taking `baseline` to its current
 /// content, in canonical form. `None` when the file is unreadable or not JSON —
 /// the caller must not treat that as an empty document.
-pub async fn derive_patch(
+async fn derive_patch(
     doc: SyncDoc,
-    path: &Path,
+    file: &UserFile,
     baseline: &serde_json::Value,
     map: Option<&PathMap>,
 ) -> Option<serde_json::Value> {
-    let canonical = current_canonical(doc, path, map).await?;
+    let canonical = current_canonical(doc, file, map).await?;
     Some(cella_env::claude_code::diff_documents(
         doc, baseline, &canonical,
     ))
@@ -369,10 +416,10 @@ pub async fn derive_patch(
 /// file is unreadable or not JSON — never an empty document.
 async fn current_canonical(
     doc: SyncDoc,
-    path: &Path,
+    file: &UserFile,
     map: Option<&PathMap>,
 ) -> Option<serde_json::Value> {
-    to_canonical(doc, &tokio::fs::read_to_string(path).await.ok()?, map)
+    to_canonical(doc, &read_text_async(file).await?, map)
 }
 
 /// Spawn a watcher per document plus the shared writer task. `apply_rx` receives
@@ -444,9 +491,15 @@ async fn apply_canonical(st: &DocState, content: &str) {
         st.set_baseline(incoming).await;
         return;
     }
-    match cella_filesync::atomic_write(&st.path, local.as_bytes(), 0o600) {
-        Ok(()) => {
-            restore_owner(&st.path);
+    let path = st.file.path();
+    match st.file.write(local.as_bytes(), 0o600) {
+        Ok(ownership) => {
+            if let Ownership::Failed(e) = ownership {
+                warn!(
+                    "doc sync: cannot hand {} to its directory's owner: {e}",
+                    path.display()
+                );
+            }
             if has_pending {
                 debug!(
                     "doc sync: kept a pending local {:?} edit across a daemon push",
@@ -461,10 +514,10 @@ async fn apply_canonical(st: &DocState, content: &str) {
             debug!(
                 "doc sync: applied daemon {:?} to {}",
                 st.doc,
-                st.path.display()
+                path.display()
             );
         }
-        Err(e) => warn!("doc sync: failed to write {}: {e}", st.path.display()),
+        Err(e) => warn!("doc sync: failed to write {}: {e}", path.display()),
     }
 }
 
@@ -474,45 +527,22 @@ async fn apply_canonical(st: &DocState, content: &str) {
 /// valid JSON — in every one of those cases there is nothing safe to preserve.
 async fn pending_local_patch(st: &DocState) -> serde_json::Value {
     let baseline = st.baseline.lock().await.clone();
-    derive_patch(st.doc, &st.path, &baseline, st.map.as_ref())
+    derive_patch(st.doc, &st.file, &baseline, st.map.as_ref())
         .await
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-/// Restore a file's ownership to whoever owns its parent directory.
-///
-/// The agent daemon usually runs as root, but `atomic_write` (temp + rename)
-/// installs a fresh root-owned inode — which the remote user's `claude` then
-/// can't read. Chowning to the directory's owner (best-effort, no-op when the
-/// agent already runs as that user) keeps the file readable.
-#[cfg(unix)]
-fn restore_owner(path: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    let Some(parent) = path.parent() else { return };
-    let Ok(meta) = std::fs::metadata(parent) else {
-        return;
-    };
-    if let Err(e) = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid())) {
-        warn!(
-            "doc sync: could not restore owner on {}: {e}",
-            path.display()
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn restore_owner(_path: &Path) {}
-
 /// Watch one container file and forward its edits to the daemon.
 async fn run_watcher(st: Arc<DocState>, control: Arc<Mutex<ReconnectingClient>>) {
-    let mut handle = match cella_filesync::watch_file(&st.path, DEBOUNCE) {
+    let path = st.file.path();
+    let mut handle = match cella_filesync::watch_file(path, DEBOUNCE) {
         Ok(h) => h,
         Err(e) => {
-            warn!("doc sync: cannot watch {}: {e}", st.path.display());
+            warn!("doc sync: cannot watch {}: {e}", path.display());
             return;
         }
     };
-    debug!("doc sync: watching {}", st.path.display());
+    debug!("doc sync: watching {}", path.display());
 
     let control = &control;
     while handle.changes.recv().await.is_some() {
@@ -562,8 +592,8 @@ where
     // the daemon would then apply as a deletion. Captured first, the file is
     // always at or after the baseline, so the diff can only add.
     let baseline = st.baseline.lock().await.clone();
-    let Ok(raw) = tokio::fs::read_to_string(&st.path).await else {
-        return; // mid-rename or transiently unreadable; next event covers it
+    let Some(raw) = read_text_async(&st.file).await else {
+        return; // mid-rename, transiently unreadable, or refused; next event covers it
     };
     let hash = cella_filesync::sha256_hex(raw.as_bytes());
     if *st.last_hash.lock().await == hash {
@@ -572,7 +602,7 @@ where
     let Some(canonical) = to_canonical(st.doc, &raw, st.map.as_ref()) else {
         warn!(
             "doc sync: {} is not valid JSON; skipping",
-            st.path.display()
+            st.file.path().display()
         );
         return;
     };
@@ -625,7 +655,12 @@ mod tests {
     }
 
     fn doc_state(dir: &Path, doc: SyncDoc, file: &str, map: Option<PathMap>) -> DocState {
-        DocState::new(doc, dir.join(file), map, &dir.join("baselines"))
+        DocState::new(
+            doc,
+            UserFile::new(dir, file).expect("plain name"),
+            map,
+            &dir.join("baselines"),
+        )
     }
 
     /// Retargeted from the deleted `plugin_sync`: a container-side manifest
@@ -634,13 +669,13 @@ mod tests {
     #[tokio::test]
     async fn container_edit_produces_a_minimal_host_shaped_patch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("known_marketplaces.json");
+        let manifest = UserFile::new(tmp.path(), "known_marketplaces.json").expect("plain name");
         let baseline: serde_json::Value =
             serde_json::from_str(r#"{"a":{"lastUpdated":"1"},"b":{"lastUpdated":"1"}}"#)
                 .expect("valid json");
 
         std::fs::write(
-            &manifest,
+            manifest.path(),
             r#"{"a":{"lastUpdated":"2"},"b":{"lastUpdated":"1"}}"#,
         )
         .expect("edit");
@@ -663,9 +698,9 @@ mod tests {
     #[tokio::test]
     async fn derived_patch_carries_host_paths() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("known_marketplaces.json");
+        let manifest = UserFile::new(tmp.path(), "known_marketplaces.json").expect("plain name");
         std::fs::write(
-            &manifest,
+            manifest.path(),
             r#"{"m":{"installLocation":"/home/vscode/.claude/plugins/marketplaces/m"}}"#,
         )
         .expect("seed");
@@ -688,8 +723,8 @@ mod tests {
     #[tokio::test]
     async fn identical_content_produces_no_patch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("known_marketplaces.json");
-        std::fs::write(&manifest, r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
+        let manifest = UserFile::new(tmp.path(), "known_marketplaces.json").expect("plain name");
+        std::fs::write(manifest.path(), r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
         let patch = derive_patch(
             SyncDoc::KnownMarketplaces,
             &manifest,
@@ -707,8 +742,8 @@ mod tests {
     #[tokio::test]
     async fn absent_baseline_patch_contains_no_deletions() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("known_marketplaces.json");
-        std::fs::write(&manifest, r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
+        let manifest = UserFile::new(tmp.path(), "known_marketplaces.json").expect("plain name");
+        std::fs::write(manifest.path(), r#"{"a":{"lastUpdated":"1"}}"#).expect("seed");
         let patch = derive_patch(SyncDoc::KnownMarketplaces, &manifest, &json!({}), None)
             .await
             .expect("patch derived");
@@ -721,8 +756,8 @@ mod tests {
     #[tokio::test]
     async fn unparseable_file_yields_no_patch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("known_marketplaces.json");
-        std::fs::write(&manifest, "{not json").expect("seed");
+        let manifest = UserFile::new(tmp.path(), "known_marketplaces.json").expect("plain name");
+        std::fs::write(manifest.path(), "{not json").expect("seed");
         assert!(
             derive_patch(SyncDoc::KnownMarketplaces, &manifest, &json!({}), None)
                 .await
@@ -762,7 +797,7 @@ mod tests {
             "known_marketplaces.json",
             None,
         );
-        let patch = derive_patch(st.doc, &st.path, &*st.baseline.lock().await, None)
+        let patch = derive_patch(st.doc, &st.file, &*st.baseline.lock().await, None)
             .await
             .expect("patch derived");
         assert_eq!(
@@ -798,12 +833,12 @@ mod tests {
     #[tokio::test]
     async fn foreign_workspace_project_path_passes_through_and_is_not_pushed() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = tmp.path().join("installed_plugins.json");
+        let manifest = UserFile::new(tmp.path(), "installed_plugins.json").expect("plain name");
         let seeded = r#"{"version":2,"plugins":{"p@m":[
             {"scope":"project","projectPath":"/workspaces/other-repo","version":"1.0"},
             {"scope":"user","version":"1.0"}
         ]}}"#;
-        std::fs::write(&manifest, seeded).expect("seed");
+        std::fs::write(manifest.path(), seeded).expect("seed");
         let map = PathMap {
             claude: (
                 "/home/vscode/.claude".to_string(),
@@ -824,14 +859,14 @@ mod tests {
         // The seed is the baseline, so a subsequent edit to the *user* entry
         // alone must not carry the foreign project entry along.
         std::fs::write(
-            &manifest,
+            manifest.path(),
             r#"{"version":2,"plugins":{"p@m":[
                 {"scope":"project","projectPath":"/workspaces/other-repo","version":"1.0"},
                 {"scope":"user","version":"2.0"}
             ]}}"#,
         )
         .expect("edit");
-        let patch = derive_patch(st.doc, &st.path, &*st.baseline.lock().await, Some(&map))
+        let patch = derive_patch(st.doc, &st.file, &*st.baseline.lock().await, Some(&map))
             .await
             .expect("patch derived");
         assert_eq!(
@@ -1075,7 +1110,7 @@ mod tests {
         apply(1, r#"{"a":{"lastUpdated":"1"}}"#).await;
 
         let on_disk: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&states[0].path).expect("written"))
+            serde_json::from_str(&std::fs::read_to_string(states[0].file.path()).expect("written"))
                 .expect("valid json");
         assert_eq!(
             on_disk["a"]["lastUpdated"],
@@ -1176,6 +1211,58 @@ mod tests {
         assert_eq!(*st.last_hash.lock().await, hash, "hash must stay unchanged");
     }
 
+    /// Root reading through a `~/.claude.json` symlink would ship whatever it
+    /// points at (the root-only proxy config, say) to the daemon and back.
+    #[tokio::test]
+    async fn a_symlinked_document_is_not_forwarded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("secret.json"), r#"{"caKey":"SECRET"}"#).expect("seed");
+        std::os::unix::fs::symlink(
+            tmp.path().join("secret.json"),
+            tmp.path().join(".claude.json"),
+        )
+        .expect("symlink");
+        let st = doc_state(tmp.path(), SyncDoc::ClaudeJson, ".claude.json", None);
+        assert_eq!(
+            *st.baseline.lock().await,
+            json!({}),
+            "nothing seeded from it"
+        );
+
+        let mut sent = Vec::new();
+        forward_change(&st, |msgs| {
+            sent = msgs;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    /// A user who swaps `~/.claude` for a symlink must not steer root's write
+    /// into the directory it points at.
+    #[tokio::test]
+    async fn a_push_is_not_written_through_a_symlinked_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("elsewhere")).expect("mkdir");
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), tmp.path().join(".claude"))
+            .expect("symlink");
+        let st = DocState::new(
+            SyncDoc::KnownMarketplaces,
+            UserFile::new(tmp.path(), ".claude/known_marketplaces.json").expect("plain names"),
+            None,
+            &tmp.path().join("baselines"),
+        );
+
+        apply_canonical(&st, r#"{"a":{"lastUpdated":"1"}}"#).await;
+
+        assert!(
+            !tmp.path()
+                .join("elsewhere/known_marketplaces.json")
+                .exists(),
+            "the write must be skipped"
+        );
+    }
+
     /// A corrupt container manifest must be skipped, not pushed as an empty
     /// document that would wipe canonical for every peer.
     #[tokio::test]
@@ -1214,7 +1301,7 @@ mod tests {
         .await;
 
         let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&st.path).expect("written"))
+            serde_json::from_str(&std::fs::read_to_string(st.file.path()).expect("written"))
                 .expect("valid json");
         assert_eq!(
             written["m"]["installLocation"],
@@ -1241,7 +1328,7 @@ mod tests {
         .await;
 
         let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&st.path).expect("written"))
+            serde_json::from_str(&std::fs::read_to_string(st.file.path()).expect("written"))
                 .expect("valid json");
         let entries = written["plugins"]["p@m"]
             .as_array()
@@ -1339,16 +1426,18 @@ mod tests {
     #[test]
     fn initial_hash_empty_for_absent_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(initial_hash(&dir.path().join("nope.json")).is_empty());
+        assert!(
+            initial_hash(&UserFile::new(dir.path(), "nope.json").expect("plain name")).is_empty()
+        );
     }
 
     #[test]
     fn initial_hash_matches_content() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(".claude.json");
-        std::fs::write(&path, b"{\"a\":1}").expect("seed");
+        let file = UserFile::new(dir.path(), ".claude.json").expect("plain name");
+        std::fs::write(file.path(), b"{\"a\":1}").expect("seed");
         assert_eq!(
-            initial_hash(&path),
+            initial_hash(&file),
             cella_filesync::sha256_hex(b"{\"a\":1}")
         );
     }
@@ -1364,7 +1453,7 @@ mod tests {
 
         apply_canonical(&st, r#"{"a":1}"#).await;
         assert!(
-            !st.path.exists(),
+            !st.file.path().exists(),
             "writer must skip a write whose hash already matches"
         );
         assert_eq!(

@@ -493,7 +493,7 @@ fn host_port(host: &str, port: u16) -> String {
 }
 
 /// Parse a proxy URL like `http://host:port` to `host:port`.
-fn parse_proxy_url(url: &str) -> Option<String> {
+pub fn parse_proxy_url(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
