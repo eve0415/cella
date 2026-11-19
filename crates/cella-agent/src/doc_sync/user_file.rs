@@ -135,7 +135,7 @@ impl UserFile {
         } else {
             None
         };
-        let mut file = create_temp_at(&dir, tmp, mode)?;
+        let mut file = create_temp_at(&dir, tmp)?;
         let filled = fill(&mut file, contents, mode, owner);
         drop(file);
         let installed = filled.and_then(|ownership| {
@@ -229,13 +229,13 @@ fn open_anchor(anchor: &Path, trusted_uid: u32) -> io::Result<File> {
     Ok(File::from(openat(&parent, name, flags, Mode::empty())?))
 }
 
-/// Create `tmp` in `dir` exclusively with `mode`.
+/// Create `tmp` in `dir` exclusively, readable and writable by its owner only until [`fill`] sets the final mode.
 /// Whatever already sits at that name is unlinked once, without following it, and the create retried.
 /// It mirrors `cella_filesync`'s `create_temp`, relative to a directory descriptor.
-fn create_temp_at(dir: &File, tmp: &OsStr, mode: u32) -> io::Result<File> {
+fn create_temp_at(dir: &File, tmp: &OsStr) -> io::Result<File> {
     let flags =
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let mode = Mode::from_bits_truncate(mode);
+    let mode = Mode::S_IRUSR | Mode::S_IWUSR;
     let create = || openat(dir, tmp, flags, mode).map(File::from);
     match create() {
         Err(nix::errno::Errno::EEXIST) => {
@@ -375,12 +375,12 @@ mod tests {
         std::fs::write(home.path().join(".claude/doc.json"), b"old").expect("seed");
         let file = UserFile::new(home.path(), ".claude/doc.json").expect("plain names");
 
-        let ownership = file.write(b"new", 0o600).expect("owned chain");
+        let ownership = file.write(b"new", 0o640).expect("owned chain");
 
         assert!(matches!(ownership, Ownership::Unrequested), "{ownership:?}");
         assert_eq!(std::fs::read(file.path()).expect("written"), b"new");
         let mode = std::fs::metadata(file.path()).expect("metadata").mode();
-        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        assert_eq!(mode & 0o777, 0o640, "mode was {:o}", mode & 0o777);
         let names: Vec<_> = std::fs::read_dir(home.path().join(".claude"))
             .expect("read_dir")
             .map(|e| e.expect("entry").file_name())
