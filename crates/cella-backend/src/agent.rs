@@ -198,6 +198,40 @@ pub async fn ensure_agent_running(client: &dyn ContainerBackend, container_id: &
     report_agent_script("start", container_id, result);
 }
 
+/// Wait until the agent's forward proxy has published its readiness marker,
+/// for at most [`cella_env::AGENT_PROXY_READY_TIMEOUT_SECS`].
+///
+/// # Errors
+///
+/// Returns an error if the exec fails or the marker does not appear in time.
+pub async fn wait_for_agent_proxy(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ready_path = cella_env::AGENT_PROXY_READY_PATH;
+    let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
+    let script = format!(
+        "elapsed=0; while [ ! -f \"{ready_path}\" ]; do \
+         [ \"$elapsed\" -ge {timeout_secs} ] && exit 1; \
+         sleep 1; elapsed=$((elapsed + 1)); done"
+    );
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), script],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await?;
+    if result.exit_code != 0 {
+        return Err("cella-agent proxy did not become ready".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
