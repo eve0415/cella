@@ -37,6 +37,12 @@ pub use ssh_agent::SshAgentTransport;
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
 /// Marker written after the agent proxy has successfully bound its listen port.
 pub const AGENT_PROXY_READY_PATH: &str = "/tmp/.cella/proxy-ready";
+/// Lock file a `cella-agent daemon` holds for its whole lifetime, so that at
+/// most one daemon per container is active and duplicates wait idle.
+///
+/// It lives in root-owned `/run`, where a non-root user can neither create it first nor
+/// plant a symlink in its place.
+pub const AGENT_LOCK_PATH: &str = "/run/cella-agent.lock";
 /// Maximum time to wait for the agent proxy marker during compose startup.
 ///
 /// Thirty seconds preserves the existing compose orchestration readiness bound

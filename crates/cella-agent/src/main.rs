@@ -18,6 +18,7 @@ mod credential_mux;
 mod credential_tunnel;
 mod doc_sync;
 mod forward_proxy;
+mod instance_lock;
 #[cfg(test)]
 mod integration_tests;
 mod mitm;
@@ -292,8 +293,34 @@ async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
     }
 }
 
+/// Block until this daemon holds the single-instance lock. A root daemon that
+/// cannot use the lock runs without it; a non-root daemon exits instead,
+/// since it could not serve the root-only proxy config anyway.
+async fn hold_instance_lock() -> Option<std::fs::File> {
+    let path = std::path::Path::new(cella_env::AGENT_LOCK_PATH);
+    let is_root = nix::unistd::geteuid().is_root();
+    let taken = tokio::task::spawn_blocking(move || instance_lock::take(path, is_root))
+        .await
+        .map_err(std::io::Error::other)
+        .flatten();
+    match taken {
+        Ok(lock) => lock,
+        Err(e) => {
+            error!(
+                "Cannot take the agent lock at {}: {e}",
+                cella_env::AGENT_LOCK_PATH
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let poll_interval = Duration::from_millis(poll_interval_ms);
+
+    // Held for the process lifetime; another daemon in this container waits
+    // here until this one exits.
+    let _instance_lock = hold_instance_lock().await;
 
     maybe_start_forward_proxy(proxy_config_json).await;
 
