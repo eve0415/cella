@@ -253,6 +253,7 @@ fn build_wrapped_entrypoint_script(
     if wait_for_agent_proxy {
         let ready_path = cella_env::AGENT_PROXY_READY_PATH;
         let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
+        let log_path = cella_env::AGENT_LOG_PATH;
         let _ = writeln!(
             script,
             "wait_file=/tmp/.cella-proxy-wait-$$$$\n\
@@ -260,7 +261,7 @@ fn build_wrapped_entrypoint_script(
              elapsed=0\n\
              while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do\n\
                if [ \"$$elapsed\" -ge {timeout_secs} ]; then\n\
-                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check /tmp/cella-agent.log\" >&2\n\
+                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check {log_path}\" >&2\n\
                  rm -f \"$$wait_file\"\n\
                  exit 1\n\
                fi\n\
@@ -1508,11 +1509,12 @@ mod tests {
         let script = entrypoint[2].as_str().expect("script element is a string");
         let ready_path = cella_env::AGENT_PROXY_READY_PATH;
         let timeout_secs = cella_env::AGENT_PROXY_READY_TIMEOUT_SECS;
+        let log_path = cella_env::AGENT_LOG_PATH;
         let bounded_wait = format!(
             "elapsed=0\n\
              while [ ! \"{ready_path}\" -nt \"$$wait_file\" ]; do\n\
                if [ \"$$elapsed\" -ge {timeout_secs} ]; then\n\
-                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check /tmp/cella-agent.log\" >&2\n\
+                 echo \"cella: timed out after {timeout_secs}s waiting for agent proxy readiness marker {ready_path}; check {log_path}\" >&2\n\
                  rm -f \"$$wait_file\"\n\
                  exit 1\n\
                fi\n\
