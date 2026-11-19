@@ -1653,7 +1653,6 @@ impl EnsureUpContext<'_> {
         img_name: &str,
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
-        agent_arch: &str,
         subst_ctx: &cella_config::devcontainer::subst::SubstitutionContext,
     ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
@@ -1719,7 +1718,6 @@ impl EnsureUpContext<'_> {
             host_mount_folder: &host_mount_folder,
             feature_config: effective_feature_config,
             image_env: &image_env,
-            agent_arch,
             workspace_mount_consistency: self.config.mount_flags.workspace_mount_consistency,
         });
 
@@ -2120,7 +2118,6 @@ impl EnsureUpContext<'_> {
             &img_name,
             base_image_details,
             resolved_features.as_ref(),
-            &agent_arch,
             &subst_ctx,
         )?;
 

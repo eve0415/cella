@@ -33,7 +33,6 @@ pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
     pub host_mount_folder: &'a Path,
     pub feature_config: Option<&'a FeatureContainerConfig>,
     pub image_env: &'a [String],
-    pub agent_arch: &'a str,
     /// Workspace mount consistency mode (e.g. "cached", "delegated").
     /// `None` means use the default ("cached"), except on Linux where
     /// consistency is always omitted.
@@ -53,7 +52,6 @@ pub fn map_config<S: std::hash::BuildHasher>(
         host_mount_folder,
         feature_config,
         image_env,
-        agent_arch,
         workspace_mount_consistency,
     } = params;
 
@@ -95,7 +93,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
     let sec = merge_security_config(config, feature_config);
-    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config, agent_arch);
+    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config);
     let gpu_request = map_gpu_device_request(config);
     let run_args_overrides = parse_run_args_from_config(config);
 
@@ -227,7 +225,6 @@ fn map_merged_string_list(
 fn build_entrypoint_cmd(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
-    _agent_arch: &str,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     use std::fmt::Write;
 
@@ -389,7 +386,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/test"),
             feature_config,
             image_env,
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         })
     }
@@ -410,7 +406,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -434,7 +429,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -568,7 +562,6 @@ mod tests {
             host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert!(opts.workspace_mount.is_some());
@@ -924,7 +917,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/myproject"),
             feature_config: Some(&substituted),
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
 
@@ -950,7 +942,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/project"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(opts.workspace_folder, "/workspaces/project");
@@ -968,7 +959,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/monorepo"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(opts.workspace_folder, "/workspaces/monorepo/packages/app");
@@ -994,7 +984,6 @@ mod tests {
             host_mount_folder: Path::new("/home/user/monorepo"),
             feature_config: None,
             image_env: &[],
-            agent_arch: "x86_64",
             workspace_mount_consistency: None,
         });
         assert_eq!(
