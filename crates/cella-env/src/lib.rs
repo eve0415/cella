@@ -35,7 +35,8 @@ pub use ssh_agent::SshAgentTransport;
 /// so it must not live in an image layer or env var) and read by `cella-agent`
 /// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
 pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
-/// Marker written after the agent proxy has successfully bound its listen port.
+/// Marker the agent writes once it has finished proxy setup: its proxy is bound,
+/// or `CELLA_NO_NETWORK_RULES` deliberately turned it off.
 pub const AGENT_PROXY_READY_PATH: &str = "/tmp/.cella/proxy-ready";
 /// Stable path of the agent binary inside every managed container.
 pub const AGENT_PATH: &str = "/cella/bin/cella-agent";

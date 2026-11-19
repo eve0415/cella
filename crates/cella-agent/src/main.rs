@@ -253,27 +253,48 @@ async fn main() {
 /// Checks `CELLA_NO_NETWORK_RULES`, then falls back to the CLI arg or
 /// `CELLA_PROXY_CONFIG` env var.
 async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
-    let rules_disabled = std::env::var("CELLA_NO_NETWORK_RULES")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let proxy_json = if rules_disabled {
+    set_up_forward_proxy(
+        std::env::var(proxy_config::NO_NETWORK_RULES_ENV)
+            .ok()
+            .as_deref(),
+        proxy_config_json,
+        std::path::Path::new(cella_env::AGENT_PROXY_READY_PATH),
+    )
+    .await;
+}
+
+/// [`maybe_start_forward_proxy`] with the `CELLA_NO_NETWORK_RULES` value and
+/// the readiness marker path passed in.
+///
+/// The marker is written once proxy setup is finished: when the proxy is bound,
+/// or at once when network rules turn it off, so whoever waits for the proxy
+/// does not wait out its timeout for a proxy that will never come.
+async fn set_up_forward_proxy(
+    no_network_rules: Option<&str>,
+    proxy_config_json: Option<String>,
+    ready_path: &std::path::Path,
+) {
+    if proxy_config::network_rules_disabled(no_network_rules) {
         info!("Network rules disabled via CELLA_NO_NETWORK_RULES");
-        None
-    } else {
-        proxy_config_json.or_else(|| {
-            let val = std::env::var("CELLA_PROXY_CONFIG").ok()?;
-            if val.starts_with('/') {
-                match std::fs::read_to_string(&val) {
-                    Ok(content) => Some(content),
-                    Err(e) => {
-                        tracing::warn!("Failed to read proxy config from {val}: {e}");
-                        None
-                    }
+        // No marker directory means no proxy config was uploaded, so nobody is
+        // waiting.
+        publish_ready(ready_path, MarkerDir::Optional);
+        return;
+    }
+    let proxy_json = proxy_config_json.or_else(|| {
+        let val = std::env::var("CELLA_PROXY_CONFIG").ok()?;
+        if val.starts_with('/') {
+            match std::fs::read_to_string(&val) {
+                Ok(content) => Some(content),
+                Err(e) => {
+                    tracing::warn!("Failed to read proxy config from {val}: {e}");
+                    None
                 }
-            } else {
-                Some(val)
             }
-        })
-    };
+        } else {
+            Some(val)
+        }
+    });
     if let Some(ref json) = proxy_json {
         match proxy_config::AgentProxyConfig::from_json(json) {
             Ok(config) => {
@@ -281,15 +302,31 @@ async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
                 match forward_proxy::start_forward_proxy(config).await {
                     Ok(handle) => {
                         info!("Forward proxy started on {}", handle.local_addr);
-                        if let Err(e) = std::fs::write(cella_env::AGENT_PROXY_READY_PATH, []) {
-                            error!("Failed to publish forward proxy readiness: {e}");
-                        }
+                        publish_ready(ready_path, MarkerDir::Required);
                     }
                     Err(e) => error!("Failed to start forward proxy: {e}"),
                 }
             }
             Err(e) => error!("Invalid proxy config: {e}"),
         }
+    }
+}
+
+/// Whether a missing directory for the proxy readiness marker is worth reporting.
+#[derive(Clone, Copy)]
+enum MarkerDir {
+    /// A missing directory is a failure to report.
+    Required,
+    /// A missing directory means nobody waits for the marker, so it is not reported.
+    Optional,
+}
+
+/// Write the proxy readiness marker at `path`, logging a failure unless `dir` excuses a missing directory.
+fn publish_ready(path: &std::path::Path, dir: MarkerDir) {
+    if let Err(e) = std::fs::write(path, [])
+        && !(matches!(dir, MarkerDir::Optional) && e.kind() == std::io::ErrorKind::NotFound)
+    {
+        error!("Failed to publish forward proxy readiness: {e}");
     }
 }
 
@@ -452,6 +489,28 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cella up` waits for the marker whenever it uploaded a proxy config,
+    /// even one that network rules then turn off.
+    #[tokio::test]
+    async fn disabled_network_rules_publish_readiness_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("proxy-ready");
+
+        set_up_forward_proxy(Some("1"), Some(r#"{"listen_port":0}"#.to_string()), &ready).await;
+
+        assert!(ready.exists());
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_fails_to_start_publishes_no_readiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("proxy-ready");
+
+        set_up_forward_proxy(Some("0"), Some("not json".to_string()), &ready).await;
+
+        assert!(!ready.exists());
+    }
 
     fn args(strs: &[&str]) -> Vec<String> {
         strs.iter().map(ToString::to_string).collect()

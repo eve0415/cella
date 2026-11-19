@@ -819,6 +819,11 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 4b. Main agent process liveness (read state file written by cella-agent daemon)
     report_main_agent_status();
 
+    // 4c. Network proxy listener
+    if report_proxy_status().await {
+        has_failures = true;
+    }
+
     // 5. Credential helper
     let browser = std::env::var("BROWSER").unwrap_or_default();
     if browser.contains("cella") {
@@ -918,6 +923,140 @@ fn format_main_agent_status(
     }
 }
 
+/// Print the network proxy check and return whether it failed.
+async fn report_proxy_status() -> bool {
+    let expected = proxy_expected(
+        std::env::var_os("CELLA_PROXY_CONFIG").is_some(),
+        std::env::var(crate::proxy_config::NO_NETWORK_RULES_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let http_proxy = std::env::var("HTTP_PROXY").ok();
+    let agent_uid =
+        crate::state::read_snapshot(std::path::Path::new(crate::state::DEFAULT_STATE_FILE))
+            .and_then(|snap| std::fs::read_to_string(format!("/proc/{}/status", snap.pid)).ok())
+            .and_then(|status| parse_status_uid(&status));
+    // The probe blocks for up to its timeout, so keep it off the runtime.
+    let (lines, failed) = tokio::task::spawn_blocking(move || {
+        format_proxy_status(
+            expected,
+            http_proxy.as_deref(),
+            |addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok(),
+            agent_uid,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            format!("  \u{26a0} network proxy: check failed: {e}\n"),
+            false,
+        )
+    });
+    eprint!("{lines}");
+    failed
+}
+
+/// Whether the agent should be serving the network proxy: a proxy config was
+/// injected and `CELLA_NO_NETWORK_RULES` (`no_rules`) does not turn it off.
+fn proxy_expected(config_set: bool, no_rules: Option<&str>) -> bool {
+    config_set && !crate::proxy_config::network_rules_disabled(no_rules)
+}
+
+/// Render the doctor's network proxy line(s) and whether they report a
+/// failure. Pure: the listener probe and the agent's uid are injected.
+///
+/// Prints nothing when the agent is not `expected` to serve a proxy, or when
+/// `HTTP_PROXY` points somewhere other than this container's loopback, which
+/// means the user replaced the agent's proxy with their own.
+fn format_proxy_status(
+    expected: bool,
+    http_proxy: Option<&str>,
+    listening: impl Fn(std::net::SocketAddr) -> bool,
+    agent_uid: Option<u32>,
+) -> (String, bool) {
+    if !expected {
+        return (String::new(), false);
+    }
+    let addr = match http_proxy.map(proxy_target) {
+        Some(ProxyTarget::Agent(addr)) => addr,
+        Some(ProxyTarget::Elsewhere) => return (String::new(), false),
+        Some(ProxyTarget::Unparseable) | None => {
+            return (
+                format!(
+                    "  \u{26a0} network proxy: no port in HTTP_PROXY={}\n",
+                    http_proxy.unwrap_or_default()
+                ),
+                false,
+            );
+        }
+    };
+    if listening(addr) {
+        return (
+            format!("  \u{2713} network proxy listening on {addr}\n"),
+            false,
+        );
+    }
+    let hint = match agent_uid {
+        Some(uid) if uid != 0 => format!(
+            "The agent runs as uid {uid} and cannot read the root-only proxy config; run `cella up` on the host to restart it as root"
+        ),
+        _ => "Run `cella up` on the host".to_string(),
+    };
+    (
+        format!("  \u{2717} network proxy not listening on {addr}\n    {hint}\n"),
+        true,
+    )
+}
+
+/// Where an `HTTP_PROXY` URL sends traffic.
+#[derive(Debug)]
+enum ProxyTarget {
+    /// This container's loopback, where the agent's proxy listens.
+    Agent(std::net::SocketAddr),
+    /// Some other host.
+    Elsewhere,
+    /// Not an `http://host:port` URL.
+    Unparseable,
+}
+
+/// Classify an `http://[user@]host:port` proxy URL by its host.
+fn proxy_target(url: &str) -> ProxyTarget {
+    let Some((host, port)) = proxy_host_port(url) else {
+        return ProxyTarget::Unparseable;
+    };
+    let host = host.as_str();
+    let ip = if host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") {
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
+    } else if host == "[::1]" {
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        return ProxyTarget::Elsewhere;
+    };
+    ProxyTarget::Agent(std::net::SocketAddr::new(ip, port))
+}
+
+/// Host (an IPv6 one keeps its brackets) and port of an `http://[user@]host:port[/path]` URL.
+fn proxy_host_port(url: &str) -> Option<(String, u16)> {
+    if !url.starts_with("http://") {
+        return None;
+    }
+    let authority = crate::forward_proxy::parse_proxy_url(url)?;
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_owned(), port.parse().ok()?))
+}
+
+/// Effective uid from the text of `/proc/<pid>/status`, whose `Uid:` line
+/// lists the real, effective, saved and filesystem uids.
+fn parse_status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -990,6 +1129,147 @@ mod doctor_tests {
         let s = snap(AgentState::Disconnected, 25, now - 1);
         let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
         assert!(out.contains("\u{26a0} main agent: disconnected (pid 25"));
+    }
+
+    fn only_18080(addr: std::net::SocketAddr) -> bool {
+        addr == std::net::SocketAddr::from(([127, 0, 0, 1], 18080))
+    }
+
+    #[test]
+    fn proxy_status_silent_without_proxy_config() {
+        let (out, failed) = format_proxy_status(
+            false,
+            Some("http://127.0.0.1:18080"),
+            |_| panic!("must not probe without a proxy config"),
+            Some(1000),
+        );
+        assert_eq!(out, "");
+        assert!(!failed);
+    }
+
+    #[test]
+    fn proxy_status_listening() {
+        let (out, failed) =
+            format_proxy_status(true, Some("http://127.0.0.1:18080"), only_18080, Some(0));
+        assert!(out.contains("\u{2713} network proxy listening on 127.0.0.1:18080"));
+        assert!(!failed);
+    }
+
+    #[test]
+    fn proxy_status_not_listening_as_root_points_at_cella_up() {
+        let (out, failed) =
+            format_proxy_status(true, Some("http://127.0.0.1:18081/"), only_18080, Some(0));
+        assert!(out.contains("\u{2717} network proxy not listening on 127.0.0.1:18081"));
+        assert!(out.contains("Run `cella up` on the host"), "{out}");
+        assert!(!out.contains("uid"), "{out}");
+        assert!(failed);
+    }
+
+    #[test]
+    fn proxy_status_not_listening_as_non_root_points_at_cella_up() {
+        let (out, failed) =
+            format_proxy_status(true, Some("http://127.0.0.1:18081"), only_18080, Some(1000));
+        assert!(out.contains("\u{2717} network proxy not listening"));
+        assert!(out.contains("uid 1000"), "{out}");
+        assert!(out.contains("run `cella up` on the host"), "{out}");
+        assert!(!out.contains("--rebuild"), "{out}");
+        assert!(failed);
+    }
+
+    #[test]
+    fn proxy_is_not_expected_when_network_rules_are_disabled() {
+        assert!(proxy_expected(true, None));
+        assert!(proxy_expected(true, Some("0")));
+        assert!(!proxy_expected(true, Some("1")));
+        assert!(!proxy_expected(true, Some("true")));
+        assert!(!proxy_expected(false, None));
+    }
+
+    #[test]
+    fn proxy_status_unknown_agent_uid_points_at_cella_up() {
+        let (out, failed) =
+            format_proxy_status(true, Some("http://127.0.0.1:18081"), only_18080, None);
+        assert!(out.contains("Run `cella up` on the host"), "{out}");
+        assert!(failed);
+    }
+
+    #[test]
+    fn proxy_status_unparseable_http_proxy_warns() {
+        for http_proxy in [
+            Some("http://127.0.0.1"),
+            Some("socks5://127.0.0.1:1080"),
+            Some("https://127.0.0.1:18080"),
+            None,
+        ] {
+            let (out, failed) = format_proxy_status(true, http_proxy, only_18080, Some(0));
+            assert!(
+                out.contains("\u{26a0} network proxy"),
+                "{http_proxy:?}: {out}"
+            );
+            assert!(!failed, "{http_proxy:?}");
+        }
+    }
+
+    /// A proxy on another host is one the user chose over the agent's, so
+    /// there is nothing of the agent's to probe.
+    #[test]
+    fn proxy_status_silent_for_a_proxy_on_another_host() {
+        for http_proxy in [
+            "http://10.0.0.5:18080",
+            "http://127.0.0.2:18080",
+            "http://localhost.evil:18080",
+            "http://proxy.corp:3128/",
+            "http://[::2]:18080",
+        ] {
+            let (out, failed) = format_proxy_status(
+                true,
+                Some(http_proxy),
+                |_| panic!("must not probe {http_proxy}"),
+                Some(0),
+            );
+            assert_eq!(out, "", "{http_proxy}");
+            assert!(!failed, "{http_proxy}");
+        }
+    }
+
+    #[test]
+    fn proxy_status_probes_every_loopback_spelling() {
+        let v4 = std::net::SocketAddr::from(([127, 0, 0, 1], 18080));
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 18080));
+        for (http_proxy, expected) in [
+            ("http://127.0.0.1:18080", v4),
+            ("http://localhost:18080/", v4),
+            ("http://127.0.0.1:18080/x", v4),
+            ("http://user:pw@LOCALHOST:18080", v4),
+            ("http://[::1]:18080", v6),
+        ] {
+            let (out, failed) = format_proxy_status(
+                true,
+                Some(http_proxy),
+                |addr| {
+                    assert_eq!(addr, expected, "{http_proxy}");
+                    false
+                },
+                Some(0),
+            );
+            assert!(
+                out.contains(&format!("not listening on {expected}")),
+                "{http_proxy}: {out}"
+            );
+            assert!(failed, "{http_proxy}");
+        }
+    }
+
+    #[test]
+    fn status_uid_is_the_effective_uid() {
+        let status = "Name:\tcella-agent\nUmask:\t0022\nState:\tS (sleeping)\n\
+                      Tgid:\t25\nPid:\t25\nPPid:\t1\n\
+                      Uid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_status_uid(status), Some(0));
+        assert_eq!(
+            parse_status_uid("Name:\tcella-agent\nGid:\t0\t0\t0\t0\n"),
+            None
+        );
     }
 
     #[test]
