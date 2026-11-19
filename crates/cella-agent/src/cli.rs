@@ -997,10 +997,10 @@ fn format_proxy_status(
         );
     }
     let hint = match agent_uid {
-        Some(uid) if uid != 0 => format!(
-            "The agent runs as uid {uid} and cannot read the root-only proxy config; run `cella up` on the host to restart it as root"
-        ),
-        _ => "Run `cella up` on the host".to_string(),
+        Some(1..) => {
+            "The agent runs as a non-root user and cannot read the root-only proxy config; run `cella up` on the host to restart it as root"
+        }
+        _ => "Run `cella up` on the host",
     };
     (
         format!("  \u{2717} network proxy not listening on {addr}\n    {hint}\n"),
@@ -1161,7 +1161,7 @@ mod doctor_tests {
             format_proxy_status(true, Some("http://127.0.0.1:18081/"), only_18080, Some(0));
         assert!(out.contains("\u{2717} network proxy not listening on 127.0.0.1:18081"));
         assert!(out.contains("Run `cella up` on the host"), "{out}");
-        assert!(!out.contains("uid"), "{out}");
+        assert!(!out.contains("non-root"), "{out}");
         assert!(failed);
     }
 
@@ -1170,7 +1170,7 @@ mod doctor_tests {
         let (out, failed) =
             format_proxy_status(true, Some("http://127.0.0.1:18081"), only_18080, Some(1000));
         assert!(out.contains("\u{2717} network proxy not listening"));
-        assert!(out.contains("uid 1000"), "{out}");
+        assert!(out.contains("non-root user"), "{out}");
         assert!(out.contains("run `cella up` on the host"), "{out}");
         assert!(!out.contains("--rebuild"), "{out}");
         assert!(failed);
