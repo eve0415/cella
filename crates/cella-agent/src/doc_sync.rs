@@ -128,7 +128,7 @@ impl DocState {
             warn!("doc sync: cannot create {}: {e}", parent.display());
         }
         let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|_| b"{}".to_vec());
-        if let Err(e) = cella_filesync::atomic_write(&self.baseline_path, &bytes, 0o600) {
+        if let Err(e) = cella_filesync::atomic_write(&self.baseline_path, &bytes, 0o600, None) {
             warn!(
                 "doc sync: cannot persist baseline {}: {e}",
                 self.baseline_path.display()
@@ -444,9 +444,14 @@ async fn apply_canonical(st: &DocState, content: &str) {
         st.set_baseline(incoming).await;
         return;
     }
-    match cella_filesync::atomic_write(&st.path, local.as_bytes(), 0o600) {
-        Ok(()) => {
-            restore_owner(&st.path);
+    match cella_filesync::atomic_write(&st.path, local.as_bytes(), 0o600, parent_owner(&st.path)) {
+        Ok(ownership) => {
+            if let cella_filesync::Ownership::Failed(e) = ownership {
+                warn!(
+                    "doc sync: cannot hand {} to its directory's owner: {e}",
+                    st.path.display()
+                );
+            }
             if has_pending {
                 debug!(
                     "doc sync: kept a pending local {:?} edit across a daemon push",
@@ -479,29 +484,30 @@ async fn pending_local_patch(st: &DocState) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-/// Restore a file's ownership to whoever owns its parent directory.
+/// Owner (uid, gid) of `path`'s parent directory, for the files this agent
+/// writes there.
 ///
-/// The agent daemon usually runs as root, but `atomic_write` (temp + rename)
-/// installs a fresh root-owned inode — which the remote user's `claude` then
-/// can't read. Chowning to the directory's owner (best-effort, no-op when the
-/// agent already runs as that user) keeps the file readable.
+/// The agent daemon usually runs as root, but `atomic_write` installs a fresh
+/// inode owned by the writer, which the remote user's `claude` then can't
+/// read. Handing the file to the directory's owner keeps it readable; the
+/// owner is set on the temp file's handle before the rename, so no path is
+/// ever chowned. A non-root agent cannot give a file away, so it keeps its own
+/// ownership rather than failing the write.
 #[cfg(unix)]
-fn restore_owner(path: &Path) {
+fn parent_owner(path: &Path) -> Option<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
-    let Some(parent) = path.parent() else { return };
-    let Ok(meta) = std::fs::metadata(parent) else {
-        return;
-    };
-    if let Err(e) = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid())) {
-        warn!(
-            "doc sync: could not restore owner on {}: {e}",
-            path.display()
-        );
+    if !nix::unistd::geteuid().is_root() {
+        return None;
     }
+    let meta = std::fs::metadata(path.parent()?).ok()?;
+    Some((meta.uid(), meta.gid()))
 }
 
 #[cfg(not(unix))]
-fn restore_owner(_path: &Path) {}
+fn parent_owner(path: &Path) -> Option<(u32, u32)> {
+    let _ = path;
+    None
+}
 
 /// Watch one container file and forward its edits to the daemon.
 async fn run_watcher(st: Arc<DocState>, control: Arc<Mutex<ReconnectingClient>>) {

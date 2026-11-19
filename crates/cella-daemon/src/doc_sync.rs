@@ -216,8 +216,8 @@ async fn transact(
 /// sets `host_dirty` so the next transaction retries.
 fn write_host(st: &mut DocSyncState, path: &Path) {
     let out = st.on_disk_string();
-    match cella_filesync::atomic_write(path, out.as_bytes(), 0o600) {
-        Ok(()) => {
+    match cella_filesync::atomic_write(path, out.as_bytes(), 0o600, None) {
+        Ok(_) => {
             st.last_hash = cella_filesync::sha256_hex(out.as_bytes());
             // The host file now equals `out`; record it as the host snapshot so a
             // later host edit diffs against what's actually on disk.
