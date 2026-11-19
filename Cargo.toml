@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -62,7 +62,7 @@ tokio = { version = "=1.54.1", features = [
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 yaml_serde = "=0.10.7"
-toml = "=1.1.8"
+toml = "=1.2.1"
 
 # Encoding
 base64 = "=0.23.1"
@@ -75,11 +75,11 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "=4.6.7", features = ["derive"] }
-clap_complete = "=4.6.11"
+clap = { version = "=4.6.8", features = ["derive"] }
+clap_complete = "=4.6.12"
 
 # Interactive prompts
-inquire = "=0.9.4"
+inquire = "=0.9.5"
 
 # Diagnostics
 miette = { version = "=7.6.0", features = ["fancy"] }
@@ -121,7 +121,7 @@ dirs = "=7.0.0"
 # default miniz_oxide on realistic payloads. See benches/extract.rs.
 # runtime_detection carries zlib-rs/std; without it every CPU-feature probe returns
 # false and only compile-time baseline SIMD survives.
-flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+flate2 = { version = "=1.1.11", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 
 # OCI registry
 # Renamed successor of oci-distribution (oras-project/rust-oci-client).
@@ -133,7 +133,7 @@ oci-client = { version = "=0.18.0", default-features = false, features = ["rustl
 shell-words = "=1.1.1"
 
 # Pattern matching
-regex = "=1.13.1"
+regex = "=1.13.2"
 
 # Semantic versioning
 semver = "=1.0.28"
@@ -159,21 +159,21 @@ http-body-util = "=0.1.5"
 notify = "=8.2.1"
 
 # Process inspection
-nix = { version = "=0.31.3", default-features = false, features = ["signal", "term", "user"] }
+nix = { version = "=0.32.0", default-features = false, features = ["signal", "term", "user"] }
 
 # PTY
 portable-pty = "=0.9.0"
 
 # Proc macros
-syn = { version = "=3.0.9", features = ["full"] }
+syn = { version = "=3.0.10", features = ["full"] }
 quote = "=1.0.47"
 proc-macro2 = "=1.0.107"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.29.0", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 
 # Credential cache memory safety
-zeroize = "=1.9.1"
+zeroize = "=1.9.2"
 
 # Wayland clipboard server (cella-wayland)
 # wayland-backend's pure-Rust server is the default; `server_system` (libwayland)
@@ -194,7 +194,7 @@ wl-clipboard-rs = "=0.9.5"
 arboard = { version = "=3.7.0", features = ["wayland-data-control"] }
 filetime = "=0.2.29"
 insta = { version = "=1.49.0", features = ["json", "yaml", "redactions"] }
-trybuild = "=1.0.122"
+trybuild = "=1.0.125"
 divan = "=0.1.21"
 
 # Internal crates
