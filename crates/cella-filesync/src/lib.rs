@@ -23,18 +23,6 @@ use tokio::sync::mpsc;
 /// Per-process counter making each temp file name unique, so concurrent [`temp_name`] calls from the *same* process (e.g. the daemon's host watcher plus several per-agent handlers) never share a temp inode.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Whether [`atomic_write`] gave the file the owner it was asked for.
-#[derive(Debug)]
-pub enum Ownership {
-    /// No owner was requested; the file belongs to the writer.
-    Unrequested,
-    /// The requested owner was set.
-    Applied,
-    /// The requested owner could not be set (a user-namespaced or rootless
-    /// runtime, NFS `root_squash`), so the file belongs to the writer.
-    Failed(std::io::Error),
-}
-
 /// Lowercase hex SHA-256 of `bytes`. Used as a content fingerprint for the
 /// loop-suppression guards on both sync sides.
 #[must_use]
@@ -46,36 +34,23 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Write `contents` to `path` atomically via temp-write + `rename`.
 ///
-/// Writes a fresh sibling temp file, sets its mode (and owner, when given) on
-/// the open handle, then renames it over `path`. Readers therefore never
-/// observe a partially-written file, and each write installs a fresh inode (so
-/// a concurrent parent-directory watcher reliably sees a create/rename event).
+/// Writes a fresh sibling temp file, sets its mode on the open handle, then renames it over `path`.
+/// Readers therefore never observe a partially-written file, and each write installs a fresh inode (so a concurrent parent-directory watcher reliably sees a create/rename event).
 ///
-/// The temp file is created exclusively, so a file or symlink already at its
-/// name is never written through, and a symlink at `path` is replaced rather
-/// than followed. Such a leftover at the temp name, for example one that a
-/// killed writer with the same pid left behind, is unlinked once (never
-/// followed) and the exclusive create retried.
+/// The temp file is created exclusively, so a file or symlink already at its name is never written through, and a symlink at `path` is replaced rather than followed.
+/// Such a leftover at the temp name, for example one that a killed writer with the same pid left behind, is unlinked once (never followed) and the exclusive create retried.
 ///
-/// `mode` (e.g. `0o600`) and `owner` (uid, gid) are applied on Unix and
-/// ignored elsewhere. An owner that cannot be set does not fail the write: the
-/// file is installed with the writer's ownership and the error is returned in
-/// [`Ownership::Failed`] for the caller to report.
+/// `mode` (e.g. `0o600`) is applied on Unix and ignored elsewhere.
 ///
 /// # Errors
 ///
 /// Returns any I/O error from creating, writing, or renaming the temp file.
-pub fn atomic_write(
-    path: &Path,
-    contents: &[u8],
-    mode: u32,
-    owner: Option<(u32, u32)>,
-) -> std::io::Result<Ownership> {
+pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().unwrap_or_else(|| OsStr::new("config"));
     // Sibling temp in the same directory guarantees the rename is same-fs and therefore atomic.
     let tmp = dir.join(temp_name(file_name));
-    write_through_temp(&tmp, path, contents, mode, owner)
+    write_through_temp(&tmp, path, contents, mode)
 }
 
 /// A fresh name for a temp file to be renamed over `file_name` in the same directory.
@@ -92,48 +67,33 @@ pub fn temp_name(file_name: &OsStr) -> OsString {
 
 /// Create `tmp` exclusively, fill it, and rename it over `path`. Removes `tmp`
 /// on failure only once this call has created it.
-fn write_through_temp(
-    tmp: &Path,
-    path: &Path,
-    contents: &[u8],
-    mode: u32,
-    owner: Option<(u32, u32)>,
-) -> std::io::Result<Ownership> {
+fn write_through_temp(tmp: &Path, path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     let mut file = create_temp(tmp, mode)?;
-
-    let write_result = (|| -> std::io::Result<Ownership> {
-        file.write_all(contents)?;
-        file.flush()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-            Ok(owner.map_or(Ownership::Unrequested, |(uid, gid)| {
-                std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
-                    .map_or_else(Ownership::Failed, |()| Ownership::Applied)
-            }))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (mode, owner);
-            Ok(Ownership::Unrequested)
-        }
-    })();
+    let filled = fill_temp(&mut file, contents, mode);
     drop(file);
-
-    let ownership = match write_result {
-        Ok(ownership) => ownership,
-        Err(e) => {
-            let _ = std::fs::remove_file(tmp);
-            return Err(e);
-        }
-    };
-
-    std::fs::rename(tmp, path)
+    filled
+        .and_then(|()| std::fs::rename(tmp, path))
         .inspect_err(|_| {
             let _ = std::fs::remove_file(tmp);
         })
-        .map(|()| ownership)
+}
+
+/// Write `contents` to a freshly created temp `file`, flush it, and set `mode` on the open handle (on Unix; ignored elsewhere).
+///
+/// # Errors
+///
+/// Returns any I/O error from writing, flushing, or setting the mode.
+pub fn fill_temp(file: &mut std::fs::File, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    file.write_all(contents)?;
+    file.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
 }
 
 /// Create `tmp` exclusively with `mode`. Whatever already sits at that name is
@@ -248,7 +208,7 @@ mod tests {
     fn atomic_write_creates_and_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        atomic_write(&path, b"{\"a\":1}", 0o600, None).unwrap();
+        atomic_write(&path, b"{\"a\":1}", 0o600).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
     }
 
@@ -256,8 +216,8 @@ mod tests {
     fn atomic_write_overwrites_existing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        atomic_write(&path, b"old", 0o600, None).unwrap();
-        atomic_write(&path, b"new", 0o600, None).unwrap();
+        atomic_write(&path, b"old", 0o600).unwrap();
+        atomic_write(&path, b"new", 0o600).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -265,7 +225,7 @@ mod tests {
     fn atomic_write_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        atomic_write(&path, b"x", 0o600, None).unwrap();
+        atomic_write(&path, b"x", 0o600).unwrap();
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -284,7 +244,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret.json");
-        atomic_write(&path, b"x", 0o600, None).unwrap();
+        atomic_write(&path, b"x", 0o600).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
     }
@@ -299,7 +259,7 @@ mod tests {
         let tmp = dir.path().join(".config.json.cella-tmp.planted");
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
 
-        write_through_temp(&tmp, &path, b"new", 0o600, None).unwrap();
+        write_through_temp(&tmp, &path, b"new", 0o600).unwrap();
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
@@ -316,7 +276,7 @@ mod tests {
         let tmp = dir.path().join(".config.json.cella-tmp.stale");
         std::fs::write(&tmp, b"half-written by a killed writer").unwrap();
 
-        write_through_temp(&tmp, &path, b"new", 0o600, None).unwrap();
+        write_through_temp(&tmp, &path, b"new", 0o600).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         assert!(!tmp.exists());
@@ -331,72 +291,11 @@ mod tests {
         let path = dir.path().join("config.json");
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
-        atomic_write(&path, b"new", 0o600, None).unwrap();
+        atomic_write(&path, b"new", 0o600).unwrap();
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
-    }
-
-    /// A group other than `primary` that this process may chown a file it
-    /// owns to: any gid as root, otherwise one of its supplementary groups.
-    #[cfg(target_os = "linux")]
-    fn other_permitted_gid(uid: u32, primary: u32) -> Option<u32> {
-        if uid == 0 {
-            return Some(primary.wrapping_add(4242));
-        }
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix("Groups:"))?
-            .split_whitespace()
-            .filter_map(|g| g.parse().ok())
-            .find(|&g| g != primary)
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn atomic_write_applies_the_requested_owner() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        std::fs::write(&probe, b"").unwrap();
-        let meta = std::fs::metadata(&probe).unwrap();
-        let (uid, default_gid) = (meta.uid(), meta.gid());
-        let Some(gid) = other_permitted_gid(uid, default_gid) else {
-            eprintln!("skipped: no group other than {default_gid} to chown to");
-            return;
-        };
-        let path = dir.path().join("config.json");
-
-        let ownership = atomic_write(&path, b"x", 0o600, Some((uid, gid))).unwrap();
-
-        assert!(matches!(ownership, Ownership::Applied), "{ownership:?}");
-        let meta = std::fs::metadata(&path).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
-    }
-
-    /// Rootless and user-namespaced runtimes refuse the chown; the old
-    /// path-based owner restore only warned there, and so must this.
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_installs_the_file_when_the_owner_cannot_be_set() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        std::fs::write(&probe, b"").unwrap();
-        let own_uid = std::fs::metadata(&probe).unwrap().uid();
-        if own_uid == 0 {
-            eprintln!("skipped: root may chown to any owner");
-            return;
-        }
-        let path = dir.path().join("config.json");
-
-        let ownership = atomic_write(&path, b"new", 0o600, Some((0, 0))).unwrap();
-
-        assert!(matches!(ownership, Ownership::Failed(_)), "{ownership:?}");
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert_eq!(std::fs::metadata(&path).unwrap().uid(), own_uid);
     }
 
     #[tokio::test]
@@ -426,7 +325,7 @@ mod tests {
         std::fs::write(&path, b"initial").unwrap();
 
         let mut handle = watch_file(&path, Duration::from_millis(100)).unwrap();
-        atomic_write(&path, b"replaced", 0o600, None).unwrap();
+        atomic_write(&path, b"replaced", 0o600).unwrap();
 
         let got = tokio::time::timeout(Duration::from_secs(3), handle.changes.recv()).await;
         assert!(
