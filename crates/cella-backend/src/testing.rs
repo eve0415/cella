@@ -20,6 +20,7 @@ use crate::types::{
 #[derive(Debug, Default)]
 pub struct RecordingBackend {
     calls: Mutex<Vec<&'static str>>,
+    exec_cmds: Mutex<Vec<Vec<String>>>,
     running: Option<ContainerInfo>,
 }
 
@@ -28,8 +29,8 @@ impl RecordingBackend {
     /// and `inspect_container`, so a flow gets past locating its container.
     pub fn with_running_container(container: ContainerInfo) -> Self {
         Self {
-            calls: Mutex::default(),
             running: Some(container),
+            ..Self::default()
         }
     }
 
@@ -40,6 +41,20 @@ impl RecordingBackend {
     /// Panics if a previous call panicked while recording.
     pub fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Commands passed to `exec_command` and `exec_detached` so far, in
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous call panicked while recording.
+    pub fn exec_commands(&self) -> Vec<Vec<String>> {
+        self.exec_cmds.lock().unwrap().clone()
+    }
+
+    fn record_exec(&self, opts: &ExecOptions) {
+        self.exec_cmds.lock().unwrap().push(opts.cmd.clone());
     }
 
     /// Record `operation` and return the running container, or fail like
@@ -161,8 +176,9 @@ impl ContainerBackend for RecordingBackend {
     fn exec_command<'a>(
         &'a self,
         _: &'a str,
-        _: &'a ExecOptions,
+        opts: &'a ExecOptions,
     ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+        self.record_exec(opts);
         self.fail("exec_command")
     }
 
@@ -187,8 +203,9 @@ impl ContainerBackend for RecordingBackend {
     fn exec_detached<'a>(
         &'a self,
         _: &'a str,
-        _: &'a ExecOptions,
+        opts: &'a ExecOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
+        self.record_exec(opts);
         self.fail("exec_detached")
     }
 
