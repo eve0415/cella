@@ -36,6 +36,7 @@ Update snapshots with `cargo insta review`. If `cargo-insta` is not installed in
 - **Unsafe code**: Denied at the workspace level. Do not use `unsafe`.
 - **Don't suppress**: No `#[allow(clippy::...)]`, no `_`-prefixed unused variables. Fix the warning or delete the dead code.
 - **`too_many_lines`**: Clippy's limit is 100 LOC per function. Extract helpers before hitting the limit — don't reach for `#[allow]`.
+- **Lifetime annotations**: Run `cargo gevatter check -- --workspace --all-targets` to find lifetime annotations that are stricter than they need to be, and `cargo gevatter fix -- --workspace --all-targets` followed by `cargo fmt --all` to apply the suggestions. This check runs locally only, not in CI. The dev container installs `cargo-gevatter`; outside it, install the version pinned in `.devcontainer/devcontainer.json` with `cargo install cargo-gevatter@<version>`, then run `cargo gevatter toolchain install`.
 
 ## Testing Conventions
 

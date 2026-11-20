@@ -12,6 +12,8 @@ cargo test -p <crate>
 
 Full-workspace equivalents (`--workspace`) take minutes; run per-crate while iterating and the full sweep once at the end.
 
+Lifetime annotations are checked locally (not in CI) with `cargo gevatter check -- --workspace --all-targets`. The dev container installs `cargo-gevatter`; outside it, install the version pinned in `.devcontainer/devcontainer.json` with `cargo install cargo-gevatter@<version>`, then run `cargo gevatter toolchain install`. After `cargo gevatter fix -- --workspace --all-targets`, run `cargo fmt --all`.
+
 ## Hard rules
 
 - **No `#[allow(clippy::...)]`.** Fix the warning or restructure the code. Workspace lints are clippy::pedantic + clippy::nursery, `unsafe_code` denied, `unused_qualifications` denied.

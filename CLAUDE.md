@@ -9,6 +9,7 @@ cargo fmt --all -- --check                                            # format c
 cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::all  # lint (all warnings are errors)
 cargo test --workspace                                                # all tests (integration tests skip if runtime unavailable)
 cargo insta test --workspace --check --unreferenced=reject            # snapshot tests
+cargo gevatter check -- --workspace --all-targets                     # lifetime annotations (local only, not run in CI)
 ```
 
 Integration tests use `#[runtime_test]` from `cella-testing` for runtime detection. They always compile and skip gracefully when the required runtime (Docker, compose, network, etc.) is unavailable. No special flags needed — `cargo test --workspace` runs everything.
@@ -16,6 +17,8 @@ Integration tests use `#[runtime_test]` from `cella-testing` for runtime detecti
 Update snapshots with `cargo insta review`.
 
 **Note:** the dev container installs `cargo-insta` via `postCreateCommand`, so the snapshot gate runs here. Update snapshots with `cargo insta review`.
+
+The dev container also installs `cargo-gevatter` (outside it, install the version pinned in `.devcontainer/devcontainer.json` with `cargo install cargo-gevatter@<version>`, then run `cargo gevatter toolchain install`). `cargo gevatter fix -- --workspace --all-targets` applies its suggestions; run `cargo fmt --all` afterwards, because it writes inline `where` clauses.
 
 ## Testing
 
