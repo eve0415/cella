@@ -233,8 +233,7 @@ impl TemplateCache {
     pub fn staging_path(final_path: &Path) -> PathBuf {
         let name = final_path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         let staging_name = format!("{name}.partial-{}", process::id());
         final_path.with_file_name(staging_name)
     }
@@ -329,8 +328,8 @@ mod tests {
 
         // Manually backdate the file to simulate expiry
         let path = cache.collection_path("ghcr.io");
-        let old_time = filetime::FileTime::from_unix_time(0, 0);
-        filetime::set_file_mtime(&path, old_time).unwrap();
+        let old_time = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        std::fs::set_times(&path, old_time).unwrap();
 
         // Fresh cache should miss
         assert!(cache.get_collection("ghcr.io").is_none());
@@ -610,8 +609,8 @@ mod tests {
 
         // Backdate to simulate expiry
         let path = cache.feature_collection_path("ghcr.io/features");
-        let old_time = filetime::FileTime::from_unix_time(0, 0);
-        filetime::set_file_mtime(&path, old_time).unwrap();
+        let old_time = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        std::fs::set_times(&path, old_time).unwrap();
 
         // Fresh cache should miss
         assert!(cache.get_feature_collection("ghcr.io/features").is_none());

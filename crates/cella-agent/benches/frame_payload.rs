@@ -32,9 +32,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn source(len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect()
+    Vec::from_fn(len, |i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
 }
 
 /// Zero-then-overwrite, then copy again into `Bytes`.

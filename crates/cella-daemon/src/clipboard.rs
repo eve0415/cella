@@ -31,7 +31,7 @@ impl ClipboardHandler {
         }
     }
 
-    pub fn backend_name(&self) -> &str {
+    pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
 

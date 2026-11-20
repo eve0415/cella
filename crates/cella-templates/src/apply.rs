@@ -448,7 +448,7 @@ fn extract_to_workspace<S: std::hash::BuildHasher>(
         let dest_path = dest.join(&file_name);
 
         // Compute path relative to template root for exclusion matching.
-        let relative = src_path.strip_prefix(template_root).unwrap_or(&src_path);
+        let relative = src_path.trim_prefix(template_root);
         let relative_str = relative.to_string_lossy();
 
         // Always-excluded names — exact root-level relative paths only.
@@ -582,7 +582,7 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
 
         // Check if this path should be excluded
         if !excluded_paths.is_empty() {
-            let relative = src_path.strip_prefix(template_root).unwrap_or(&src_path);
+            let relative = src_path.trim_prefix(template_root);
             let relative_str = relative.to_string_lossy();
             if excluded_paths.iter().any(|pat| pat.matches(&relative_str)) {
                 continue;

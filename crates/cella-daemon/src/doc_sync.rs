@@ -111,10 +111,7 @@ impl DocSyncState {
             .and_then(|s| host_canonical(doc, s, host_claude.as_deref()));
         let started_from_host = parsed.is_some();
         let canonical = parsed.unwrap_or_else(|| serde_json::json!({}));
-        let last_hash = raw
-            .as_deref()
-            .map(cella_filesync::sha256_hex)
-            .unwrap_or_default();
+        let last_hash = raw.as_deref().map_or_default(cella_filesync::sha256_hex);
         Self {
             doc,
             host_snapshot: canonical.clone(),

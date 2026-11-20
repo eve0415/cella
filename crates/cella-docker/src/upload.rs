@@ -75,7 +75,7 @@ fn create_tar_archive(files: &[FileToUpload]) -> Result<Vec<u8>, CellaDockerErro
         // Add directory entries (append_data handles GNU long name extensions
         // for paths exceeding standard tar header field sizes)
         for dir in &dirs {
-            let dir_path = dir.strip_prefix('/').unwrap_or(dir);
+            let dir_path = dir.trim_prefix('/');
             if dir_path.is_empty() || !dir_path.contains('/') {
                 // Skip top-level dirs (/tmp, /home, /etc, ...) — they always
                 // exist and may have non-default permissions (e.g. /tmp is 1777).
@@ -91,7 +91,7 @@ fn create_tar_archive(files: &[FileToUpload]) -> Result<Vec<u8>, CellaDockerErro
 
         // Add file entries
         for file in files {
-            let path = file.path.strip_prefix('/').unwrap_or(&file.path);
+            let path = file.path.trim_prefix('/');
             let mut header = tar::Header::new_gnu();
             header.set_size(file.content.len() as u64);
             header.set_mode(file.mode);

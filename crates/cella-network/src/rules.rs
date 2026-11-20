@@ -1065,14 +1065,14 @@ mod tests {
         let (matcher, payloads) =
             matcher_with_payloads(vec![respond_rule("api.example.com", &[], &[529, 529, 200])]);
 
-        let served: Vec<u16> = (0..4)
-            .map(|_| match matcher.evaluate("api.example.com", "/").action {
+        let served: Vec<u16> = Vec::from_fn(4, |_| {
+            match matcher.evaluate("api.example.com", "/").action {
                 VerdictAction::Respond(rule) => {
                     payloads.responses[rule.index().get()][rule.next_index()].status
                 }
                 other => panic!("expected a respond verdict, got {other:?}"),
-            })
-            .collect();
+            }
+        });
         assert_eq!(served, [529, 529, 200, 200]);
     }
 

@@ -66,7 +66,7 @@ fn build_env_filter(rust_log_set: bool, level: Option<LogLevel>) -> EnvFilter {
 
 /// cella — Dev containers reinvented for the AI age
 #[derive(Parser)]
-#[command(name = "cella", version, about, disable_version_flag = true)]
+#[command(name = "cella", version, disable_version_flag = true)]
 struct Cli {
     /// Print version.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
@@ -170,6 +170,19 @@ mod tests {
     // Helper to parse CLI args. Returns the parsed Cli or the error.
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    // ── top-level help ──────────────────────────────────────────────
+
+    #[test]
+    fn top_level_about_is_the_tagline() {
+        use clap::CommandFactory;
+
+        let about = Cli::command().get_about().map(ToString::to_string);
+        assert_eq!(
+            about.as_deref(),
+            Some("cella — Dev containers reinvented for the AI age")
+        );
     }
 
     // ── up command ──────────────────────────────────────────────────

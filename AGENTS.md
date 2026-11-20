@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rust workspace (edition 2024, MSRV 1.99.1). Crates live in `crates/`.
+Rust workspace (edition 2024, MSRV 1.100.0). Crates live in `crates/`.
 
 ## Gates — run before declaring any change complete
 
@@ -11,6 +11,8 @@ cargo test -p <crate>
 ```
 
 Full-workspace equivalents (`--workspace`) take minutes; run per-crate while iterating and the full sweep once at the end.
+
+Lifetime annotations are checked locally (not in CI) with `cargo gevatter check -- --workspace --all-targets`. The dev container installs `cargo-gevatter`; outside it, install the version pinned in `.devcontainer/devcontainer.json` with `cargo install cargo-gevatter@<version>`, then run `cargo gevatter toolchain install`. After `cargo gevatter fix -- --workspace --all-targets`, run `cargo fmt --all`.
 
 ## Hard rules
 

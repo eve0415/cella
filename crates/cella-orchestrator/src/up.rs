@@ -189,23 +189,26 @@ where
     }
 }
 
-impl EnsureUpContext<'_> {
-    const fn config_json(&self) -> &serde_json::Value {
+impl<'a> EnsureUpContext<'a> {
+    const fn config_json(&self) -> &'a serde_json::Value {
         &self.config.resolved.config
     }
 
-    fn workspace_folder_str(&self) -> &str {
+    fn workspace_folder_str(&self) -> &'a str {
         self.config
             .workspace_folder_from_config
             .unwrap_or(self.config.default_workspace_folder)
     }
 
     fn build_lifecycle_ctx<'b>(
-        &'b self,
+        &self,
         container_id: &'b str,
         user: &'b str,
         env: &'b [String],
-    ) -> LifecycleContext<'b> {
+    ) -> LifecycleContext<'b>
+    where
+        'a: 'b,
+    {
         let progress = self.progress.clone();
         LifecycleContext {
             client: self.client,
@@ -2362,8 +2365,7 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
     config
         .get("forwardPorts")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(forward_port_number).collect())
-        .unwrap_or_default()
+        .map_or_default(|arr| arr.iter().filter_map(forward_port_number).collect())
 }
 
 /// Run the full non-compose container-up pipeline.

@@ -468,10 +468,10 @@ pub async fn check_compose_cli() -> Result<String, CellaComposeError> {
 pub fn parse_compose_version(version_str: &str) -> Option<(u32, u32, u32)> {
     // Find a version-like pattern: optional 'v' prefix followed by digit.digit.digit
     let version_part = version_str.split_whitespace().find(|s| {
-        let stripped = s.strip_prefix('v').unwrap_or(s);
+        let stripped = s.trim_prefix('v');
         stripped.starts_with(|c: char| c.is_ascii_digit()) && stripped.contains('.')
     })?;
-    let version_part = version_part.strip_prefix('v').unwrap_or(version_part);
+    let version_part = version_part.trim_prefix('v');
     let mut parts = version_part.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;

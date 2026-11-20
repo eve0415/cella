@@ -5533,7 +5533,7 @@ exit 1
         // /home/dev/.local/state/demo. The fixture deliberately avoids any
         // forwarded-mount target, since the walk would chown the host's
         // directory there.
-        let backend = MockBackend::new(std::iter::repeat_with(|| Ok(ok_exit(0))).take(7).collect());
+        let backend = MockBackend::new(Vec::from_fn(7, |_| Ok(ok_exit(0))));
 
         chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
 

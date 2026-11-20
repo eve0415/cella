@@ -79,13 +79,11 @@ fn main() {
     // Everything below this point is setup and must stay out of the loop.
     let blob = build_layer(entries);
     let _ = std::fs::remove_dir_all(&dest_root);
-    let dests: Vec<PathBuf> = (0..iterations)
-        .map(|i| {
-            let d = dest_root.join(format!("run{i}"));
-            std::fs::create_dir_all(&d).expect("create dest");
-            d
-        })
-        .collect();
+    let dests: Vec<PathBuf> = Vec::from_fn(iterations, |i| {
+        let d = dest_root.join(format!("run{i}"));
+        std::fs::create_dir_all(&d).expect("create dest");
+        d
+    });
 
     let mut out = std::io::stderr();
     writeln!(

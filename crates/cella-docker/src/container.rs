@@ -350,7 +350,7 @@ impl DockerClient {
             .network_settings
             .as_ref()
             .and_then(|ns| ns.ports.as_ref())
-            .map(|ports_map| {
+            .map_or_default(|ports_map| {
                 ports_map
                     .iter()
                     .filter_map(|(key, bindings)| {
@@ -369,8 +369,7 @@ impl DockerClient {
                         })
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         let container_user = inspect
             .config

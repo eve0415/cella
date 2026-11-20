@@ -40,8 +40,7 @@ fn git_content_hash(workspace_root: &Path) -> Option<String> {
         .current_dir(workspace_root)
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).to_string());
 
     let input = format!("{head_hash}\n{status}");
     Some(fast_hash_short(&input))

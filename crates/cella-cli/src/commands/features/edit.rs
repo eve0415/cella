@@ -280,8 +280,7 @@ async fn prompt_add_feature(
             let desc = f
                 .description
                 .as_deref()
-                .map(|d| format!(" - {d}"))
-                .unwrap_or_default();
+                .map_or_default(|d| format!(" - {d}"));
             format!("{name}{desc}")
         })
         .collect();

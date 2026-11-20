@@ -3,6 +3,7 @@ name = "cella-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 cella-backend.workspace = true
@@ -21,8 +22,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [build-dependencies]
-cella-codegen = { path = "../cella-codegen" }
-serde_json.workspace = true
+cella-codegen.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

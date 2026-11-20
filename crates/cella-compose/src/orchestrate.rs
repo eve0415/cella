@@ -618,8 +618,7 @@ async fn resolve_user_and_env(
     // wrapped entrypoint is skipped unless `overrideCommand` is set.
     let feature_entrypoints = effective_feature_config
         .as_ref()
-        .map(|fc| fc.entrypoints.clone())
-        .unwrap_or_default();
+        .map_or_default(|fc| fc.entrypoints.clone());
     // Merged `devcontainer.metadata` label: the features path reuses the label
     // computed during feature resolution; otherwise merge the base image's
     // metadata with the devcontainer.json config entry (mirrors single-container
@@ -1139,9 +1138,7 @@ fn write_build_override(
         build_dockerfile: features_build.map(|b| b.combined_dockerfile.clone()),
         build_target: features_build.map(|b| b.build_target.clone()),
         build_context: features_build.and_then(|b| b.build_context.clone()),
-        additional_contexts: features_build
-            .map(|b| b.additional_contexts.clone())
-            .unwrap_or_default(),
+        additional_contexts: features_build.map_or_default(|b| b.additional_contexts.clone()),
         build_secrets: Vec::new(),
         // `up` does not thread `cella build --label`; image labels are a
         // build-only concern. Keep empty so the `up` override is unchanged.
@@ -1452,9 +1449,7 @@ fn write_final_override(
         build_dockerfile: features_build.map(|b| b.combined_dockerfile.clone()),
         build_target: features_build.map(|b| b.build_target.clone()),
         build_context: features_build.and_then(|b| b.build_context.clone()),
-        additional_contexts: features_build
-            .map(|b| b.additional_contexts.clone())
-            .unwrap_or_default(),
+        additional_contexts: features_build.map_or_default(|b| b.additional_contexts.clone()),
         build_secrets: Vec::new(),
         // `up` does not thread `cella build --label`; image labels are a
         // build-only concern. Keep empty so the `up` override is unchanged.
@@ -1796,11 +1791,14 @@ fn compose_metadata_label(
 
 /// The feature-resolution input for `compose up`: the substituted config for
 /// resolution, the raw config for the persisted label.
-const fn compose_features_input<'a>(
-    cfg: &'a ComposeUpConfig<'_>,
+const fn compose_features_input<'a, 'b>(
+    cfg: &ComposeUpConfig<'b>,
     project: &'a ComposeProject,
     subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
-) -> crate::combined_dockerfile_build::ResolveComposeFeaturesInput<'a> {
+) -> crate::combined_dockerfile_build::ResolveComposeFeaturesInput<'a>
+where
+    'b: 'a,
+{
     crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
         config: cfg.config,
         subst_ctx,

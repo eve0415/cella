@@ -216,8 +216,7 @@ pub fn parse_other_ports_attributes(config: &serde_json::Value) -> Option<PortAt
     let on_auto_forward = obj
         .get("onAutoForward")
         .and_then(|v| v.as_str())
-        .map(parse_on_auto_forward)
-        .unwrap_or_default();
+        .map_or_default(parse_on_auto_forward);
 
     let label = obj.get("label").and_then(|v| v.as_str()).map(String::from);
 
@@ -254,8 +253,7 @@ fn parse_single_port_attributes(key: &str, value: &serde_json::Value) -> Option<
     let on_auto_forward = obj
         .get("onAutoForward")
         .and_then(|v| v.as_str())
-        .map(parse_on_auto_forward)
-        .unwrap_or_default();
+        .map_or_default(parse_on_auto_forward);
 
     let label = obj.get("label").and_then(|v| v.as_str()).map(String::from);
 

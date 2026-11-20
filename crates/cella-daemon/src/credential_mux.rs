@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::mem::DropGuard;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -739,7 +740,10 @@ async fn process_request_end<W: AsyncWrite + Unpin + Send + 'static>(
     let in_flight_clone = in_flight.clone();
 
     let handle = tokio::spawn(async move {
-        let _guard = InFlightGuard::new(in_flight_clone);
+        // Decrements the in-flight counter when the task ends.
+        let _guard = DropGuard::new(in_flight_clone, |counter| {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        });
         execute_upstream(
             request_id,
             &handshake,
@@ -752,23 +756,6 @@ async fn process_request_end<W: AsyncWrite + Unpin + Send + 'static>(
     });
 
     state.task_handle = Some(handle);
-}
-
-/// RAII guard that decrements the in-flight counter on drop.
-struct InFlightGuard {
-    counter: Arc<AtomicUsize>,
-}
-
-impl InFlightGuard {
-    const fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self { counter }
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +922,7 @@ fn process_cancel(
         return; // RESPONSE_END already sent — CANCEL is a no-op
     }
 
-    // If a task was spawned, its InFlightGuard handles the decrement on abort.
+    // If a task was spawned, its drop guard handles the decrement on abort.
     // If no task was spawned yet, we decrement here.
     if let Some(handle) = state.task_handle.take() {
         handle.abort();
@@ -955,7 +942,7 @@ fn process_cancel(
 /// Transition a request to Terminal state.
 ///
 /// If the request was counted in `in_flight` but no upstream task was
-/// spawned (so no `InFlightGuard` will handle the decrement), this
+/// spawned (so no task drop guard will handle the decrement), this
 /// decrements the counter to prevent counter leaks.
 fn mark_terminal(state: &mut RequestState, in_flight: &Arc<AtomicUsize>) {
     if state.phase == RequestPhase::Terminal {

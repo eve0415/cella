@@ -201,11 +201,7 @@ fn create_inner(
                 || stderr.contains("already used by worktree") =>
         {
             // Parse the path from git's error: "fatal: 'branch' is already checked out at '/path'"
-            let checked_out_path = stderr
-                .split('\'')
-                .nth(3)
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let checked_out_path = stderr.split('\'').nth(3).map_or_default(PathBuf::from);
             Err(CellaGitError::BranchCheckedOut {
                 branch: branch.to_string(),
                 worktree_path: checked_out_path,
@@ -280,7 +276,7 @@ fn parse_porcelain_output(output: &str) -> Vec<WorktreeInfo> {
             current_head = Some(head.to_string());
         } else if let Some(branch) = line.strip_prefix("branch ") {
             // "refs/heads/main" → "main"
-            let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            let short = branch.trim_prefix("refs/heads/");
             current_branch = Some(short.to_string());
         } else if line == "bare" {
             is_bare = true;

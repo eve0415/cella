@@ -189,13 +189,12 @@ fn reject_respond_fields(layer: &serde_json::Value) -> Result<(), CellaConfigErr
         let paths: Vec<String> = obj
             .get("paths")
             .and_then(serde_json::Value::as_array)
-            .map(|paths| {
+            .map_or_default(|paths| {
                 paths
                     .iter()
                     .filter_map(|p| p.as_str().map(str::to_string))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         return Err(CellaConfigError::RespondFieldInCustomizations {
             rule: cella_network::config::rule_label(domain, &paths),
             field: field.to_string(),

@@ -529,7 +529,7 @@ fn build_error_response(category: &str, message: &str) -> hyper::Response<BoxBod
         .header("x-cella-error", category)
         .body(
             Full::new(Bytes::from(message.to_string()))
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+                .map_err(|e| match e {})
                 .boxed(),
         )
         .expect("building error response")
@@ -592,9 +592,7 @@ mod tests {
     #[test]
     fn request_id_monotonic() {
         let counter = AtomicU32::new(1);
-        let ids: Vec<u32> = (0..100)
-            .map(|_| counter.fetch_add(1, Ordering::Relaxed))
-            .collect();
+        let ids: Vec<u32> = Vec::from_fn(100, |_| counter.fetch_add(1, Ordering::Relaxed));
         for window in ids.windows(2) {
             assert_eq!(window[1], window[0] + 1);
         }

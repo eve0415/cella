@@ -171,8 +171,7 @@ impl LogsArgs {
             let phase_name = file
                 .path()
                 .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
+                .map_or_default(|s| s.to_string_lossy().to_string());
             let content = std::fs::read_to_string(file.path())?;
             if !content.is_empty() {
                 eprintln!("[{phase_name}]");

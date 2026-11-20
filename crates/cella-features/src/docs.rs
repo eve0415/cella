@@ -228,7 +228,7 @@ fn build_repo_url(feature_id: &str, input: &GenerateDocsInput<'_>) -> String {
     // slashes.  This makes the default `--project-folder .` produce a clean URL
     // with no stray `./` segment (matching the official CLI behaviour).
     let raw = input.project_folder.to_string_lossy();
-    let trimmed = raw.strip_prefix("./").unwrap_or(&raw).trim_end_matches('/');
+    let trimmed = raw.trim_prefix("./").trim_end_matches('/');
     // A bare `.` means "current directory" — collapse to empty so we don't
     // embed a literal `.` in the URL.
     let base = if trimmed == "." { "" } else { trimmed };
@@ -330,8 +330,7 @@ fn generate_deprecation_header(parsed: &serde_json::Value) -> String {
     let legacy_ids: Vec<&str> = parsed
         .get("legacyIds")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
 
     if !deprecated && legacy_ids.is_empty() {
         return String::new();

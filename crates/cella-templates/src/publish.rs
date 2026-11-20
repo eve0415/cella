@@ -241,8 +241,7 @@ async fn publish_collection_index(
     for dir in template_dirs {
         let id = dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
 
         // Skip templates that failed or were skipped
         let Some(result) = output.get(&id) else {

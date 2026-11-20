@@ -17,26 +17,24 @@ use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction}
 use cella_network::rules::RuleMatcher;
 
 fn build_config(rules: usize) -> NetworkConfig {
-    let rules = (0..rules)
-        .map(|i| {
-            let domain = if i % 3 == 0 {
-                format!("*.svc{i}.internal")
-            } else {
-                format!("api{i}.example.com")
-            };
-            let paths = if i % 4 == 0 {
-                vec![format!("/v1/admin{i}/**"), format!("/internal{i}/*")]
-            } else {
-                Vec::new()
-            };
-            NetworkRule {
-                domain,
-                paths,
-                action: RuleAction::Block,
-                ..Default::default()
-            }
-        })
-        .collect();
+    let rules = Vec::from_fn(rules, |i| {
+        let domain = if i % 3 == 0 {
+            format!("*.svc{i}.internal")
+        } else {
+            format!("api{i}.example.com")
+        };
+        let paths = if i % 4 == 0 {
+            vec![format!("/v1/admin{i}/**"), format!("/internal{i}/*")]
+        } else {
+            Vec::new()
+        };
+        NetworkRule {
+            domain,
+            paths,
+            action: RuleAction::Block,
+            ..Default::default()
+        }
+    });
 
     NetworkConfig {
         mode: NetworkMode::Denylist,

@@ -88,16 +88,14 @@ impl Table {
         }
 
         // 1. Compute natural widths
-        let mut widths: Vec<usize> = (0..ncols)
-            .map(|i| {
-                let max_val = self.rows.iter().map(|row| row[i].len()).max().unwrap_or(0);
-                self.columns[i]
-                    .header
-                    .len()
-                    .max(max_val)
-                    .max(self.columns[i].min_width)
-            })
-            .collect();
+        let mut widths: Vec<usize> = Vec::from_fn(ncols, |i| {
+            let max_val = self.rows.iter().map(|row| row[i].len()).max().unwrap_or(0);
+            self.columns[i]
+                .header
+                .len()
+                .max(max_val)
+                .max(self.columns[i].min_width)
+        });
 
         // 2. Shrink if needed
         if let Some(tw) = term_width {

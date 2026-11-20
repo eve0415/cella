@@ -682,9 +682,7 @@ mod tests {
 
     /// More distinct names than a `HeaderMap` can hold.
     fn too_many_headers() -> Vec<(String, String)> {
-        (0..40_000)
-            .map(|i| (format!("x-h{i}"), "1".to_string()))
-            .collect()
+        Vec::from_fn(40_000, |i| (format!("x-h{i}"), "1".to_string()))
     }
 
     #[test]

@@ -690,12 +690,11 @@ pub fn parse_build_options(
     let args: HashMap<String, String> = build
         .get("args")
         .and_then(|v| v.as_object())
-        .map(|obj| {
+        .map_or_default(|obj| {
             obj.iter()
                 .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     let target = build
         .get("target")
@@ -729,12 +728,11 @@ pub fn parse_build_options(
     let mut options: Vec<String> = build
         .get("options")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     if no_cache {
         options.extend(["--no-cache".to_string(), "--pull".to_string()]);

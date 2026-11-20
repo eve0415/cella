@@ -1139,8 +1139,7 @@ async fn lookup_container_labels(
         handles
             .values()
             .find(|h| h.container_id == container_id)
-            .map(|h| (h.backend_kind.clone(), h.docker_host.clone()))
-            .unwrap_or_default()
+            .map_or_default(|h| (h.backend_kind.clone(), h.docker_host.clone()))
     };
 
     let cmd_name = match backend_kind.as_deref() {
@@ -1545,14 +1544,11 @@ fn try_parse_branch_json(text: &str) -> Option<cella_protocol::WorktreeOperation
 /// Expected format: `{"pruned":["branch1","branch2"],"errors":["msg"]}`
 fn parse_prune_json_output(stdout: &str) -> (Vec<String>, Vec<String>) {
     fn extract_strings(v: &serde_json::Value, key: &str) -> Vec<String> {
-        v.get(key)
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
+        v.get(key).and_then(|a| a.as_array()).map_or_default(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
     }
 
     let trimmed = stdout.trim();
@@ -1671,7 +1667,7 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_protocol::WorktreeEntry> 
         if let Some(p) = line.strip_prefix("worktree ") {
             path = Some(p.to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
-            let short = b.strip_prefix("refs/heads/").unwrap_or(b);
+            let short = b.trim_prefix("refs/heads/");
             branch = Some(short.to_string());
         } else if line == "bare" {
             is_bare = true;

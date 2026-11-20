@@ -357,12 +357,10 @@ fn resolve_empty_features(
     debug!("no features declared in devcontainer.json");
     let build_context = cache.build_context_path("empty");
     std::fs::create_dir_all(&build_context)?;
-    let container_config = base_image_metadata
-        .map(|m| {
-            let (cfg, _) = parse_image_metadata(m);
-            merge_with_devcontainer(&cfg, config)
-        })
-        .unwrap_or_default();
+    let container_config = base_image_metadata.map_or_default(|m| {
+        let (cfg, _) = parse_image_metadata(m);
+        merge_with_devcontainer(&cfg, config)
+    });
     Ok(ResolvedFeatures {
         features: Vec::new(),
         dockerfile: String::new(),

@@ -573,13 +573,13 @@ mod tests {
 
         // Force a refresh so the fresh-cache branch cannot serve this, then
         // backdate so only the stale reader can.
-        let old = filetime::FileTime::from_unix_time(0, 0);
+        let old = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
         let entry = std::fs::read_dir(dir.path())
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
-        filetime::set_file_mtime(entry.path(), old).unwrap();
+        std::fs::set_times(entry.path(), old).unwrap();
 
         let fetched = fetch_image_tags(&cache, "registry.invalid/foo/bar", true)
             .await
@@ -669,9 +669,7 @@ mod tests {
 
     #[test]
     fn pinnable_tags_truncates_to_max() {
-        let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)
-            .map(|i| format!("4.0.{i}-trixie"))
-            .collect();
+        let owned: Vec<String> = Vec::from_fn(MAX_PINNED_TAGS + 5, |i| format!("4.0.{i}-trixie"));
         let tags: Vec<&str> = owned.iter().map(String::as_str).collect();
         let pinned = pinnable_tags(&tags, "trixie");
         assert_eq!(pinned.len(), MAX_PINNED_TAGS);

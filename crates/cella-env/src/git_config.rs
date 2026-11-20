@@ -171,11 +171,7 @@ fn is_safe_key(key: &str) -> bool {
     // Prefix allowlist (all keys under these prefixes)
     let prefixes = ["alias.", "color."];
 
-    if prefixes.iter().any(|p| key_lower.starts_with(p)) {
-        return true;
-    }
-
-    false
+    prefixes.iter().any(|p| key_lower.starts_with(p))
 }
 
 /// Git config keys forwarded when the host signs commits with SSH.
