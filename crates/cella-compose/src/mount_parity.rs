@@ -1791,7 +1791,7 @@ mod tests {
         let env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
         let fp_before = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
-        settings.tools.claude_code.forward_config = !settings.tools.claude_code.forward_config;
+        settings.tools.claude_code.forward_config.toggle();
         let fp_after = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
         assert_ne!(
             fp_before, fp_after,
