@@ -669,9 +669,7 @@ mod tests {
 
     #[test]
     fn pinnable_tags_truncates_to_max() {
-        let owned: Vec<String> = (0..MAX_PINNED_TAGS + 5)
-            .map(|i| format!("4.0.{i}-trixie"))
-            .collect();
+        let owned: Vec<String> = Vec::from_fn(MAX_PINNED_TAGS + 5, |i| format!("4.0.{i}-trixie"));
         let tags: Vec<&str> = owned.iter().map(String::as_str).collect();
         let pinned = pinnable_tags(&tags, "trixie");
         assert_eq!(pinned.len(), MAX_PINNED_TAGS);

@@ -24,26 +24,24 @@ const RULE_COUNTS: &[usize] = &[8, 32, 128];
 /// Build a rule set shaped like a real policy: mostly domain-only rules with
 /// a wildcard label, plus a path-bearing rule every fourth entry.
 fn build_config(rules: usize) -> NetworkConfig {
-    let rules = (0..rules)
-        .map(|i| {
-            let domain = if i % 3 == 0 {
-                format!("*.svc{i}.internal")
-            } else {
-                format!("api{i}.example.com")
-            };
-            let paths = if i % 4 == 0 {
-                vec![format!("/v1/admin{i}/**"), format!("/internal{i}/*")]
-            } else {
-                Vec::new()
-            };
-            NetworkRule {
-                domain,
-                paths,
-                action: RuleAction::Block,
-                ..Default::default()
-            }
-        })
-        .collect();
+    let rules = Vec::from_fn(rules, |i| {
+        let domain = if i % 3 == 0 {
+            format!("*.svc{i}.internal")
+        } else {
+            format!("api{i}.example.com")
+        };
+        let paths = if i % 4 == 0 {
+            vec![format!("/v1/admin{i}/**"), format!("/internal{i}/*")]
+        } else {
+            Vec::new()
+        };
+        NetworkRule {
+            domain,
+            paths,
+            action: RuleAction::Block,
+            ..Default::default()
+        }
+    });
 
     NetworkConfig {
         mode: NetworkMode::Denylist,
