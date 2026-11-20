@@ -145,8 +145,8 @@ mod tests {
 
         // Backdate past the TTL — without this the test cannot tell `get`
         // and `get_stale` apart.
-        let old = filetime::FileTime::from_unix_time(0, 0);
-        filetime::set_file_mtime(cache.path_for(REF), old).unwrap();
+        let old = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        std::fs::set_times(cache.path_for(REF), old).unwrap();
 
         assert_eq!(cache.get(REF), None, "expired entry must miss");
         assert_eq!(

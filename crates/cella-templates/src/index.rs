@@ -326,8 +326,8 @@ mod tests {
 
         // Backdate to simulate expiry
         let path = index_cache_path(&cache, key);
-        let old_time = filetime::FileTime::from_unix_time(0, 0);
-        filetime::set_file_mtime(&path, old_time).unwrap();
+        let old_time = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        std::fs::set_times(&path, old_time).unwrap();
 
         // Fresh cache should miss
         assert!(get_cached_index(&cache, key).is_none());

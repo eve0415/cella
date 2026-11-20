@@ -190,7 +190,6 @@ wayland-client = "=0.31.15"
 # `wayland-data-control` is NOT default — without it arboard has no Wayland
 # backend compiled in and silently falls through to X11.
 arboard = { version = "=3.7.0", features = ["wayland-data-control"] }
-filetime = "=0.2.29"
 insta = { version = "=1.49.0", features = ["json", "yaml", "redactions"] }
 trybuild = "=1.0.125"
 divan = "=0.1.21"

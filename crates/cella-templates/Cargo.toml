@@ -28,7 +28,6 @@ semver.workspace = true
 
 [dev-dependencies]
 cella-testing.workspace = true
-filetime.workspace = true
 tempfile.workspace = true
 # Not referenced by name in this crate — the `runtime_test` macro expands to it.
 tokio.workspace = true
