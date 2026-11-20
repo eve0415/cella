@@ -1313,7 +1313,7 @@ async fn plain_http_websocket_upgrade_offers_only_websocket_upstream() {
     )
     .await;
     assert!(head.starts_with("HTTP/1.1 101"), "response was {head:?}");
-    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.clone());
     assert_eq!(heads.len(), 1, "heads were {heads:?}");
     let upgrade_lines: Vec<&str> = heads[0]
         .lines()
@@ -1349,7 +1349,7 @@ async fn plain_http_upgrade_to_other_protocol_is_not_relayed() {
     let _ = stream.write_all(follow_up.as_bytes()).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(upstream.spliced.load(Ordering::SeqCst), 0);
-    let heads = upstream.heads.lock().map(|h| h.len()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.len());
     assert_eq!(heads, 1);
 
     proxy.task.abort();
@@ -2234,7 +2234,7 @@ async fn mitm_non_websocket_upgrade_is_forwarded_without_upgrade_headers() {
         resp.starts_with("HTTP/1.1 200") && resp.ends_with("no upgrade"),
         "response was {resp:?}"
     );
-    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.clone());
     assert_eq!(heads.len(), 1, "heads were {heads:?}");
     for name in ["upgrade", "http2-settings"] {
         assert!(
@@ -2254,7 +2254,7 @@ async fn mitm_non_websocket_upgrade_is_forwarded_without_upgrade_headers() {
         "response was {blocked:?}"
     );
     assert_eq!(upstream.spliced.load(Ordering::SeqCst), 0);
-    let heads = upstream.heads.lock().map(|h| h.len()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.len());
     assert_eq!(heads, 1);
 
     proxy.task.abort();
@@ -2276,7 +2276,7 @@ async fn mitm_websocket_upgrade_offers_only_websocket_upstream() {
     )
     .await;
     assert!(resp.starts_with("HTTP/1.1 101"), "response was {resp:?}");
-    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.clone());
     assert_eq!(heads.len(), 1, "heads were {heads:?}");
     let upgrade_lines: Vec<&str> = heads[0]
         .lines()
@@ -2311,7 +2311,7 @@ async fn mitm_upgrade_to_other_protocol_is_not_relayed() {
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(upstream.spliced.load(Ordering::SeqCst), 0);
-    let heads = upstream.heads.lock().map(|h| h.len()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.len());
     assert_eq!(heads, 1);
 
     proxy.task.abort();
@@ -2368,7 +2368,7 @@ async fn mitm_obs_text_token_lines_are_rejected() {
             lines.escape_ascii()
         );
     }
-    let heads = upstream.heads.lock().map(|h| h.clone()).unwrap_or_default();
+    let heads = upstream.heads.lock().map_or_default(|h| h.clone());
     assert!(heads.is_empty(), "heads were {heads:?}");
 
     proxy.task.abort();

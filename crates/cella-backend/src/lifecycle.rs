@@ -521,13 +521,12 @@ pub fn lifecycle_entries_for_phase(
             config
                 .get(phase)
                 .filter(|v| !v.is_null())
-                .map(|cmd| {
+                .map_or_default(|cmd| {
                     vec![cella_features::LifecycleEntry {
                         origin: "devcontainer.json".into(),
                         command: cmd.clone(),
                     }]
                 })
-                .unwrap_or_default()
         },
         |meta_json| cella_features::lifecycle_from_metadata_label(meta_json, phase),
     )
@@ -633,13 +632,12 @@ fn resolve_entries_with_metadata(
     config
         .get(phase)
         .filter(|v| !v.is_null())
-        .map(|cmd| {
+        .map_or_default(|cmd| {
             vec![cella_features::LifecycleEntry {
                 origin: "devcontainer.json".into(),
                 command: cmd.clone(),
             }]
         })
-        .unwrap_or_default()
 }
 
 /// Run all lifecycle phases for a first-create scenario.

@@ -95,8 +95,7 @@ pub fn generate_docs(
     for dir in dirs {
         let dir_name = dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
 
         // Skip hidden directories (mirrors the `!f.startsWith('.')` check in the official impl).
         if dir_name.starts_with('.') {
@@ -315,8 +314,7 @@ fn build_repo_url(
         (Some(owner), Some(repo)) if !owner.is_empty() && !repo.is_empty() => {
             let dir_name = template_dir
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|n| n.to_string_lossy().into_owned());
 
             format!(
                 "https://github.com/{owner}/{repo}/blob/main/src/{dir_name}/devcontainer-template.json"

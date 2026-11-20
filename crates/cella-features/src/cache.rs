@@ -186,8 +186,7 @@ impl FeatureCache {
     pub fn staging_path(final_path: &Path) -> PathBuf {
         let name = final_path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         let staging_name = format!("{name}.partial-{}", process::id());
         final_path.with_file_name(staging_name)
     }

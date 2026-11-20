@@ -136,8 +136,7 @@ impl ListArgs {
             let desc = feature
                 .description
                 .as_deref()
-                .map(|d| truncate(d, 50))
-                .unwrap_or_default();
+                .map_or_default(|d| truncate(d, 50));
             let ref_str = format!("{registry}/{}:{}", feature.id, feature.version);
             eprintln!("  {name:<25} {desc:<52} {ref_str}");
         }

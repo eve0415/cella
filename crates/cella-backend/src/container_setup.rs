@@ -128,14 +128,11 @@ fn run_single_host_command(
 
 /// Convert a JSON `remoteEnv` object to a vec of `KEY=value` strings.
 pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
-    value
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
-                .collect()
-        })
-        .unwrap_or_default()
+    value.and_then(|v| v.as_object()).map_or_default(|obj| {
+        obj.iter()
+            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+            .collect()
+    })
 }
 
 /// Convert [`cella_env::FileUpload`] items to [`cella_backend::FileToUpload`].

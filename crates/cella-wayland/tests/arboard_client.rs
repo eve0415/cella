@@ -70,8 +70,7 @@ impl ClipboardSource for StubSource {
             .entries
             .iter()
             .find(|(m, _)| m == mime_type)
-            .map(|(_, d)| d.clone())
-            .unwrap_or_default())
+            .map_or_default(|(_, d)| d.clone()))
     }
 
     fn publish(&self, mime_type: &str, data: &[u8]) -> Result<(), SourceError> {

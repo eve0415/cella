@@ -201,11 +201,7 @@ fn create_inner(
                 || stderr.contains("already used by worktree") =>
         {
             // Parse the path from git's error: "fatal: 'branch' is already checked out at '/path'"
-            let checked_out_path = stderr
-                .split('\'')
-                .nth(3)
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let checked_out_path = stderr.split('\'').nth(3).map_or_default(PathBuf::from);
             Err(CellaGitError::BranchCheckedOut {
                 branch: branch.to_string(),
                 worktree_path: checked_out_path,

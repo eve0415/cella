@@ -358,12 +358,11 @@ fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
     config
         .get(key)
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

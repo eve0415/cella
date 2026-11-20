@@ -158,9 +158,7 @@ fn read_canonical(
 
 /// Hash of the file's current content, or empty if it doesn't exist yet.
 fn initial_hash(file: &UserFile) -> String {
-    contents(file, file.read())
-        .map(|b| cella_filesync::sha256_hex(&b))
-        .unwrap_or_default()
+    contents(file, file.read()).map_or_default(|b| cella_filesync::sha256_hex(&b))
 }
 
 /// The bytes a read of `file` found. A refused read is warned about and, like

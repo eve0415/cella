@@ -330,8 +330,7 @@ fn generate_deprecation_header(parsed: &serde_json::Value) -> String {
     let legacy_ids: Vec<&str> = parsed
         .get("legacyIds")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
 
     if !deprecated && legacy_ids.is_empty() {
         return String::new();

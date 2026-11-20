@@ -46,8 +46,9 @@ pub fn from_container_labels(
     let (ports_attributes, other_ports_attributes) = container
         .labels
         .get("dev.cella.ports_attributes")
-        .map(|label| crate::config_map::ports::deserialize_ports_attributes_label(label))
-        .unwrap_or_default();
+        .map_or_default(|label| {
+            crate::config_map::ports::deserialize_ports_attributes_label(label)
+        });
 
     ContainerRegistrationData {
         container_id: container.id.clone(),
@@ -100,8 +101,7 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
     config
         .get("forwardPorts")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(forward_port_number).collect())
-        .unwrap_or_default()
+        .map_or_default(|arr| arr.iter().filter_map(forward_port_number).collect())
 }
 
 /// Extract `host:port` entries from `forwardPorts`.
@@ -114,8 +114,7 @@ pub(crate) fn parse_forward_host_ports(config: &serde_json::Value) -> Vec<HostFo
     config
         .get("forwardPorts")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(forward_host_port).collect())
-        .unwrap_or_default()
+        .map_or_default(|arr| arr.iter().filter_map(forward_host_port).collect())
 }
 
 fn forward_host_port(value: &serde_json::Value) -> Option<HostForwardPort> {

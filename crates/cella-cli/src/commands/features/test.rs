@@ -1306,8 +1306,7 @@ mod tests {
         fn recorded(&self) -> Vec<ExecCall> {
             self.recorder
                 .as_ref()
-                .map(|r| r.lock().unwrap().clone())
-                .unwrap_or_default()
+                .map_or_default(|r| r.lock().unwrap().clone())
         }
     }
 

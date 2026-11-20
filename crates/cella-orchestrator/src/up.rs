@@ -2362,8 +2362,7 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
     config
         .get("forwardPorts")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(forward_port_number).collect())
-        .unwrap_or_default()
+        .map_or_default(|arr| arr.iter().filter_map(forward_port_number).collect())
 }
 
 /// Run the full non-compose container-up pipeline.

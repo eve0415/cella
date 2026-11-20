@@ -558,9 +558,8 @@ fn build_merged_output(
     merged["postAttachCommands"] = lifecycle_commands_array(config, "postAttachCommand", fc);
 
     // --- entrypoints: omit when empty, matching official behaviour ---
-    let entrypoints: Vec<serde_json::Value> = fc
-        .map(|c| c.entrypoints.iter().map(|ep| json!(ep)).collect())
-        .unwrap_or_default();
+    let entrypoints: Vec<serde_json::Value> =
+        fc.map_or_default(|c| c.entrypoints.iter().map(|ep| json!(ep)).collect());
     if entrypoints.is_empty() {
         if let Some(obj) = merged.as_object_mut() {
             obj.remove("entrypoints");

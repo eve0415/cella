@@ -336,8 +336,7 @@ impl ContainerBackend for AppleContainerBackend {
             Ok(entry
                 .configuration
                 .and_then(|c| c.init_process)
-                .map(|p| p.environment)
-                .unwrap_or_default())
+                .map_or_default(|p| p.environment))
         })
     }
 
@@ -1322,47 +1321,35 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     let labels = config.labels.clone().unwrap_or_default();
     let config_hash = labels.get("dev.cella.config_hash").cloned();
 
-    let ports = config
-        .published_ports
-        .as_ref()
-        .map(|ps| {
-            ps.iter()
-                .filter_map(|p| {
-                    Some(PortBinding {
-                        container_port: p.container_port?,
-                        host_port: p.host_port,
-                        protocol: p.proto.clone().unwrap_or_else(|| "tcp".to_string()),
-                    })
+    let ports = config.published_ports.as_ref().map_or_default(|ps| {
+        ps.iter()
+            .filter_map(|p| {
+                Some(PortBinding {
+                    container_port: p.container_port?,
+                    host_port: p.host_port,
+                    protocol: p.proto.clone().unwrap_or_else(|| "tcp".to_string()),
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+            })
+            .collect()
+    });
 
-    let mounts = config
-        .mounts
-        .as_ref()
-        .map(|ms| {
-            ms.iter()
-                .map(|m| MountInfo {
-                    mount_type: m
-                        .fs_type
-                        .as_ref()
-                        .map(|t| t.kind().to_string())
-                        .unwrap_or_default(),
-                    // Volume mounts surface the volume name (Docker parity);
-                    // the raw source is the host-side storage path.
-                    source: m
-                        .fs_type
-                        .as_ref()
-                        .and_then(FilesystemType::volume_name)
-                        .map(String::from)
-                        .or_else(|| m.source.clone())
-                        .unwrap_or_default(),
-                    destination: m.destination.clone().unwrap_or_default(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mounts = config.mounts.as_ref().map_or_default(|ms| {
+        ms.iter()
+            .map(|m| MountInfo {
+                mount_type: m.fs_type.as_ref().map_or_default(|t| t.kind().to_string()),
+                // Volume mounts surface the volume name (Docker parity);
+                // the raw source is the host-side storage path.
+                source: m
+                    .fs_type
+                    .as_ref()
+                    .and_then(FilesystemType::volume_name)
+                    .map(String::from)
+                    .or_else(|| m.source.clone())
+                    .unwrap_or_default(),
+                destination: m.destination.clone().unwrap_or_default(),
+            })
+            .collect()
+    });
 
     let created_at = labels.get("dev.cella.created_at").cloned();
 
