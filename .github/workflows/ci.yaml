@@ -86,7 +86,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install cargo-insta
-        uses: taiki-e/install-action@v2.89.1
+        uses: taiki-e/install-action@v2.90.6
         with:
           tool: cargo-insta
 
@@ -112,7 +112,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.89.1
+        uses: taiki-e/install-action@v2.90.6
         with:
           tool: cargo-llvm-cov
 
