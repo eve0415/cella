@@ -529,7 +529,7 @@ fn build_error_response(category: &str, message: &str) -> hyper::Response<BoxBod
         .header("x-cella-error", category)
         .body(
             Full::new(Bytes::from(message.to_string()))
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+                .map_err(|e| match e {})
                 .boxed(),
         )
         .expect("building error response")

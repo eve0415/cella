@@ -175,7 +175,7 @@ async fn tunnel_request_inner(
 
 fn full(s: &str) -> BoxBody {
     Full::new(Bytes::from(s.to_string()))
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .map_err(|e| match e {})
         .boxed()
 }
 
