@@ -23,7 +23,7 @@ pub struct PackageSpec {
 }
 
 impl PackageSpec {
-    pub const fn names_for(&self, manager: PackageManager) -> &[&str] {
+    pub const fn names_for(&self, manager: PackageManager) -> &'static [&'static str] {
         if let (PackageManager::Apk, Some(apk)) = (manager, self.apk_override) {
             apk
         } else {

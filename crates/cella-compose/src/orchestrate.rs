@@ -1791,11 +1791,14 @@ fn compose_metadata_label(
 
 /// The feature-resolution input for `compose up`: the substituted config for
 /// resolution, the raw config for the persisted label.
-const fn compose_features_input<'a>(
-    cfg: &'a ComposeUpConfig<'_>,
+const fn compose_features_input<'a, 'b>(
+    cfg: &ComposeUpConfig<'b>,
     project: &'a ComposeProject,
     subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
-) -> crate::combined_dockerfile_build::ResolveComposeFeaturesInput<'a> {
+) -> crate::combined_dockerfile_build::ResolveComposeFeaturesInput<'a>
+where
+    'b: 'a,
+{
     crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
         config: cfg.config,
         subst_ctx,

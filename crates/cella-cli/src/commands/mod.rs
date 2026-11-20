@@ -318,7 +318,7 @@ pub enum ImagePullPolicy {
 }
 
 impl ImagePullPolicy {
-    pub const fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Always => "always",
             Self::Missing => "missing",
@@ -365,7 +365,7 @@ pub enum ComposePullPolicy {
 }
 
 impl ComposePullPolicy {
-    pub const fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Always => "always",
             Self::Missing => "missing",
