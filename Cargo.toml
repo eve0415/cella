@@ -36,7 +36,6 @@ version = "0.10.3"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
-homepage = "https://github.com/eve0415/cella"
 description = "A terminal-native devcontainer CLI built for the AI agent era"
 readme = "README.md"
 keywords = ["devcontainers", "containers", "cli", "docker", "vscode"]
@@ -199,7 +198,6 @@ divan = "=0.1.21"
 
 # Internal crates
 cella-backend = { path = "crates/cella-backend" }
-cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
 cella-completion = { path = "crates/cella-completion" }
 cella-compose = { path = "crates/cella-compose" }
