@@ -21,7 +21,6 @@ miette.workspace = true
 cella-protocol.workspace = true
 cella-wayland.workspace = true
 nix = { workspace = true, features = ["fs"] }
-notify.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

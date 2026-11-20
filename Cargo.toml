@@ -186,7 +186,6 @@ wayland-protocols-wlr = "=0.3.12"
 # Testing
 tempfile = "=3.27.0"
 wayland-client = "=0.31.15"
-wl-clipboard-rs = "=0.9.5"
 # `image-data` arrives via default features and is required for get_image().
 # `wayland-data-control` is NOT default — without it arboard has no Wayland
 # backend compiled in and silently falls through to X11.
@@ -248,3 +247,6 @@ assert_is_empty = "allow"
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_qualifications = "deny"
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"

@@ -19,7 +19,6 @@ cella-tool-install.workspace = true
 hex.workspace = true
 miette.workspace = true
 chrono.workspace = true
-dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

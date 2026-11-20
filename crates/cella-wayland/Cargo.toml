@@ -17,7 +17,6 @@ wayland-server.workspace = true
 [dev-dependencies]
 wayland-client.workspace = true
 wayland-protocols = { workspace = true, features = ["client"] }
-wl-clipboard-rs.workspace = true
 
 [lints]
 workspace = true

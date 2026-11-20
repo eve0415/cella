@@ -361,7 +361,6 @@ dependencies = [
  "hyper-util",
  "miette",
  "nix 0.32.0",
- "notify",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -738,7 +737,6 @@ dependencies = [
  "cella-protocol",
  "cella-tool-install",
  "chrono",
- "dirs",
  "hex",
  "miette",
  "serde",
@@ -859,7 +857,6 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "wayland-server",
- "wl-clipboard-rs",
 ]
 
 [[package]]

@@ -8,7 +8,6 @@ rust-version.workspace = true
 [dependencies]
 cella-backend.workspace = true
 cella-config.workspace = true
-cella-protocol.workspace = true
 cella-daemon-client.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
@@ -28,6 +27,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 cella-backend = { workspace = true, features = ["test-support"] }
+cella-protocol.workspace = true
 cella-testing.workspace = true
 insta.workspace = true
 tempfile.workspace = true
