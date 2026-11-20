@@ -49,7 +49,7 @@ pub async fn run_health_monitor(
     last_activity: Arc<AtomicU64>,
     pid_path: &Path,
     socket_path: &Path,
-) {
+) -> ! {
     let pid_path = pid_path.to_path_buf();
     let socket_path = socket_path.to_path_buf();
 
