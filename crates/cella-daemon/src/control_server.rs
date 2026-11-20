@@ -1667,7 +1667,7 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_protocol::WorktreeEntry> 
         if let Some(p) = line.strip_prefix("worktree ") {
             path = Some(p.to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
-            let short = b.strip_prefix("refs/heads/").unwrap_or(b);
+            let short = b.trim_prefix("refs/heads/");
             branch = Some(short.to_string());
         } else if line == "bare" {
             is_bare = true;

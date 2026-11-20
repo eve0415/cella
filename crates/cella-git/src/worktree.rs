@@ -276,7 +276,7 @@ fn parse_porcelain_output(output: &str) -> Vec<WorktreeInfo> {
             current_head = Some(head.to_string());
         } else if let Some(branch) = line.strip_prefix("branch ") {
             // "refs/heads/main" → "main"
-            let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            let short = branch.trim_prefix("refs/heads/");
             current_branch = Some(short.to_string());
         } else if line == "bare" {
             is_bare = true;

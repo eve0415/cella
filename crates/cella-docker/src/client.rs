@@ -102,7 +102,7 @@ impl DockerClient {
     /// Returns `CellaDockerError::RuntimeNotFound` if connection fails.
     pub fn connect_with_host(host: &str) -> Result<Self, CellaDockerError> {
         let docker = if host.starts_with("unix://") || host.starts_with('/') {
-            let path = host.strip_prefix("unix://").unwrap_or(host);
+            let path = host.trim_prefix("unix://");
             Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
         } else {
             Docker::connect_with_http(host, 120, bollard::API_DEFAULT_VERSION)

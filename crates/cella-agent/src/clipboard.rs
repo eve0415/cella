@@ -148,7 +148,7 @@ pub async fn handle_wl_paste(args: &[String]) -> Result<(), CellaPortError> {
     };
     let data = request_clipboard_paste(&mime).await?;
     let output = if opts.no_newline {
-        data.strip_suffix(b"\n").unwrap_or(&data).to_vec()
+        data.trim_suffix(b"\n").to_vec()
     } else {
         data
     };

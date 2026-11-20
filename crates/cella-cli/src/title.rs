@@ -30,9 +30,7 @@ const WEZTERM_RESET_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b]0;wezterm\x07\x1b\\";
 /// present in the `" \u{2014} cella <subcommand>"` suffix. No-op if the prefix
 /// is absent.
 pub fn title_name(container_name: &str) -> &str {
-    container_name
-        .strip_prefix("cella-")
-        .unwrap_or(container_name)
+    container_name.trim_prefix("cella-")
 }
 
 /// Inputs to title rendering. Constructed by call sites from the resolved

@@ -60,7 +60,7 @@ pub fn parse_variant(variant: &str) -> Option<Release> {
 
     let family = FAMILIES.iter().find(|f| variant.starts_with(**f))?;
     let tail = &variant[family.len()..];
-    let rest = tail.strip_prefix('-').unwrap_or(tail);
+    let rest = tail.trim_prefix('-');
     if rest.is_empty() {
         // Bare `debian` / `ubuntu` / `alpine` float to the newest release.
         return None;

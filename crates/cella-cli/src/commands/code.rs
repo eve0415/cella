@@ -352,7 +352,7 @@ fn check_local_docker() -> Result<(), CodeError> {
 
 /// Check if a `tcp://` Docker host URL points to localhost.
 fn is_localhost_tcp(url: &str) -> bool {
-    let authority = url.strip_prefix("tcp://").unwrap_or(url);
+    let authority = url.trim_prefix("tcp://");
     // Strip bracket notation and port for comparison
     let normalized = authority
         .trim_start_matches('[')

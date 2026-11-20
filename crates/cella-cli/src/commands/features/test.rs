@@ -1123,7 +1123,7 @@ fn collect_files(
         if path.is_dir() {
             collect_files(&path, base, container_dest, out)?;
         } else {
-            let rel = path.strip_prefix(base).unwrap_or(&path);
+            let rel = path.trim_prefix(base);
             let container_path = format!(
                 "{container_dest}/{}",
                 rel.to_string_lossy().replace('\\', "/")
